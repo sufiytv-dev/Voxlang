@@ -19,12 +19,6 @@ Desktop.ini
 *.lib
 *.a
 
-# GPU device binaries
-device.ll
-device.ptx
-device.hsaco
-device.*
-
 # Other temporary files
 *.tmp
 *.log
