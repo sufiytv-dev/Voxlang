@@ -1,0 +1,44 @@
+# struct.vx – simplified struct test (no nested structs)
+# All structs at top level, explicit types everywhere.
+
+struct Point:
+    x: i32
+    y: i32
+}
+
+fn test_mutable() -> i32:
+    let mut p: Point = Point(x: 10, y: 20)
+    let q: &mut Point = &mut p
+    q.x = 30
+    q.y = 40
+    if q.x != 30:
+        return 1
+    }
+    if q.y != 40:
+        return 2
+    }
+    return 0
+}
+
+fn test_struct_literal() -> i32:
+    let p: Point = Point(x: 30, y: 40)
+    if p.x != 30:
+        return 7
+    }
+    if p.y != 40:
+        return 8
+    }
+    return 0
+}
+
+fn main() -> i32:
+    let r1: i32 = test_mutable()
+    if r1 != 0:
+        return r1
+    }
+    let r2: i32 = test_struct_literal()
+    if r2 != 0:
+        return r2
+    }
+    return 0
+}

@@ -1,0 +1,33 @@
+fn main() -> i32:
+    # Test Option::Some with inference
+    let some_val = Option::Some(42)
+    let some_explicit: Option<i32> = Option::Some(100)
+
+    # Test Option::None with explicit type
+    let none_explicit: Option<i32> = Option::None
+
+    # Test pattern matching on constructed values
+    let result = match some_val:
+        Option::Some(x) -> x
+        Option::None -> 0
+    }
+    assert(result == 42, "Option::Some pattern match failed")
+
+    # Test Result::Ok and Result::Err
+    let ok_val: Result<i32, &str> = Result::Ok(999)
+    let err_val: Result<i32, i32> = Result::Err(1)
+
+    let ok_check = match ok_val:
+        Result::Ok(v) -> v
+        Result::Err(_) -> -1
+    }
+    assert(ok_check == 999, "Result::Ok pattern match failed")
+
+    let err_check = match err_val:
+        Result::Ok(_) -> -1
+        Result::Err(s) -> 0   # just verify it's Err
+    }
+    assert(err_check == 0, "Result::Err pattern match failed")
+
+    return 0
+}

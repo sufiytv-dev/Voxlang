@@ -1,0 +1,35 @@
+# while.vx – test while loops, loop variable updates, and correct exit condition
+
+fn test_while_sum() -> i32:
+    let mut i: i32 = 0
+    let mut sum: i32 = 0
+    while i < 10:
+        sum = sum + i
+        i = i + 1
+    }
+    return sum
+}
+
+fn test_while_negative() -> i32:
+    let mut i: i32 = -5
+    let mut count: i32 = 0
+    while i < 0:
+        count = count + 1
+        i = i + 1
+    }
+    return count   # should be 5
+}
+
+fn main() -> i32:
+    let s = test_while_sum()
+    if s != 45:
+        return 1
+    }
+
+    let c = test_while_negative()
+    if c != 5:
+        return 2
+    }
+
+    return 0
+}

@@ -1,0 +1,18 @@
+# refine_precondition.vx – test function parameter refinements (preconditions)
+
+fn divide(a: i32 where a != 0, b: i32) -> i32:
+    return b / a
+}
+
+fn main() -> i32:
+    let x = divide(2, 10)
+    if x != 5:
+        return 1
+    }
+
+    # This should fail at compile time because precondition is not satisfied:
+    # let y = divide(0, 10)
+    # But we don't include it because it would cause compilation error.
+
+    return 0
+}

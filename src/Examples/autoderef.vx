@@ -1,0 +1,27 @@
+# autoderef.vx – demonstrates auto‑dereferencing of &mut Point and &Point
+
+struct Point:
+    x: i32
+    y: i32
+}   # struct block must be closed with '}'
+
+fn set_x(p: &mut Point, v: i32):
+    # Auto‑deref: p.x instead of (*p).x
+    p.x = v
+}
+
+fn get_x(p: &Point) -> i32:
+    # Auto‑deref: p.x instead of (*p).x
+    return p.x
+}
+
+fn main() -> i32:
+    let mut p = Point(x: 0, y: 0)
+    set_x(&mut p, 42)
+    let val = get_x(&p)
+    if val == 42:
+        return 0
+    } else:
+        return 1
+    }
+}

@@ -1,0 +1,72 @@
+# test_enum.vx – enum definitions and pattern matching
+
+fn print(s: &str):
+    puts(s as i8*)
+}
+
+fn assert(cond: i32, msg: &str):
+    if cond == 0:
+        print("FAIL: ")
+        print(msg)
+        print("\n")
+        exit(1)
+    }   # closing brace for the if branch
+}
+
+enum Option:
+    None
+    Some
+}   # enum block must be closed with '}'
+
+enum Color:
+    Red
+    Green
+    Blue
+}
+
+fn option_to_i32(x: Option) -> i32:
+    return match x:
+        None -> 0
+        Some -> 1
+    }   # closing brace for match expression
+}
+
+fn color_to_str(c: Color) -> &str:
+    return match c:
+        Red -> "red"
+        Green -> "green"
+        Blue -> "blue"
+    }
+}
+
+fn main() -> i32:
+    let none_val: Option = Option::None
+    let some_val: Option = Option::Some
+
+    assert(option_to_i32(none_val) == 0, "Option::None -> 0")
+    assert(option_to_i32(some_val) == 1, "Option::Some -> 1")
+
+    let c: Color = Color::Green
+    let name: &str = match c:
+        Red -> "red"
+        _ -> "not red"
+    }
+    assert(len(name) == 7, "wildcard match")
+
+    let val: i32 = match Color::Blue:
+        Red -> 100
+        Green -> 200
+        Blue -> 300
+    }
+    assert(val == 300, "direct match value")
+
+    let exhaustive: i32 = match Color::Red:
+        Red -> 1
+        Green -> 2
+        Blue -> 3
+    }
+    assert(exhaustive == 1, "exhaustive match")
+
+    print("All enum/match tests passed!\n")
+    return 0
+}

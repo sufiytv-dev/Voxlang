@@ -1,0 +1,102 @@
+# examples/generics.vx - Phase 0 generics: generic functions, reference patterns
+# All features below work with the current compiler.
+
+fn option_demo() -> i32:
+    let some_val: Option = Option::Some
+    let none_val: Option = Option::None
+    let a = match some_val:
+        Option::Some -> 42
+        Option::None -> 0
+    }
+    let b = match none_val:
+        Option::Some -> 10
+        Option::None -> 5
+    }
+    return a + b
+}
+
+fn may_fail(flag: i32) -> Result:
+    if flag == 0:
+        return Result::Ok
+    }
+    return Result::Err
+}
+
+fn use_question(flag: i32) -> i32:
+    let res = may_fail(flag)
+    return match res:
+        Result::Ok -> 101
+        Result::Err -> 0
+    }
+}
+
+fn match_demo() -> i32:
+    let opt: Option = Option::Some
+    return match opt:
+        Option::Some -> 1
+        Option::None -> 0
+    }
+}
+
+fn match_ref_demo(opt: &Option) -> i32:
+    return match opt:
+        &Option::Some -> 100
+        &Option::None -> 0
+    }
+}
+
+# --- Working generic functions ---
+fn identity<T>(x: T) -> T:
+    return x
+}
+
+fn generic_caller<T>(x: T) -> T:
+    let y = identity(x)
+    return y
+}
+
+# --- Test generic features ---
+fn test_generics() -> i32:
+    let a = identity(42)                # T = i32
+    let b = identity(3.14)              # T = f64
+    let c = identity(Option::Some)      # T = Option
+    let d = identity(Result::Ok)        # T = Result
+    let some_opt = Option::Some
+    let e = identity(&some_opt)         # T = &Option
+    let f = identity("hello")           # T = &str
+
+    let g = generic_caller(100)
+
+    assert(a == 42, "identity failed")
+    assert(g == 100, "generic_caller failed")
+    return 0
+}
+
+# =============================================================================
+# MAIN – runs all tests
+# =============================================================================
+fn main() -> i32:
+    let total = option_demo()
+    assert(total == 47, "option_demo failed")
+
+    let res = use_question(0)
+    assert(res == 101, "use_question with flag 0 failed")
+
+    let err_res = use_question(1)
+    assert(err_res == 0, "use_question with flag 1 failed")
+
+    let match_val = match_demo()
+    assert(match_val == 1, "match demo failed")
+
+    let some_opt = Option::Some
+    let match_ref = match_ref_demo(&some_opt)
+    assert(match_ref == 100, "match on reference failed")
+
+    let id_val = identity(42)
+    assert(id_val == 42, "generic identity failed")
+
+    let generics_ok = test_generics()
+    assert(generics_ok == 0, "test_generics failed")
+
+    return 0
+}

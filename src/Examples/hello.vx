@@ -1,0 +1,38 @@
+# Write to stderr without newline
+fn eprint(s: &str) -> i32:
+    let ptr = s.as_ptr()
+    let l = s.len()
+    return vox_eprint_str(ptr, l as usize)
+}
+
+# Write to stderr with newline
+fn eprintln(s: &str) -> i32:
+    let ptr = s.as_ptr()
+    let l = s.len()
+    return vox_eprintln_str(ptr, l as usize)
+}
+
+# Write to stdout without newline
+fn print(s: &str) -> i32:
+    let ptr = s.as_ptr()
+    let l = s.len()
+    return vox_print_str(ptr, l as usize)
+}
+
+# Write to stdout with newline
+fn println(s: &str) -> i32:
+    let ptr = s.as_ptr()
+    let l = s.len()
+    return vox_println_str(ptr, l as usize)
+}
+
+fn main() -> i32:
+    eprint("Hello, ")
+    eprintln("world!")
+    print("This goes to stdout")
+    println(" (with a newline)")
+    let num = 42
+    eprint("Number: ")
+    eprintln("42")
+    return 0
+}

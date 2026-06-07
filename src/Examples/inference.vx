@@ -1,0 +1,23 @@
+# examples/inference.vx
+fn get_magic_number() -> i32:
+    return 42
+}
+
+fn main() -> i32:
+    # Inference from literal
+    let x = 10
+
+    # Inference from function return
+    let y = get_magic_number()
+
+    # Inference from binary expression
+    let z = x + y
+
+    # Explicit type still works (validation check)
+    let explicit: i32 = 100
+
+    if z == 52:
+        return 0 }
+    else:
+        return 1 }
+}

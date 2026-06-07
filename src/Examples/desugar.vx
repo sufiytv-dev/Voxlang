@@ -1,0 +1,52 @@
+# test_for.vx – Test for loop desugaring
+# Verifies that `for i in start..end` loops are correctly transformed
+# into a while loop with a counter.
+
+fn main() -> i32:
+    # Test 1: Simple sum of 0..10 should be 45
+    let mut sum: i32 = 0
+    for i in 0..10:
+        sum = sum + i
+    }
+    assert(sum == 45, "0..10 sum should be 45")
+
+    # Test 2: Loop with explicit start and end
+    let mut prod: i32 = 1
+    for i in 1..5:
+        prod = prod * i
+    }
+    assert(prod == 24, "1..4 product should be 24")
+
+    # Test 3: Empty range should not execute
+    let mut count: i32 = 0
+    for i in 5..5:
+        count = count + 1
+    }
+    assert(count == 0, "empty range should not execute")
+
+    # Test 4: Loop variable is immutable inside the body (cannot be assigned)
+    for i in 3..7:
+        # i = i + 1  # This would cause a compile error if uncommented
+        assert(i >= 3 and i <= 6, "i should be in range")
+    }
+
+    # Test 5: Nested loops
+    let mut total: i32 = 0
+    for a in 0..3:
+        for b in 0..3:
+            total = total + a * b
+        }
+    }
+    # Expected: (0*0+0*1+0*2) + (1*0+1*1+1*2) + (2*0+2*1+2*2) = 0 + 3 + 6 = 9
+    assert(total == 9, "nested loops sum should be 9")
+
+    # Test 6: Shadowing (inner loop variable shadows outer variable)
+    let outer: i32 = 100
+    for inner in 0..5:
+        # inner variable shadows outer – but we don't need to declare it again
+        let _unused = inner
+    }
+    assert(outer == 100, "outer variable unchanged after loop")
+
+    return 0
+}

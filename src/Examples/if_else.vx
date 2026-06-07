@@ -1,0 +1,92 @@
+# if_else.vx – test if‑else statements, nested conditions, and return from branches
+
+fn check_positive(x: i32) -> i32:
+    if x > 0:
+        return 1
+    }
+    else:
+        return 0
+    }
+}
+
+fn nested_if(a: i32, b: i32) -> i32:
+    if a > 0:
+        if b > 0:
+            return 10
+        }
+        else:
+            return 20
+        }
+    }
+    else:
+        return 30
+    }
+}
+
+fn main() -> i32:
+    # Simple if‑else
+    let r1 = check_positive(5)
+    if r1 != 1:
+        return 1
+    }
+
+    let r2 = check_positive(-3)
+    if r2 != 0:
+        return 2
+    }
+
+    # Nested if‑else
+    let n1 = nested_if(1, 2)
+    if n1 != 10:
+        return 3
+    }
+
+    let n2 = nested_if(1, -1)
+    if n2 != 20:
+        return 4
+    }
+
+    let n3 = nested_if(-1, 5)
+    if n3 != 30:
+        return 5
+    }
+
+    # If‑else as an expression (workaround using mutable variable)
+    let x: i32 = 7
+    let y: i32 = 3
+    let mut max: i32 = 0
+    if x > y:
+        max = x
+    }
+    else:
+        max = y
+    }
+    if max != 7:
+        return 6
+    }
+
+    # If‑else with multiple statements in each branch
+    let mut flag: i32 = 0
+    if x > y:
+        flag = 1
+        flag = flag * 10
+    }
+    else:
+        flag = 2
+        flag = flag + 100
+    }
+    if flag != 10:
+        return 7
+    }
+
+    # No else branch (only if) – should be allowed
+    let mut z: i32 = 0
+    if x == 7:
+        z = 42
+    }
+    if z != 42:
+        return 8
+    }
+
+    return 0
+}

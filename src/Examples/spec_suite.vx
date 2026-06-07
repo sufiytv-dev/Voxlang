@@ -1,0 +1,140 @@
+# test.vx – minimal regression suite (only fully working features)
+# Expected exit code: 0
+
+fn test_basic_arithmetic() -> i32:
+    let a: i32 = 10
+    let b: i32 = 20
+    return a + b - 5
+}   # closes function body
+
+fn test_control_flow() -> i32:
+    let x: i32 = 42
+    if x > 0:
+        return 1
+    } else:
+        return 0
+    }
+}
+
+fn test_refinement_constant() -> i32:
+    let x: i32 where x > 0 = 42
+    let y: i32 where y > 0 and y < 100 = 50
+    return x + y
+}
+
+fn divide(a: i32 where a != 0, b: i32) -> i32:
+    return b / a
+}
+
+fn test_function_precondition() -> i32:
+    return divide(2, 10)
+}
+
+fn test_borrowing() -> i32:
+    let mut s: i32 = 10
+    let t: &mut i32 = &mut s
+    *t = 20
+    return s
+}
+
+fn test_parallel_loop() -> i32:
+    let mut sum: i32 = 0
+    parallel for i in 0..10:
+        sum = sum + i
+    }
+    return sum
+}
+
+fn test_char() -> i32:
+    let c1: char = 'A'
+    let c2: char = 'a'
+    let diff: i32 = (c2 as i32) - (c1 as i32)
+    let next: char = 'B'
+    let next_val: i32 = next as i32
+    return diff + next_val - 65
+}
+
+fn test_logical() -> i32:
+    let a: i32 = 1
+    let b: i32 = 0
+    let and_true: i32 = a and a
+    let and_false: i32 = a and b
+    let or_true: i32 = a or b
+    let or_false: i32 = b or b
+    let not_a: i32 = not a
+    let not_b: i32 = not b
+    return and_true + and_false + or_true + or_false + not_a + not_b
+}
+
+fn test_unary() -> i32:
+    let x: i32 = 10
+    let neg: i32 = -x
+    let not_x: i32 = not x
+    let zero: i32 = 0
+    let not_zero: i32 = not zero
+    return neg + x + not_x + not_zero
+}
+
+fn test_while() -> i32:
+    let mut i: i32 = 0
+    let mut sum: i32 = 0
+    while i < 10:
+        sum = sum + i
+        i = i + 1
+    }
+    return sum
+}
+
+fn main() -> i32:
+    let sum: i32 = test_basic_arithmetic()
+    if sum != 25:
+        return 1
+    }
+
+    let flow: i32 = test_control_flow()
+    if flow != 1:
+        return 2
+    }
+
+    let refined: i32 = test_refinement_constant()
+    if refined != 92:
+        return 3
+    }
+
+    let div: i32 = test_function_precondition()
+    if div != 5:
+        return 4
+    }
+
+    let borrowed: i32 = test_borrowing()
+    if borrowed != 20:
+        return 5
+    }
+
+    let parallel_sum: i32 = test_parallel_loop()
+    if parallel_sum != 45:
+        return 6
+    }
+
+    let char_result: i32 = test_char()
+    if char_result != 33:
+        return 7
+    }
+
+    let logical_result: i32 = test_logical()
+    if logical_result != 3:
+        return 8
+    }
+
+    let unary_result: i32 = test_unary()
+    if unary_result != 1:
+        return 9
+    }
+
+    let while_sum: i32 = test_while()
+    if while_sum != 45:
+        return 10
+    }
+
+    return 0
+}

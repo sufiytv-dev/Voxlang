@@ -1,0 +1,60 @@
+fn test_char_literals() -> i32:
+    let a: char = 'A'
+    let b: char = 'a'
+    let diff: i32 = (b as i32) - (a as i32)
+    if diff != 32:
+        return 1
+    }
+    return 0
+}
+
+fn test_char_cast() -> i32:
+    let c: char = 'B'
+    let val: i32 = c as i32
+    if val != 66:
+        return 2
+    }
+    return 0
+}
+
+fn test_char_compare() -> i32:
+    let x: char = 'x'
+    let y: char = 'y'
+    if x >= y:
+        return 3
+    }
+    return 0
+}
+
+fn test_char_arithmetic() -> i32:
+    let base: char = '0'
+    let next: char = ((base as i32) + 1) as char
+    if next != '1':
+        return 4
+    }
+    return 0
+}
+
+fn main() -> i32:
+    let r1 = test_char_literals()
+    if r1 != 0:
+        return r1
+    }
+
+    let r2 = test_char_cast()
+    if r2 != 0:
+        return r2
+    }
+
+    let r3 = test_char_compare()
+    if r3 != 0:
+        return r3
+    }
+
+    let r4 = test_char_arithmetic()
+    if r4 != 0:
+        return r4
+    }
+
+    return 0
+}

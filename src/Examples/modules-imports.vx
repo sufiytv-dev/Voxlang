@@ -1,0 +1,5 @@
+import "lib/math.vx" as m
+
+fn main() -> i32:
+    return m::add(5, 3)
+}
