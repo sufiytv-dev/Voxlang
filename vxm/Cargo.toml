@@ -1,6 +1,7 @@
 [package]
-name = "vox-installer"
+name = "vxm"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Any specific dependencies vxm needs go here
