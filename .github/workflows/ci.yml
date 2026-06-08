@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [main, master]
 
+# 🔑 GRANT WRITE PERMISSIONS TO THE RUNNER TO CREATE RELEASES
+permissions:
+  contents: write
+
 jobs:
   # Stage 1: Compile VXM for all 3 major architectures
   build-vxm:
@@ -55,7 +59,7 @@ jobs:
   # Stage 2: Native Validation of the Vox Compiler Core
   test-vox:
     name: Core Compiler Conformance
-    needs: build-vxm # Ensures vxm builds cleanly across targets before testing core logic
+    needs: build-vxm
     runs-on: windows-latest
 
     steps:
