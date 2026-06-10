@@ -1,0 +1,19 @@
+# vec_tests.vx
+fn test_vec() -> i32:
+    let mut v: Vec<i32> = Vec::new()
+    push(v, 10)
+    push(v, 20)
+    push(v, 30)
+    assert(len(v) == 3, "len after pushes")
+    let x = pop(v)
+    assert(x == Some(30), "pop returns last")
+    assert(len(v) == 2, "len after pop")
+    let y = pop(v)
+    assert(y == Some(20), "pop second")
+    assert(v[0] == 10, "index works")
+    return 0
+}
+
+fn main() -> i32:
+    return test_vec()
+}

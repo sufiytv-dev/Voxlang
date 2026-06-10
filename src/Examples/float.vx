@@ -1,0 +1,10 @@
+fn main() -> i32:
+    let pi: f64 = 3.141592653589793
+    let e: f64  = 2.718281828459045
+    let sum: f64 = pi + e
+    let sum_int: i32 = sum as i32
+    if sum_int == 5:
+        return 0 }
+    else:
+        return 1 }
+}

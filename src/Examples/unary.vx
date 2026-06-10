@@ -1,0 +1,49 @@
+# unary.vx – test unary minus (-x) and logical not (not x) on integers
+
+fn test_unary_minus() -> i32:
+    let x: i32 = 10
+    let y: i32 = -x
+    if y != -10:
+        return 1
+    }
+
+    let z: i32 = -(-5)
+    if z != 5:
+        return 2
+    }
+    return 0
+}
+
+fn test_logical_not() -> i32:
+    let a: i32 = 1
+    let b: i32 = 0
+    let not_a: i32 = not a
+    let not_b: i32 = not b
+    if not_a != 0:
+        return 3
+    }
+    if not_b != 1:
+        return 4
+    }
+
+    let c: i32 = -10
+    let not_c: i32 = not c
+    if not_c != 0:
+        return 5
+    }
+    return 0
+}
+
+fn main() -> i32:
+    let r1 = test_unary_minus()
+    if r1 != 0:
+        return r1
+    }
+
+    let r2 = test_logical_not()
+    if r2 != 0:
+        return r2
+    }
+
+    return 0
+}

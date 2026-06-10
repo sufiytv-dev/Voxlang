@@ -1,0 +1,71 @@
+# borrow.vx – test mutable and immutable borrows, dereferencing, and basic borrowing rules
+
+fn test_immutable_borrow() -> i32:
+    let mut x: i32 = 10
+    let y: &i32 = &x   # immutable borrow
+    if *y != 10:
+        return 1
+    }
+    # x can still be read but not mutated while y is alive
+    if x != 10:
+        return 2
+    }
+    return 0
+}
+
+fn test_mutable_borrow() -> i32:
+    let mut x: i32 = 10
+    let y: &mut i32 = &mut x
+    *y = 20
+    if x != 20:
+        return 3
+    }
+    return 0
+}
+
+fn test_dereference() -> i32:
+    let mut x: i32 = 5
+    let y: &mut i32 = &mut x
+    *y = *y + 10
+    if x != 15:
+        return 4
+    }
+    return 0
+}
+
+fn test_borrow_scope() -> i32:
+    let mut x: i32 = 10
+    if 1:   # true condition (non-zero integer)
+        let y: &mut i32 = &mut x
+        *y = 30
+    }   # y goes out of scope, mutable borrow ends
+    # x can be used again
+    if x != 30:
+        return 5
+    }
+    return 0
+}
+
+fn main() -> i32:
+    let r1 = test_immutable_borrow()
+    if r1 != 0:
+        return r1
+    }
+
+    let r2 = test_mutable_borrow()
+    if r2 != 0:
+        return r2
+    }
+
+    let r3 = test_dereference()
+    if r3 != 0:
+        return r3
+    }
+
+    let r4 = test_borrow_scope()
+    if r4 != 0:
+        return r4
+    }
+
+    return 0
+}

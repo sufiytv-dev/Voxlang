@@ -1,0 +1,54 @@
+# examples/comptime_block.vx
+# Multi‑statement @comptime block using colon + indented block (no '{' allowed)
+
+fn main() -> i32:
+    # Basic sequential statements and tail return
+    let a: i32 = @comptime:
+        let x = 5
+        let y = x * 2
+        y + 3          # last expression becomes block value
+    }
+    if a != 13:
+        return 1
+    }
+
+    # Mutable variable and while loop
+    let b: i32 = @comptime:
+        let mut sum = 0
+        let mut i = 0
+        while i < 10:
+            sum = sum + i
+            i = i + 1
+        }
+        sum
+    }
+    if b != 45:
+        return 1
+    }
+
+    # If‑else inside comptime
+    let c: i32 = @comptime:
+        let mut val = 0
+        if 2 > 1:
+            val = 100
+        } else:
+            val = 200
+        }
+        val
+    }
+    if c != 100:
+        return 1
+    }
+
+    # Nested block – inner block is just a group, ends with its own '}'
+    let d: i32 = @comptime:
+        let x = 10
+        let y = x * 2
+        y
+    }
+    if d != 20:
+        return 1
+    }
+
+    return 0
+}

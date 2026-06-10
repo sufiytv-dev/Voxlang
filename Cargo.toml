@@ -1,0 +1,19 @@
+[package]
+name = "vox"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [
+    ".",
+    "vxm"
+]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3            # Aggressive performance optimizations
+lto = "fat"              # Full cross-crate Link-Time Optimization across the entire binary
+codegen-units = 1        # Forces a single code generation unit, maximizing LTO optimization potential
+panic = "abort"          # Eliminates stack unwinding overhead, reducing binary size and maximizing execution speed
+strip = true             # Strips all symbols and debug info from the final binary for the absolute smallest footprint

@@ -1,0 +1,35 @@
+# examples/type_alias_full.vx
+# Comprehensive type alias tests
+
+# Basic alias
+type MyInt = i32
+
+# Forward reference: MyVec uses MyInt which is defined AFTER
+type MyVec = Vec<MyInt>
+type MyInt = i32   # already defined, but ok; forward reference works because map collects all
+
+# Generic alias
+type MyOption = Option<i32>
+
+fn main() -> i32:
+    # Basic alias usage
+    let x: MyInt = 42
+
+    # Forward reference alias usage
+    let v: MyVec = Vec::new()
+    push(v, x)
+    let len1 = len(v)
+
+    # Generic alias usage
+    let opt: MyOption = Some(100)
+    let val = match opt:
+        Some(v) -> v
+        None -> 0
+    }
+
+    return x + len1 + val   # 42 + 1 + 100 = 143
+}
+
+# --- Error cases (uncomment to verify they produce diagnostics) ---
+# type MyInt = f64   # error: already defined
+# type Unknown = DoesNotExist   # error: unknown type

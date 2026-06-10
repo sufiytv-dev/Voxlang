@@ -1,0 +1,8 @@
+fn main() -> i32:
+    let arr: [3 x i32] = [1, 2, 3]
+    let sum: i32 = arr[0] + arr[1] + arr[2]
+    if sum == 6:
+        return 0 }
+    else:
+        return 1 }
+}

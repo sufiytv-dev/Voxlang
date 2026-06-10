@@ -1,0 +1,35 @@
+# Build output directory
+/target/
+
+# OS-specific metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Executables
+*.exe
+*.exe~
+
+# LLVM IR files
+*.ll
+
+# Object files
+*.o
+*.obj
+*.lib
+*.a
+
+# Other temporary files
+*.tmp
+*.log
+output.txt
+*.cache
+
+# IDE / editor files
+.vs/
+.vscode/
+*.swp
+*.swo
+
+# Local configuration
+.env

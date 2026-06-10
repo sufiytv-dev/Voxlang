@@ -1,0 +1,47 @@
+# test_string.vx
+
+fn print(s: &str):
+    puts(s as i8*)
+}
+
+fn assert(cond: i32, msg: &str):
+    if cond == 0:
+        print("FAIL: ")
+        print(msg)
+        print("\n")
+        exit(1)
+    }
+}
+
+fn main() -> i32:
+    let hello: &str = "Hello"
+    assert(len(hello) == 5, "len literal")
+
+    let mut s: String = String::new()
+    assert(len(s) == 0, "new length")
+
+    let t: String = String::from(hello)
+    assert(len(t) == 5, "from length")
+
+    push_str(&mut s, "World")
+
+    let slice: &str = as_str(&t)
+    assert(len(slice) == 5, "as_str length")
+
+    let full: String = String::from("abcdefgh")
+    let full_slice: &str = as_str(&full)
+    let mid: &str = full_slice[2..5]
+    assert(len(mid) == 3, "slice len")
+    let prefix: &str = full_slice[..3]
+    assert(len(prefix) == 3, "prefix len")
+    let suffix: &str = full_slice[5..]
+    assert(len(suffix) == 3, "suffix len")
+    let whole: &str = full_slice[..]
+    assert(len(whole) == 8, "whole len")
+
+    assert(len(full) == 8, "len on String")
+    assert(len(whole) == 8, "len on &str")
+
+    print("All string tests passed!\n")
+    return 0
+}

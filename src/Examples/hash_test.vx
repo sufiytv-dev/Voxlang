@@ -1,0 +1,76 @@
+# examples/hashmap_tests.vx
+# Tests for HashMap<K,V> built‑in generic struct
+
+fn test_basic() -> i32:
+    let mut m: HashMap<&str, i32> = HashMap::new()
+
+    insert(m, "a", 1)
+    insert(m, "b", 2)
+    insert(m, "c", 3)
+
+    assert(contains_key(m, "a") == 1, "contains_key a")
+    assert(contains_key(m, "d") == 0, "contains_key d")
+
+    let val_a = get(m, "a")
+    match val_a:
+        Some(v) -> assert(v == 1, "get a returns 1")
+        None    -> assert(0 == 1, "get a failed")
+    }
+
+    let val_d = get(m, "d")
+    match val_d:
+        Some(_) -> assert(0 == 1, "get d should be None")
+        None    -> assert(1 == 1, "get d returns None as expected")
+    }
+
+    assert(len(m) == 3, "len after inserts")
+
+    let removed = remove(m, "b")
+    match removed:
+        Some(v) -> assert(v == 2, "remove b returns 2")
+        None    -> assert(0 == 1, "remove b failed")
+    }
+
+    assert(contains_key(m, "b") == 0, "b removed")
+    assert(len(m) == 2, "len after remove")
+
+    # overwrite existing key
+    insert(m, "c", 30)
+    let val_c = get(m, "c")
+    match val_c:
+        Some(v) -> assert(v == 30, "overwrite c to 30")
+        None    -> assert(0 == 1, "get c after overwrite failed")
+    }
+    assert(len(m) == 2, "len unchanged after overwrite")
+
+    return 0
+}
+
+fn test_integer_keys() -> i32:
+    let mut m: HashMap<i32, &str> = HashMap::new()
+    insert(m, 42, "answer")
+    insert(m, 7,  "seven")
+
+    assert(contains_key(m, 42) == 1, "contains 42")
+    assert(len(m) == 2, "len after inserts")
+
+    let val = get(m, 42)
+    match val:
+        Some(s) -> assert(s == "answer", "get 42 returns answer")
+        None    -> assert(0 == 1, "get 42 failed")
+    }
+
+    let removed = remove(m, 7)
+    match removed:
+        Some(s) -> assert(s == "seven", "remove 7 returns seven")
+        None    -> assert(0 == 1, "remove 7 failed")
+    }
+    assert(len(m) == 1, "len after remove")
+    return 0
+}
+
+fn main() -> i32:
+    let r1 = test_basic()
+    let r2 = test_integer_keys()
+    return r1 + r2
+}

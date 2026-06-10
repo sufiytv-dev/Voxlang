@@ -1,0 +1,72 @@
+# test_generic_struct_full.vx - Full test of generic structs
+# This file checks semantic correctness of:
+# - generic struct definitions with multiple type parameters
+# - generic function returning generic structs
+# - field access on generic structs
+# - type inference for generic functions
+# - multiple instantiations of the same generic struct
+
+# Define a generic vector-like struct
+struct Vec<T>:
+    ptr: i8*
+    len: i64
+    cap: i64
+}
+
+# Define a generic pair struct
+struct Pair<A, B>:
+    first: A
+    second: B
+}
+
+# Generic constructor for Vec
+fn new_vec<T>() -> Vec<T>:
+    return Vec(ptr: 0 as i8*, len: 0 as i64, cap: 0 as i64)
+}
+
+# Generic constructor for Pair
+fn new_pair<A, B>(a: A, b: B) -> Pair<A, B>:
+    return Pair(first: a, second: b)
+}
+
+# Generic function to get length of a Vec
+fn get_len<T>(v: &Vec<T>) -> i64:
+    return v.len
+}
+
+# Generic function to get pointer (just to test field access)
+fn get_ptr<T>(v: &Vec<T>) -> i8*:
+    return v.ptr
+}
+
+fn main() -> i32:
+    # Instantiate Vec with i32
+    let v_i32: Vec<i32> = new_vec()
+    let len_i32 = get_len(&v_i32)
+    let ptr_i32 = get_ptr(&v_i32)
+
+    # Instantiate Vec with f64
+    let v_f64: Vec<f64> = new_vec()
+    let len_f64 = get_len(&v_f64)
+
+    # Type inference: no explicit type, but return value used to infer
+    let v_inferred = new_vec()
+    # The inferred type is Vec<T> with T still unknown; we need a usage that fixes T.
+    # For demonstration, we can assign to a variable with explicit type or call a function.
+    let v_explicit: Vec<i32> = v_inferred   # forces T = i32
+
+    # Pair with i32 and &str
+    let p = new_pair(42, "hello")
+    let first_i32 = p.first
+    let second_str = p.second
+
+    # Pair with f64 and i32
+    let p2 = new_pair(3.14, 100)
+
+    # Access fields directly
+    let x = p2.first
+    let y = p2.second
+
+    # All operations successful, return 0
+    return 0
+}

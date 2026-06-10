@@ -1,0 +1,255 @@
+# examples/generics.vx - Full test suite for working features.
+# Unsupported features are commented out.
+
+# =============================================================================
+# WORKING: Option and Result as monomorphic enums
+# =============================================================================
+
+fn option_demo() -> i32:
+    let some_val: Option = Option::Some
+    let none_val: Option = Option::None
+    let a = match some_val:
+        Option::Some -> 42
+        Option::None -> 0
+    }
+    let b = match none_val:
+        Option::Some -> 10
+        Option::None -> 5
+    }
+    return a + b
+}
+
+fn may_fail(flag: i32) -> Result:
+    if flag == 0:
+        return Result::Ok
+    }
+    return Result::Err
+}
+
+fn use_question(flag: i32) -> i32:
+    let res = may_fail(flag)
+    return match res:
+        Result::Ok -> 101
+        Result::Err -> 0
+    }
+}
+
+fn match_demo() -> i32:
+    let opt: Option = Option::Some
+    return match opt:
+        Option::Some -> 1
+        Option::None -> 0
+    }
+}
+
+fn match_ref_demo(opt: &Option) -> i32:
+    return match opt:
+        &Option::Some -> 100
+        &Option::None -> 0
+    }
+}
+
+# =============================================================================
+# WORKING: Generic functions (monomorphisation)
+# =============================================================================
+
+fn identity<T>(x: T) -> T:
+    return x
+}
+
+fn generic_caller<T>(x: T) -> T:
+    let y = identity(x)
+    return y
+}
+
+fn test_generics() -> i32:
+    let a = identity(42)
+    let b = identity(3.14)
+    let c = identity(Option::Some)
+    let d = identity(Result::Ok)
+    let some_opt = Option::Some
+    let e = identity(&some_opt)
+    let f = identity("hello")
+    let g = generic_caller(100)
+    assert(a == 42, "identity failed")
+    assert(g == 100, "generic_caller failed")
+    return 0
+}
+
+# =============================================================================
+# WORKING: Generic structs and Vec<T> (runtime bug present – to be fixed)
+# =============================================================================
+
+struct Vec<T>:
+    ptr: i8*
+    len: i64
+    cap: i64
+}
+
+struct Pair<A, B>:
+    first: A
+    second: B
+}
+
+fn new_vec<T>() -> Vec<T>:
+    return Vec(ptr: 0 as i8*, len: 0 as i64, cap: 0 as i64)
+}
+
+fn new_pair<A, B>(a: A, b: B) -> Pair<A, B>:
+    return Pair(first: a, second: b)
+}
+
+fn get_len<T>(v: &Vec<T>) -> i64:
+    return v.len
+}
+
+fn get_ptr<T>(v: &Vec<T>) -> i8*:
+    return v.ptr
+}
+
+fn test_vec() -> i32:
+    let mut v: Vec<i32> = new_vec()
+    push(v, 10)
+    push(v, 20)
+    push(v, 30)
+    assert(len(v) == 3, "len after pushes")
+    let x = pop(v)
+    assert(x == Some(30), "pop returns last")
+    assert(len(v) == 2, "len after pop")
+    let y = pop(v)
+    assert(y == Some(20), "pop second")
+    assert(v[0] == 10, "index works")
+    return 0
+}
+
+# =============================================================================
+# WORKING: if let
+# =============================================================================
+
+fn test_if_let(opt: Option) -> i32:
+    if let Option::Some = opt:
+        return 1
+    } else:
+        return 0
+    }
+}
+
+# =============================================================================
+# UNSUPPORTED FEATURES (commented out – will cause compile errors)
+# =============================================================================
+
+# 1. Generic enum syntax (Option<T>, Result<T,E>) – unsupported
+# fn generic_option_demo() -> i32:
+#     let some_int: Option<i32> = Option::Some(42)
+#     let none_int: Option<i32> = Option::None
+#     return match some_int:
+#         Option::Some(x) -> x
+#         Option::None -> 0
+#     }
+# }
+
+# 2. `?` operator – unsupported
+ fn may_fail_generic(flag: i32) -> Result<i32, &str>:
+     if flag == 0:
+         return Result::Ok(42)
+     } else:
+         return Result::Err("error")
+     }
+ }
+
+ fn test_question() -> Result<i32, &str>:
+    let x = may_fail_generic(0)?
+    return Result::Ok(x)
+ }
+
+# 3. `while let` – unsupported
+# fn test_while_let() -> i32:
+#     let mut i = 0
+#     while let Option::Some = get_next():
+#         i = i + 1
+#     }
+#     return i
+# }
+
+# fn get_next() -> Option:
+#     return Option::None
+# }
+
+# 4. `type` alias – unsupported
+# type MyInt = i32
+# fn test_type_alias() -> MyInt:
+#     return 42
+# }
+
+# 5. `use` statement – unsupported
+# use std::vec::Vec as MyVec
+# fn test_use() -> i32:
+#     let mut v: MyVec<i32> = MyVec::new()
+#     return len(v)
+# }
+
+# 6. `for` loop – unsupported
+# fn test_for_loop() -> i32:
+#     let arr = [1,2,3]
+#     let mut sum = 0
+#     for x in arr:
+#         sum = sum + x
+#     }
+#     return sum
+# }
+
+# 7. `HashMap<K,V>` – unsupported (not in standard library)
+# fn test_hashmap() -> i32:
+#     let mut m: HashMap<&str, i32> = HashMap::new()
+#     insert(m, "key", 42)
+#     let val = get(m, "key")
+#     return match val:
+#         Option::Some(v) -> v
+#         Option::None -> 0
+#     }
+# }
+
+# =============================================================================
+# MAIN – runs all working tests
+# =============================================================================
+
+fn main() -> i32:
+    let total = option_demo()
+    assert(total == 47, "option_demo failed")
+
+    let res = use_question(0)
+    assert(res == 101, "use_question with flag 0 failed")
+
+    let err_res = use_question(1)
+    assert(err_res == 0, "use_question with flag 1 failed")
+
+    let match_val = match_demo()
+    assert(match_val == 1, "match demo failed")
+
+    let some_opt = Option::Some
+    let match_ref = match_ref_demo(&some_opt)
+    assert(match_ref == 100, "match on reference failed")
+
+    let id_val = identity(42)
+    assert(id_val == 42, "generic identity failed")
+
+    let generics_ok = test_generics()
+    assert(generics_ok == 0, "test_generics failed")
+
+    let iflet_ok = test_if_let(Option::Some)
+    assert(iflet_ok == 1, "if let failed")
+
+    let vec_ok = test_vec()
+    assert(vec_ok == 0, "test_vec failed")
+
+    # Uncomment when feature becomes supported:
+    # let alias_ok = test_type_alias()
+    # let use_ok = test_use()
+    # let loop_ok = test_for_loop()
+    # let question_ok = test_question()
+    # let while_ok = test_while_let()
+    # let generic_enum_ok = generic_option_demo()
+    # let map_ok = test_hashmap()
+
+    return 0
+}

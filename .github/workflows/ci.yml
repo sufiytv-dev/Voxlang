@@ -1,0 +1,79 @@
+name: Voxlang CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  # Stage 1: Compile VXM for all 3 major architectures
+  build-vxm:
+    name: Build VXM (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin_name: vxm
+            asset_name: vxm-linux-amd64
+          - os: macos-latest
+            bin_name: vxm
+            asset_name: vxm-macos-amd64
+          - os: windows-latest
+            bin_name: vxm.exe
+            asset_name: vxm-windows-amd64.exe
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile VXM Orchestrator
+        run: cargo build -p vxm --release
+
+      - name: Rename Artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        run: mv target/release/${{ matrix.bin_name }} target/release/${{ matrix.asset_name }}
+
+      - name: Rename Artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: Rename-Item -Path "target\release\${{ matrix.bin_name }}" -NewName "${{ matrix.asset_name }}"
+
+      - name: Upload Release Asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Stage 2: Native Validation of the Vox Compiler Core
+  test-vox:
+    name: Core Compiler Conformance (${{ matrix.os }})
+    needs: build-vxm
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+        # Add ubuntu-latest when Linux support is ready (planned for v0.3)
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Vox Compiler
+        run: cargo build --release
+
+      - name: Run Conformance Suite
+        shell: bash
+        run: target/release/vox test
