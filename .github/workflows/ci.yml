@@ -63,7 +63,7 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, macos-latest]
-        # Add ubuntu-latest when Linux support is ready (planned for v0.3)
+        # ubuntu-latest will be added when Linux is fully supported (v0.3)
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4

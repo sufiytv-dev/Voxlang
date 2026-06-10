@@ -107,6 +107,7 @@ fn host_triple() -> String {
         ("x86_64", "windows") => "x86_64-pc-windows-msvc".to_string(),
         ("x86_64", "linux") => "x86_64-unknown-linux-gnu".to_string(),
         ("x86_64", "macos") => "x86_64-apple-darwin".to_string(),
+        ("aarch64", "macos") => "aarch64-apple-darwin".to_string(),
         (_, _) => {
             eprintln!("Unsupported host platform: {} {}", arch, os);
             std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
