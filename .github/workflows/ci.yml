@@ -42,12 +42,6 @@ jobs:
           sudo apt update
           sudo apt install -y clang lld z3
 
-      - name: Install Dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          # MacPorts is the recommended package manager for Voxlang on macOS
-          sudo port install z3
-
       - name: Compile VXM Orchestrator
         run: cargo build -p vxm --release
 
@@ -88,15 +82,9 @@ jobs:
           sudo apt update
           sudo apt install -y clang lld z3
 
-      - name: Install Dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          sudo port install z3
-
       - name: Build Vox Compiler
         run: cargo build --release
 
       - name: Run Conformance Suite
         shell: bash
         run: target/release/vox test
-        # GPU tests (kernel.vx) automatically use CPU fallback on CI runners
