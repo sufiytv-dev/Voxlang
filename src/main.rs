@@ -1,4 +1,4 @@
-// main.rs - CLI driver for Voxlang compiler. Supports check, build, run, test, update, index, clean, lsp, shell.
+// main.rs - CLI driver for Voxlang compiler.
 
 mod std;
 use std::env;
@@ -117,7 +117,7 @@ fn host_triple() -> String {
 
 fn print_usage() {
     eprintln!(
-        r#"Usage: vox [OPTIONS] <COMMAND>
+        r#"Usage: vox <COMMAND> [OPTIONS] [FILE|PATH]
 
 Commands:
   check   <file>          Only perform lexical, syntactic, and semantic analysis
@@ -130,23 +130,27 @@ Commands:
   lsp                     Start Language Server Protocol server
   shell                   Start interactive REPL shell
 
-Global Options:
+Options (may appear before or after the command):
   --debug                 Enable debug output (lexer, parser, codegen)
   --target <TRIPLE>       Target triple (default: host triple)
   --output-format <FORMAT> Specify terminal formatting ("pretty", "json", "auto")
   --gpu <BACKEND>         GPU backend: "cuda" or "hip"
-  --gpu-arch <ARCH>       GPU architecture (e.g., sm_70, gfx1200)
+  --gpu-arch <ARCH>       GPU architecture (e.g., sm_70, sm_75, gfx1200)
   --no-cache              Ignore all caches
-  --reuse-proofs          Reuse cached Z3 proofs (default: true)
-  --reuse-bitcode         Reuse cached LLVM bitcode (default: true)
+  --reuse-proofs [true|false] Reuse cached Z3 proofs (default: true)
+  --reuse-bitcode [true|false] Reuse cached LLVM bitcode (default: true)
   --offline               Do not download remote modules; fail if not cached
   --trust-modules         Allow @comptime execution in imported modules (security risk)
 "#
     );
 }
 
+// -----------------------------------------------------------------------------
+// Argument parsing (flags anywhere, command first)
+// -----------------------------------------------------------------------------
 fn parse_args() -> Cli {
     let args: Vec<String> = env::args().skip(1).collect();
+
     let mut debug = false;
     let mut target = host_triple();
     let mut output_format = diagnostic::OutputFormat::Auto;
@@ -157,214 +161,148 @@ fn parse_args() -> Cli {
     let mut reuse_bitcode = true;
     let mut offline = false;
     let mut trust_modules = false;
+    let mut update_write = false;
+    let mut index_watch = false;
 
     let mut i = 0;
+    let mut non_flag_tokens = Vec::new();
+
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--debug" {
-            debug = true;
-            i += 1;
-        } else if arg == "--target" {
-            if i + 1 >= args.len() {
-                eprintln!("Error: --target requires a value");
-                print_usage();
-                std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
-            }
-            target = args[i + 1].clone();
-            i += 2;
-        } else if arg == "--output-format" {
-            if i + 1 >= args.len() {
-                eprintln!("Error: --output-format requires a value (pretty, json, or auto)");
-                print_usage();
-                std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
-            }
-            let val = args[i + 1].as_str();
-            output_format = match val {
-                "pretty" => diagnostic::OutputFormat::Pretty,
-                "json" => diagnostic::OutputFormat::Json,
-                "auto" => diagnostic::OutputFormat::Auto,
+        if arg.starts_with("--") {
+            match arg.as_str() {
+                "--debug" => debug = true,
+                "--target" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("Error: --target requires a value");
+                        print_usage();
+                        std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
+                    }
+                    target = args[i + 1].clone();
+                    i += 1;
+                }
+                "--output-format" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("Error: --output-format requires a value (pretty, json, or auto)");
+                        print_usage();
+                        std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
+                    }
+                    let val = args[i + 1].as_str();
+                    output_format = match val {
+                        "pretty" => diagnostic::OutputFormat::Pretty,
+                        "json" => diagnostic::OutputFormat::Json,
+                        "auto" => diagnostic::OutputFormat::Auto,
+                        _ => {
+                            eprintln!("Error: Invalid output format '{}'", val);
+                            print_usage();
+                            std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
+                        }
+                    };
+                    i += 1;
+                }
+                "--gpu" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("Error: --gpu requires a backend (cuda or hip)");
+                        print_usage();
+                        std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
+                    }
+                    let backend = args[i + 1].clone();
+                    if backend != "cuda" && backend != "hip" {
+                        eprintln!("Error: --gpu must be 'cuda' or 'hip', got '{}'", backend);
+                        print_usage();
+                        std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
+                    }
+                    gpu = Some(backend);
+                    i += 1;
+                }
+                "--gpu-arch" => {
+                    if i + 1 >= args.len() {
+                        eprintln!("Error: --gpu-arch requires a value");
+                        print_usage();
+                        std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
+                    }
+                    gpu_arch = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                "--no-cache" => no_cache = true,
+                "--reuse-proofs" => {
+                    if i + 1 < args.len() && args[i + 1] == "false" {
+                        reuse_proofs = false;
+                        i += 1;
+                    }
+                }
+                "--reuse-bitcode" => {
+                    if i + 1 < args.len() && args[i + 1] == "false" {
+                        reuse_bitcode = false;
+                        i += 1;
+                    }
+                }
+                "--offline" => offline = true,
+                "--trust-modules" => trust_modules = true,
+                "--write" => update_write = true,
+                "--watch" => index_watch = true,
                 _ => {
-                    eprintln!(
-                        "Error: Invalid output format '{}'. Use 'pretty', 'json', or 'auto'.",
-                        val
-                    );
+                    eprintln!("Error: Unknown option '{}'", arg);
                     print_usage();
                     std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
                 }
-            };
-            i += 2;
-        } else if arg == "--gpu" {
-            if i + 1 >= args.len() {
-                eprintln!("Error: --gpu requires a backend (cuda or hip)");
-                print_usage();
-                std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
             }
-            let backend = args[i + 1].clone();
-            if backend != "cuda" && backend != "hip" {
-                eprintln!("Error: --gpu must be 'cuda' or 'hip', got '{}'", backend);
-                print_usage();
-                std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
-            }
-            gpu = Some(backend);
-            i += 2;
-        } else if arg == "--gpu-arch" {
-            if i + 1 >= args.len() {
-                eprintln!("Error: --gpu-arch requires a value");
-                print_usage();
-                std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
-            }
-            gpu_arch = Some(args[i + 1].clone());
-            i += 2;
-        } else if arg == "--no-cache" {
-            no_cache = true;
             i += 1;
-        } else if arg == "--reuse-proofs" {
-            if i + 1 < args.len() && args[i + 1] == "false" {
-                reuse_proofs = false;
-                i += 2;
-            } else {
-                reuse_proofs = true;
-                i += 1;
-            }
-        } else if arg == "--reuse-bitcode" {
-            if i + 1 < args.len() && args[i + 1] == "false" {
-                reuse_bitcode = false;
-                i += 2;
-            } else {
-                reuse_bitcode = true;
-                i += 1;
-            }
-        } else if arg == "--offline" {
-            offline = true;
-            i += 1;
-        } else if arg == "--trust-modules" {
-            trust_modules = true;
-            i += 1;
-        } else if arg.starts_with('-') {
-            eprintln!("Error: Unknown option '{}'", arg);
-            print_usage();
-            std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
         } else {
-            break;
+            non_flag_tokens.push(arg.clone());
+            i += 1;
         }
     }
 
-    let remaining = &args[i..];
-    if remaining.is_empty() {
+    if non_flag_tokens.is_empty() {
         eprintln!("Error: No command specified");
         print_usage();
         std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
     }
 
-    let command_str = &remaining[0];
-    let command_args = &remaining[1..];
+    let command_str = non_flag_tokens[0].clone();
+    let cmd_args = &non_flag_tokens[1..];
 
     let command = match command_str.as_str() {
         "check" => {
-            if command_args.is_empty() {
+            if cmd_args.is_empty() {
                 eprintln!("Error: 'check' requires a file argument");
                 print_usage();
                 std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
             }
-            let file = command_args[0].clone();
-            if command_args.len() > 1 {
-                eprintln!("Warning: extra arguments after file ignored");
-            }
-            Commands::Check { file }
+            Commands::Check { file: cmd_args[0].clone() }
         }
         "build" => {
-            if command_args.is_empty() {
+            if cmd_args.is_empty() {
                 eprintln!("Error: 'build' requires a file argument");
                 print_usage();
                 std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
             }
-            let file = command_args[0].clone();
-            if command_args.len() > 1 {
-                eprintln!("Warning: extra arguments after file ignored");
-            }
-            Commands::Build { file }
+            Commands::Build { file: cmd_args[0].clone() }
         }
         "run" => {
-            if command_args.is_empty() {
+            if cmd_args.is_empty() {
                 eprintln!("Error: 'run' requires a file argument");
                 print_usage();
                 std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
             }
-            let file = command_args[0].clone();
-            if command_args.len() > 1 {
-                eprintln!("Warning: extra arguments after file ignored");
-            }
-            Commands::Run { file }
+            Commands::Run { file: cmd_args[0].clone() }
         }
         "test" => {
-            let path = if command_args.is_empty() {
-                "src/Examples".to_string()
-            } else {
-                command_args[0].clone()
-            };
-            if command_args.len() > 1 {
-                eprintln!("Warning: extra arguments after path ignored");
-            }
+            let path = cmd_args.first().cloned().unwrap_or_else(|| "src/Examples".to_string());
             Commands::Test { path }
         }
         "update" => {
-            let mut write = false;
-            let mut path = ".".to_string();
-            let mut j = 0;
-            while j < command_args.len() {
-                let arg = &command_args[j];
-                if arg == "--write" {
-                    write = true;
-                    j += 1;
-                } else if !arg.starts_with('-') {
-                    path = arg.clone();
-                    j += 1;
-                } else {
-                    eprintln!("Error: Unknown update option '{}'", arg);
-                    print_usage();
-                    std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
-                }
-            }
-            Commands::Update { write, path }
+            let path = cmd_args.first().cloned().unwrap_or_else(|| ".".to_string());
+            Commands::Update { write: update_write, path }
         }
         "index" => {
-            let mut watch = false;
-            let mut path = ".".to_string();
-            let mut j = 0;
-            while j < command_args.len() {
-                let arg = &command_args[j];
-                if arg == "--watch" {
-                    watch = true;
-                    j += 1;
-                } else if !arg.starts_with('-') {
-                    path = arg.clone();
-                    j += 1;
-                } else {
-                    eprintln!("Error: Unknown index option '{}'", arg);
-                    print_usage();
-                    std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
-                }
-            }
-            Commands::Index { path, watch }
+            let path = cmd_args.first().cloned().unwrap_or_else(|| ".".to_string());
+            Commands::Index { watch: index_watch, path }
         }
-        "clean" => {
-            if !command_args.is_empty() {
-                eprintln!("Warning: 'clean' takes no arguments; ignoring extra");
-            }
-            Commands::Clean
-        }
-        "lsp" => {
-            if !command_args.is_empty() {
-                eprintln!("Warning: 'lsp' takes no arguments; ignoring extra");
-            }
-            Commands::Lsp
-        }
-        "shell" => {
-            if !command_args.is_empty() {
-                eprintln!("Warning: 'shell' takes no arguments; ignoring extra");
-            }
-            Commands::Shell
-        }
+        "clean" => Commands::Clean,
+        "lsp" => Commands::Lsp,
+        "shell" => Commands::Shell,
         _ => {
             eprintln!("Error: Unknown command '{}'", command_str);
             print_usage();
@@ -407,9 +345,7 @@ pub fn get_cache_dir() -> PathBuf {
 fn has_kernel(node: &ASTNode, device_triple: &mut Option<String>) -> bool {
     match node {
         ASTNode::Program(stmts, _) => stmts.iter().any(|s| has_kernel(s, device_triple)),
-        ASTNode::KernelFn {
-            device_triple: dt, ..
-        } => {
+        ASTNode::KernelFn { device_triple: dt, .. } => {
             if device_triple.is_none() {
                 *device_triple = Some(dt.clone());
             }
@@ -417,30 +353,6 @@ fn has_kernel(node: &ASTNode, device_triple: &mut Option<String>) -> bool {
         }
         _ => false,
     }
-}
-
-#[allow(dead_code)]
-fn detect_gpu_from_source(src_path: &Path) -> (bool, Option<String>) {
-    let source_code = match std::fs::read_to_string(src_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Warning: cannot read source for GPU detection: {}", e);
-            return (false, None);
-        }
-    };
-    let mut lexer = Lexer::new(&source_code);
-    let tokens = match lexer.tokenize() {
-        Ok(t) => t,
-        Err(()) => {
-            eprintln!("Warning: lexing failed during GPU detection");
-            return (false, None);
-        }
-    };
-    let mut parser = Parser::new(&tokens);
-    let ast = parser.parse();
-    let mut device_triple = None;
-    let has_gpu = has_kernel(&ast, &mut device_triple);
-    (has_gpu, device_triple)
 }
 
 // -----------------------------------------------------------------------------
@@ -465,49 +377,26 @@ pub fn compile_source(
 ) -> Result<CompilationResult, String> {
     let path = Path::new(file_path);
     if !path.exists() {
-        return Err(format!(
-            "Target source file '{}' does not exist.",
-            file_path
-        ));
+        return Err(format!("Target source file '{}' does not exist.", file_path));
     }
     if path.extension().and_then(|s| s.to_str()) != Some("vx") {
         return Err("Input file must have .vx extension.".to_string());
     }
 
     emit_phase_update("Loading source file", 5);
-    let user_source = match module::read_source_file(path) {
-        Ok(s) => s,
-        Err(e) => return Err(format!("Failed to read file: {}", e)),
-    };
-    let full_source = user_source;
+    let full_source = module::read_source_file(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
 
     if debug {
         eprintln!("[DEBUG] Source length: {} bytes", full_source.len());
-        eprintln!("[DEBUG] ===== SOURCE BEGIN =====");
-        eprintln!("{}", &full_source[..full_source.len().min(500)]);
-        if full_source.len() > 500 {
-            eprintln!("... (truncated)");
-        }
-        eprintln!("[DEBUG] ===== SOURCE END =====");
     }
 
     emit_phase_update("Lexical analysis", 10);
     let mut lexer = Lexer::new(&full_source);
     lexer.set_debug(debug);
-    let tokens = match lexer.tokenize() {
-        Ok(t) => t,
-        Err(()) => return Err("Lexical analysis failed".to_string()),
-    };
+    let tokens = lexer.tokenize().map_err(|_| "Lexical analysis failed".to_string())?;
 
     emit_phase_update("Syntactic parsing", 25);
-    if debug {
-        eprintln!("\n=== TOKEN STREAM ===");
-        for (i, t) in tokens.iter().enumerate() {
-            eprintln!("  {:3}: {:?} at {:?}", i, t.kind, t.span);
-        }
-        eprintln!();
-    }
-
     let mut parser = Parser::new(&tokens);
     parser.set_debug(debug);
     let ast = parser.parse();
@@ -515,103 +404,34 @@ pub fn compile_source(
         return Err("Parsing failed due to syntax errors".to_string());
     }
 
-    eprintln!("\n[DEBUG] === AFTER PARSING ===");
-    if let ASTNode::Program(stmts, _) = &ast {
-        eprintln!("Parsed program has {} statements", stmts.len());
-        for (idx, stmt) in stmts.iter().enumerate() {
-            if let ASTNode::FunctionDef { name, .. } = stmt {
-                eprintln!("  [{}] FunctionDef: {}", idx, name);
-            } else {
-                eprintln!("  [{}] {:?}", idx, stmt);
-            }
-        }
-    } else {
-        eprintln!("Parsed AST is not a Program node! {:?}", ast);
-    }
-
     emit_phase_update("Desugaring syntactic sugar", 30);
     let desugared_ast = desugar(ast);
 
-    eprintln!("\n[DEBUG] === AFTER DESUGARING ===");
-    if let ASTNode::Program(stmts, _) = &desugared_ast {
-        eprintln!("Desugared program has {} statements", stmts.len());
-        for (idx, stmt) in stmts.iter().enumerate() {
-            if let ASTNode::FunctionDef { name, .. } = stmt {
-                eprintln!("  [{}] FunctionDef: {}", idx, name);
-            } else {
-                eprintln!("  [{}] {:?}", idx, stmt);
-            }
-        }
-    } else {
-        eprintln!("Desugared AST is not a Program node! {:?}", desugared_ast);
-    }
-
     emit_phase_update("Import resolution & semantic analysis", 40);
-
     let mut resolver = ModuleResolver::new(path, config);
     let mut semantic = SemanticAnalyzer::with_resolver(&mut resolver);
 
     use bridge::ForeignFunction;
     let mut ffi_functions = vec![
-        ForeignFunction {
-            name: "puts".to_string(),
-            param_types: vec!["i8*".to_string()],
-            return_type: "i32".to_string(),
-        },
-        ForeignFunction {
-            name: "exit".to_string(),
-            param_types: vec!["i32".to_string()],
-            return_type: "void".to_string(),
-        },
-        ForeignFunction {
-            name: "vox_as_ptr".to_string(),
-            param_types: vec!["*const u8".to_string(), "usize".to_string()],
-            return_type: "*const u8".to_string(),
-        },
-        ForeignFunction {
-            name: "vox_str_len".to_string(),
-            param_types: vec!["*const u8".to_string(), "usize".to_string()],
-            return_type: "i32".to_string(),
-        },
-        ForeignFunction {
-            name: "vox_eprint_str".to_string(),
-            param_types: vec!["*const u8".to_string(), "usize".to_string()],
-            return_type: "i32".to_string(),
-        },
-        ForeignFunction {
-            name: "vox_eprintln_str".to_string(),
-            param_types: vec!["*const u8".to_string(), "usize".to_string()],
-            return_type: "i32".to_string(),
-        },
-        ForeignFunction {
-            name: "vox_print_str".to_string(),
-            param_types: vec!["*const u8".to_string(), "usize".to_string()],
-            return_type: "i32".to_string(),
-        },
-        ForeignFunction {
-            name: "vox_println_str".to_string(),
-            param_types: vec!["*const u8".to_string(), "usize".to_string()],
-            return_type: "i32".to_string(),
-        },
+        ForeignFunction { name: "puts".to_string(), param_types: vec!["i8*".to_string()], return_type: "i32".to_string() },
+        ForeignFunction { name: "exit".to_string(), param_types: vec!["i32".to_string()], return_type: "void".to_string() },
+        ForeignFunction { name: "vox_as_ptr".to_string(), param_types: vec!["*const u8".to_string(), "usize".to_string()], return_type: "*const u8".to_string() },
+        ForeignFunction { name: "vox_str_len".to_string(), param_types: vec!["*const u8".to_string(), "usize".to_string()], return_type: "i32".to_string() },
+        ForeignFunction { name: "vox_eprint_str".to_string(), param_types: vec!["*const u8".to_string(), "usize".to_string()], return_type: "i32".to_string() },
+        ForeignFunction { name: "vox_eprintln_str".to_string(), param_types: vec!["*const u8".to_string(), "usize".to_string()], return_type: "i32".to_string() },
+        ForeignFunction { name: "vox_print_str".to_string(), param_types: vec!["*const u8".to_string(), "usize".to_string()], return_type: "i32".to_string() },
+        ForeignFunction { name: "vox_println_str".to_string(), param_types: vec!["*const u8".to_string(), "usize".to_string()], return_type: "i32".to_string() },
     ];
     if target.contains("windows") {
         ffi_functions.push(ForeignFunction {
             name: "MessageBoxA".to_string(),
-            param_types: vec![
-                "i8*".to_string(),
-                "i8*".to_string(),
-                "i8*".to_string(),
-                "i32".to_string(),
-            ],
+            param_types: vec!["i8*".to_string(), "i8*".to_string(), "i8*".to_string(), "i32".to_string()],
             return_type: "i32".to_string(),
         });
     }
     semantic.register_ffi_signatures(ffi_functions);
 
-    eprintln!("\n[DEBUG] === BEFORE SEMANTIC ANALYSIS ===");
     let semantic_ok = semantic.check(&desugared_ast);
-    eprintln!("[DEBUG] Semantic analysis returned: {}", semantic_ok);
-
     if !semantic_ok {
         return Ok(CompilationResult {
             _ast: desugared_ast,
@@ -632,17 +452,19 @@ pub fn compile_source(
 
     emit_phase_update("IR generation", 70);
 
-    let forced_device_triple = gpu_backend.map(|backend| {
-        let arch = gpu_arch.unwrap_or_else(|| match backend {
-            "cuda" => "sm_70",
-            "hip" => "gfx1200",
-            _ => unreachable!(),
-        });
-        match backend {
-            "cuda" => format!("nvptx64-nvidia-cuda--{}", arch),
-            "hip" => format!("amdgcn-amd-amdhsa--{}", arch),
-            _ => unreachable!(),
-        }
+    // Determine GPU architecture default (sm_75 for RTX 2070 Super)
+    let default_gpu_arch = match gpu_backend {
+        Some("cuda") => "sm_75",
+        Some("hip")  => "gfx1200",
+        _ => "sm_75",
+    };
+    let effective_gpu_arch = gpu_arch.unwrap_or(default_gpu_arch);
+
+    // Standard device triples WITHOUT architecture suffix (architecture passed via -mcpu to llc)
+    let forced_device_triple = gpu_backend.map(|backend| match backend {
+        "cuda" => "nvptx64-nvidia-cuda".to_string(),
+        "hip"  => "amdgcn-amd-amdhsa".to_string(),
+        _ => unreachable!(),
     });
 
     let mut codegen = CodegenEngine::new(target);
@@ -656,30 +478,21 @@ pub fn compile_source(
     for (alias, module_ast) in imported_modules {
         codegen.add_imported_module_ast(alias, module_ast);
     }
+    // Pass the GPU architecture (e.g., "sm_75") to the code generator
+    codegen.set_gpu_arch(Some(effective_gpu_arch.to_string()));
 
-    match discovery::find_llvm_tools() {
-        Ok(llvm) => {
-            codegen.set_llvm_paths(llvm.clang, llvm.llc, llvm.lld);
-        }
+    // LLVM tool discovery with fallback
+    let llvm_paths = match discovery::find_llvm_tools() {
+        Ok(tools) => tools,
         Err(e) => {
-            eprintln!("Warning: LLVM tools auto-discovery failed: {}", e);
-            eprintln!("Falling back to 'clang', 'llc', 'ld.lld' from PATH.");
+            eprintln!("Warning: LLVM auto-discovery failed: {}", e);
+            find_llvm_fallback().unwrap_or_else(|| {
+                eprintln!("Error: Could not find clang/llc. Please install LLVM tools.");
+                std::process::exit(diagnostic::exit_code::LINKER_ERROR);
+            })
         }
-    }
-
-    eprintln!("\n[DEBUG] === BEFORE CODEGEN ===");
-    if let ASTNode::Program(stmts, _) = &desugared_ast {
-        eprintln!("Codegen input program has {} statements", stmts.len());
-        for (idx, stmt) in stmts.iter().enumerate() {
-            if let ASTNode::FunctionDef { name, .. } = stmt {
-                eprintln!("  [{}] FunctionDef: {}", idx, name);
-            } else {
-                eprintln!("  [{}] {:?}", idx, stmt);
-            }
-        }
-    } else {
-        eprintln!("Codegen input is not a Program node! {:?}", desugared_ast);
-    }
+    };
+    codegen.set_llvm_paths(llvm_paths.clang, llvm_paths.llc, llvm_paths.lld);
 
     let llvm_ir = codegen.generate(&desugared_ast);
     if llvm_ir.is_empty() && codegen.has_error {
@@ -687,7 +500,6 @@ pub fn compile_source(
     }
 
     emit_phase_update("Code generation complete", 100);
-
     Ok(CompilationResult {
         _ast: desugared_ast,
         semantic_ok,
@@ -697,6 +509,7 @@ pub fn compile_source(
     })
 }
 
+// Public function used by watch.rs
 pub fn check_file(file_path: &str, debug: bool, target: &str, config: &CacheConfig) -> bool {
     match compile_source(file_path, debug, target, None, None, config) {
         Ok(result) => result.semantic_ok,
@@ -704,6 +517,53 @@ pub fn check_file(file_path: &str, debug: bool, target: &str, config: &CacheConf
             eprintln!("Fatal error: {}", e);
             false
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// LLVM tool fallback (search many common paths)
+// -----------------------------------------------------------------------------
+fn find_llvm_fallback() -> Option<discovery::LlvmPaths> {
+    let mut clang_paths = vec![
+        "/usr/bin/clang".to_string(),
+        "/usr/local/bin/clang".to_string(),
+    ];
+    let mut llc_paths = vec![
+        "/usr/bin/llc".to_string(),
+        "/usr/local/bin/llc".to_string(),
+    ];
+
+    for v in 10..=19 {
+        clang_paths.push(format!("/usr/lib/llvm-{}/bin/clang", v));
+        clang_paths.push(format!("/usr/bin/clang-{}", v));
+        llc_paths.push(format!("/usr/lib/llvm-{}/bin/llc", v));
+        llc_paths.push(format!("/usr/bin/llc-{}", v));
+    }
+
+    let mut clang = None;
+    for p in &clang_paths {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            clang = Some(path);
+            break;
+        }
+    }
+    let mut llc = None;
+    for p in &llc_paths {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            llc = Some(path);
+            break;
+        }
+    }
+
+    match (clang, llc) {
+        (Some(c), Some(l)) => Some(discovery::LlvmPaths {
+            clang: c.clone(),
+            llc: l,
+            lld: Some(c),
+        }),
+        _ => None,
     }
 }
 
@@ -721,14 +581,11 @@ fn cmd_check(
 ) -> i32 {
     emit_phase_update("Checking program", 0);
     match compile_source(file, debug, target, gpu, gpu_arch, config) {
-        Ok(result) => {
-            if result.semantic_ok {
-                println!("Check passed.");
-                diagnostic::exit_code::SUCCESS
-            } else {
-                diagnostic::exit_code::SEMANTIC_ERROR
-            }
+        Ok(result) if result.semantic_ok => {
+            println!("Check passed.");
+            diagnostic::exit_code::SUCCESS
         }
+        Ok(_) => diagnostic::exit_code::SEMANTIC_ERROR,
         Err(e) => {
             eprintln!("{}", e);
             diagnostic::exit_code::GENERIC_ERROR
@@ -736,14 +593,11 @@ fn cmd_check(
     }
 }
 
-// FIXED: test command runs example files from src/Examples (or fallback)
 fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
     let examples_dir = if Path::new(path_str).exists() {
         Path::new(path_str)
     } else if Path::new("src/Examples").exists() {
         Path::new("src/Examples")
-    } else if Path::new("src/examples").exists() {
-        Path::new("src/examples")
     } else if Path::new("examples").exists() {
         Path::new("examples")
     } else {
@@ -751,10 +605,7 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
         return diagnostic::exit_code::IO_ERROR;
     };
 
-    let current_exe =
-        std::env::current_exe().expect("Failed to locate current compiler executable");
-
-    // Recursively collect all .vx files, but skip those in a 'lib' subdirectory
+    let current_exe = std::env::current_exe().expect("Failed to locate current compiler executable");
     let mut test_files = Vec::new();
     for entry in WalkDir::new(examples_dir)
         .into_iter()
@@ -773,41 +624,30 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
         return diagnostic::exit_code::SUCCESS;
     }
 
-    let mut total_tests = 0;
-    let mut passed_tests = 0;
-
+    let mut total = 0;
+    let mut passed = 0;
     println!("==================================================");
     println!("       VOXLANG COMPILER CONFORMANCE SUITE        ");
     println!("==================================================\n");
 
     for path in test_files {
         let file_name = path.file_name().unwrap().to_string_lossy();
-        if file_name.contains("gpu") {
-            continue;
-        }
-
-        total_tests += 1;
+        if file_name.contains("gpu") { continue; }
+        total += 1;
         let rel_path = path.strip_prefix(examples_dir).unwrap_or(&path);
         print!("test {:<30} ... ", rel_path.display());
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
 
-        let mut link_cmd = Command::new(&current_exe);
-        link_cmd.arg("run").arg(&path);
-        if config.no_cache {
-            link_cmd.arg("--no-cache");
-        }
-
-        let output = link_cmd
-            .output()
-            .expect("Failed to execute internal compiler run pipeline");
-
+        let mut cmd = Command::new(&current_exe);
+        cmd.arg("run").arg(&path);
+        if config.no_cache { cmd.arg("--no-cache"); }
+        let output = cmd.output().expect("Failed to execute internal compiler run pipeline");
         let stderr_str = String::from_utf8_lossy(&output.stderr);
         let has_error = stderr_str.to_lowercase().contains("error:");
-        let passed = output.status.success() || (!has_error);
-
-        if passed {
+        let ok = output.status.success() || (!has_error);
+        if ok {
             println!("✅ PASSED");
-            passed_tests += 1;
+            passed += 1;
         } else {
             println!("❌ FAILED");
             eprintln!("\n--- [STDERR OUTPUT: {}] ---", file_name);
@@ -816,12 +656,8 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
         }
     }
 
-    println!("\nResult: {}/{} tests passed.", passed_tests, total_tests);
-    if passed_tests < total_tests {
-        diagnostic::exit_code::GENERIC_ERROR
-    } else {
-        diagnostic::exit_code::SUCCESS
-    }
+    println!("\nResult: {}/{} tests passed.", passed, total);
+    if passed < total { diagnostic::exit_code::GENERIC_ERROR } else { diagnostic::exit_code::SUCCESS }
 }
 
 fn cmd_build(
@@ -859,26 +695,23 @@ fn cmd_build(
         file_name.to_string()
     };
     let exe_path = out_dir.join(&exe_filename);
-    println!(
-        "-> Invoking native toolchain backend for target {}...",
-        target
-    );
+    println!("-> Invoking native toolchain backend for target {}...", target);
 
     let has_gpu = compile_result.has_gpu;
-    let llvm_tools = discovery::find_llvm_tools().unwrap_or_else(|e| {
-        eprintln!("Error: LLVM tools not found: {}", e);
-        std::process::exit(diagnostic::exit_code::LINKER_ERROR);
-    });
+    let llvm_tools = match discovery::find_llvm_tools() {
+        Ok(tools) => tools,
+        Err(e) => {
+            eprintln!("Warning: LLVM auto-discovery failed: {}", e);
+            find_llvm_fallback().unwrap_or_else(|| {
+                eprintln!("Error: Could not find clang/llc. Please install LLVM tools.");
+                std::process::exit(diagnostic::exit_code::LINKER_ERROR);
+            })
+        }
+    };
 
     let (linker, linker_is_hip) = if has_gpu && gpu_backend == Some("hip") {
         let hipcc = discovery::find_gpu_backend("hip")
-            .and_then(|gpu| {
-                gpu.hip_path.map(|p| {
-                    p.join("bin")
-                        .join("hipcc")
-                        .with_extension(env::consts::EXE_EXTENSION)
-                })
-            })
+            .and_then(|gpu| gpu.hip_path.map(|p| p.join("bin").join("hipcc").with_extension(env::consts::EXE_EXTENSION)))
             .filter(|p| p.exists())
             .unwrap_or_else(|| PathBuf::from("hipcc"));
         (hipcc, true)
@@ -886,11 +719,9 @@ fn cmd_build(
         (llvm_tools.clang, false)
     };
 
-    let actual_ll_path = debug_ir_path.clone();
     let mut link_cmd = Command::new(&linker);
-    link_cmd.arg(&actual_ll_path).arg("-o").arg(&exe_path);
-
-    let mut link_args = Vec::<String>::new();
+    link_cmd.arg(&debug_ir_path).arg("-o").arg(&exe_path);
+    let mut link_args = Vec::new();
 
     let target_triple = if target.contains("windows") && target.contains("msvc") {
         "x86_64-pc-windows-msvc"
@@ -904,45 +735,32 @@ fn cmd_build(
     std::fs::create_dir_all(&cache_dir).expect("Failed to create runtime cache dir");
 
     let lib_name = "vox_rt";
-    let lib_extension = if target_triple.contains("msvc") {
-        ".lib"
-    } else {
-        ".a"
-    };
+    let lib_extension = if target_triple.contains("msvc") { ".lib" } else { ".a" };
     let static_lib = cache_dir.join(format!("{}{}", lib_name, lib_extension));
 
-    // vox_rt.rs is now located at src/vox_rt.rs
     let need_rebuild = !static_lib.exists()
         || fs::metadata("src/vox_rt.rs")
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| {
-                static_lib
-                    .metadata()
-                    .ok()
-                    .map(|m| m.modified().unwrap() < t)
-            })
+            .and_then(|t| static_lib.metadata().ok().map(|m| m.modified().unwrap() < t))
             .unwrap_or(true);
 
     if need_rebuild {
         let mut rustc_cmd = Command::new("rustc");
         rustc_cmd
             .arg("--crate-type=staticlib")
-            .arg("--target")
-            .arg(target_triple)
-            .arg("-C")
-            .arg("panic=abort")
-            .arg("-C")
-            .arg("opt-level=3")
-            .arg("-C")
-            .arg("overflow-checks=off")
-            .arg("--out-dir")
-            .arg(&cache_dir)
+            .arg("--target").arg(target_triple)
+            .arg("-C").arg("panic=abort")
+            .arg("-C").arg("opt-level=3")
+            .arg("-C").arg("overflow-checks=off")
+            .arg("--out-dir").arg(&cache_dir)
             .arg("src/vox_rt.rs");
         if target_triple.contains("msvc") {
             rustc_cmd.arg("-C").arg("target-feature=+crt-static");
         }
-        if gpu_backend == Some("hip") {
+        if let Some("cuda") = gpu_backend {
+            rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_cuda\"");
+        } else if let Some("hip") = gpu_backend {
             rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_enabled\"");
         }
         let status = rustc_cmd.status().expect("failed to run rustc");
@@ -956,8 +774,7 @@ fn cmd_build(
     link_args.push(format!("-l{}", lib_name));
 
     if let Some(sysroot) = std::process::Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
+        .arg("--print").arg("sysroot")
         .output()
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
@@ -969,27 +786,23 @@ fn cmd_build(
         }
     }
 
+    // Linker arguments – careful with GNU target detection
     if target_triple.contains("msvc") {
-        link_args.push("-lmsvcrt".to_string());
-        link_args.push("-loldnames".to_string());
-        link_args.push("-lkernel32".to_string());
-        link_args.push("-lntdll".to_string());
-        link_args.push("-lucrt".to_string());
-        link_args.push("-lbcrypt".to_string());
-        link_args.push("-lws2_32".to_string());
-        link_args.push("-luserenv".to_string());
-        link_args.push("-lsecur32".to_string());
-        link_args.push("-liphlpapi".to_string());
-    } else if target_triple.contains("gnu") {
-        link_args.push("-lstdc++".to_string());
-        link_args.push("-lpthread".to_string());
-        link_args.push("-lmingw32".to_string());
-        link_args.push("-lgcc_s".to_string());
-        link_args.push("-lgcc".to_string());
+        link_args.extend(vec![
+            "-lmsvcrt".to_string(), "-loldnames".to_string(), "-lkernel32".to_string(),
+            "-lntdll".to_string(), "-lucrt".to_string(), "-lbcrypt".to_string(),
+            "-lws2_32".to_string(), "-luserenv".to_string(), "-lsecur32".to_string(),
+            "-liphlpapi".to_string(),
+        ]);
+    } else if target_triple.contains("windows") && target_triple.contains("gnu") {
+        // Windows GNU (MinGW)
+        link_args.extend(vec![
+            "-lstdc++".to_string(), "-lpthread".to_string(), "-lmingw32".to_string(),
+            "-lgcc_s".to_string(), "-lgcc".to_string(),
+        ]);
     } else {
-        link_args.push("-lstdc++".to_string());
-        link_args.push("-lpthread".to_string());
-        link_args.push("-lm".to_string());
+        // Linux, macOS, etc.
+        link_args.extend(vec!["-lstdc++".to_string(), "-lpthread".to_string(), "-lm".to_string()]);
     }
 
     if target_triple.contains("msvc") {
@@ -1019,100 +832,56 @@ fn cmd_build(
                         eprintln!("Error: HIP backend requires hipcc linker.");
                         return diagnostic::exit_code::LINKER_ERROR;
                     }
-                    link_cmd.arg("-D__HIP_PLATFORM_AMD__");
-                    link_cmd.arg("-DVOX_GPU_ENABLED");
+                    link_cmd.arg("-D__HIP_PLATFORM_AMD__").arg("-DVOX_GPU_ENABLED");
                     let hip_path = discovery::find_gpu_backend("hip")
                         .and_then(|g| g.hip_path)
                         .map(|p| p.to_string_lossy().to_string())
                         .or_else(|| env::var("HIP_PATH").ok())
                         .unwrap_or_else(|| "C:\\Program Files\\AMD\\ROCm\\7.1".to_string());
-                    let hip_include = format!("{}\\include", hip_path);
-                    let hip_lib = format!("{}\\lib", hip_path);
-                    link_cmd.arg(format!("-I\"{}\"", hip_include));
-                    link_cmd.arg(format!("-L\"{}\"", hip_lib));
+                    link_cmd.arg(format!("-I\"{}\\include\"", hip_path));
+                    link_cmd.arg(format!("-L\"{}\\lib\"", hip_path));
                 }
                 "cuda" => {
+                    link_cmd.arg("-lcuda").arg("-D__CUDACC__");
                     if target.contains("windows") {
-                        link_cmd.arg("-lcuda").arg("-D__CUDACC__");
                         let cuda_path = discovery::find_gpu_backend("cuda")
                             .and_then(|g| g.cuda_path)
                             .map(|p| p.to_string_lossy().to_string())
                             .or_else(|| env::var("CUDA_PATH").ok())
-                            .unwrap_or_else(|| {
-                                "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
-                                    .to_string()
-                            });
-                        link_cmd.arg(&format!("-L{}\\lib\\x64", cuda_path));
-                        link_cmd.arg(&format!("-I{}\\include", cuda_path));
+                            .unwrap_or_else(|| "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8".to_string());
+                        link_cmd.arg(format!("-L\"{}\\lib\\x64\"", cuda_path));
+                        link_cmd.arg(format!("-I\"{}\\include\"", cuda_path));
                     } else if target.contains("linux") {
-                        link_cmd.arg("-lcuda").arg("-lcudart").arg("-D__CUDACC__");
                         link_cmd.arg("-I/usr/local/cuda/include");
                         link_cmd.arg("-L/usr/local/cuda/lib64");
                     } else if target.contains("darwin") {
                         eprintln!("Warning: GPU support on macOS is experimental");
-                        link_cmd.arg("-lcuda").arg("-D__CUDACC__");
                     }
                 }
                 _ => unreachable!(),
             }
         } else {
-            eprintln!(
-                "Info: @kernel present but no --gpu flag given. GPU code will run on CPU stub (no GPU libraries linked)."
-            );
+            eprintln!("Info: @kernel present but no --gpu flag given. GPU code will run on CPU stub.");
         }
     }
 
     if target.contains("nvptx") || target.contains("amdgcn") {
-        println!(
-            "GPU target {} does not produce a standalone host executable.",
-            target
-        );
-        println!("The device IR has been written; use external tools (ptxas, llc) to assemble.");
+        println!("GPU target {} does not produce a standalone host executable.", target);
         return diagnostic::exit_code::SUCCESS;
     }
 
-    if debug {
-        link_cmd.arg("-v");
-        let output = match link_cmd.output() {
-            Ok(out) => out,
-            Err(e) => {
-                eprintln!("Failed to spawn linker: {}", e);
-                return diagnostic::exit_code::LINKER_ERROR;
-            }
-        };
-        if output.status.success() {
+    match link_cmd.status() {
+        Ok(status) if status.success() => {
             println!("SUCCESS: Native binary compiled -> {}", exe_path.display());
             diagnostic::exit_code::SUCCESS
-        } else {
-            eprintln!("Linker command: {:?}", link_cmd);
-            eprintln!(
-                "Linker stderr:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            eprintln!(
-                "Compilation failure: {:?} exited with status {}",
-                linker, output.status
-            );
+        }
+        Ok(status) => {
+            eprintln!("Compilation failure: {:?} exited with status {}", linker, status);
             diagnostic::exit_code::LINKER_ERROR
         }
-    } else {
-        let compile_status = link_cmd.status();
-        match compile_status {
-            Ok(status) if status.success() => {
-                println!("SUCCESS: Native binary compiled -> {}", exe_path.display());
-                diagnostic::exit_code::SUCCESS
-            }
-            Ok(status) => {
-                eprintln!(
-                    "Compilation failure: {:?} exited with status {}",
-                    linker, status
-                );
-                diagnostic::exit_code::LINKER_ERROR
-            }
-            Err(e) => {
-                eprintln!("Compilation failure: could not invoke {:?}: {}", linker, e);
-                diagnostic::exit_code::LINKER_ERROR
-            }
+        Err(e) => {
+            eprintln!("Compilation failure: could not invoke {:?}: {}", linker, e);
+            diagnostic::exit_code::LINKER_ERROR
         }
     }
 }
@@ -1138,15 +907,10 @@ fn cmd_run(
         file_name.to_string()
     });
     println!("\n=== EXECUTING ===");
-    let execution_status = Command::new(&exe_path).status();
-    match execution_status {
+    match Command::new(&exe_path).status() {
         Ok(status) => {
             println!("\nProcess exited with status: {}", status);
-            if status.success() {
-                diagnostic::exit_code::SUCCESS
-            } else {
-                diagnostic::exit_code::GENERIC_ERROR
-            }
+            if status.success() { diagnostic::exit_code::SUCCESS } else { diagnostic::exit_code::GENERIC_ERROR }
         }
         Err(e) => {
             eprintln!("Failed to execute binary: {}", e);
@@ -1158,7 +922,6 @@ fn cmd_run(
 fn cmd_update(path: &str, write: bool) -> i32 {
     let path = Path::new(path);
     let mut files = Vec::new();
-
     if path.is_file() {
         if path.extension().and_then(|s| s.to_str()) == Some("vx") {
             files.push(path.to_path_buf());
@@ -1186,18 +949,10 @@ fn cmd_update(path: &str, write: bool) -> i32 {
 
     let mut updated_any = false;
     let mut error_occurred = false;
-
     for file in files {
         match update::process_file(&file, write) {
-            Ok(updated) => {
-                if updated {
-                    updated_any = true;
-                }
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                error_occurred = true;
-            }
+            Ok(updated) => if updated { updated_any = true; },
+            Err(e) => { eprintln!("{}", e); error_occurred = true; }
         }
     }
 
@@ -1256,27 +1011,28 @@ fn cmd_clean() -> i32 {
 }
 
 fn cmd_lsp() -> i32 {
-    if let Err(e) = lsp::run_server() {
-        eprintln!("LSP server error: {}", e);
-        diagnostic::exit_code::GENERIC_ERROR
-    } else {
-        diagnostic::exit_code::SUCCESS
+    match lsp::run_server() {
+        Ok(()) => diagnostic::exit_code::SUCCESS,
+        Err(e) => {
+            eprintln!("LSP server error: {}", e);
+            diagnostic::exit_code::GENERIC_ERROR
+        }
     }
 }
 
 fn cmd_shell() -> i32 {
-    if let Err(e) = shell::run() {
-        eprintln!("Shell error: {}", e);
-        diagnostic::exit_code::GENERIC_ERROR
-    } else {
-        diagnostic::exit_code::SUCCESS
+    match shell::run() {
+        Ok(()) => diagnostic::exit_code::SUCCESS,
+        Err(e) => {
+            eprintln!("Shell error: {}", e);
+            diagnostic::exit_code::GENERIC_ERROR
+        }
     }
 }
 
 // -----------------------------------------------------------------------------
 // main
 // -----------------------------------------------------------------------------
-
 fn main() {
     let cli = parse_args();
 
@@ -1294,42 +1050,14 @@ fn main() {
     refinement::set_proof_cache_enabled(!config.no_cache && config.reuse_proofs);
 
     let ui_handle = match cli.command {
-        Commands::Check { .. } | Commands::Build { .. } | Commands::Run { .. } => {
-            Some(spawn_ui_thread())
-        }
-        Commands::Test { .. } => None,
-        Commands::Update { .. }
-        | Commands::Index { .. }
-        | Commands::Clean
-        | Commands::Lsp
-        | Commands::Shell => None,
+        Commands::Check { .. } | Commands::Build { .. } | Commands::Run { .. } => Some(spawn_ui_thread()),
+        _ => None,
     };
 
     let exit_code = match cli.command {
-        Commands::Check { file } => cmd_check(
-            &file,
-            cli.debug,
-            &cli.target,
-            cli.gpu.as_deref(),
-            cli.gpu_arch.as_deref(),
-            &config,
-        ),
-        Commands::Build { file } => cmd_build(
-            &file,
-            cli.debug,
-            &cli.target,
-            cli.gpu.as_deref(),
-            cli.gpu_arch.as_deref(),
-            &config,
-        ),
-        Commands::Run { file } => cmd_run(
-            &file,
-            cli.debug,
-            &cli.target,
-            cli.gpu.as_deref(),
-            cli.gpu_arch.as_deref(),
-            &config,
-        ),
+        Commands::Check { file } => cmd_check(&file, cli.debug, &cli.target, cli.gpu.as_deref(), cli.gpu_arch.as_deref(), &config),
+        Commands::Build { file } => cmd_build(&file, cli.debug, &cli.target, cli.gpu.as_deref(), cli.gpu_arch.as_deref(), &config),
+        Commands::Run { file } => cmd_run(&file, cli.debug, &cli.target, cli.gpu.as_deref(), cli.gpu_arch.as_deref(), &config),
         Commands::Test { path } => cmd_test(&path, &config),
         Commands::Update { write, path } => cmd_update(&path, write),
         Commands::Index { path, watch } => cmd_index(&path, watch),

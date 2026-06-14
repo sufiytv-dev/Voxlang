@@ -44,6 +44,7 @@ pub enum TokenKind {
     Let,
     Mut,
     Ref,
+    Launch,     // GPU kernel launch keyword
 
     // Logical keywords
     And,

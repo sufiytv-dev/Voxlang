@@ -1,11 +1,6 @@
 // string_const.rs - Management of string and binary constants in generated IR.
-//
-// Extracted from the original utils.rs.
-// Contains methods for creating string/binary constants, emitting them,
-// and generating fat pointers for string literals.
 
 use crate::codegen::CodegenEngine;
-use crate::diagnostic::emit_diagnostic; // only for warning, but not used here
 use crate::parser::ASTNode;
 
 impl CodegenEngine {
@@ -83,12 +78,12 @@ impl CodegenEngine {
             name
         ));
 
+        // Get i8* pointer to the start of the array using modern opaque pointer syntax
         let array_ptr = self.next_register();
-        let array_ptr_line = format!(
-            "    {} = bitcast [{} x i8]* {} to i8*",
-            array_ptr, len, name
-        );
-        self.debug_emit(&array_ptr_line);
+        self.debug_emit(&format!(
+            "    {} = getelementptr i8, ptr {}, i64 0",
+            array_ptr, name
+        ));
 
         let fat_ptr_alloca = self.next_register();
         self.debug_emit(&format!("    {} = alloca {{ i8*, i64 }}", fat_ptr_alloca));
@@ -116,39 +111,23 @@ impl CodegenEngine {
     }
 
     /// Generate a raw i8* pointer to a string constant (without length).
-    pub fn get_string_ptr(&mut self, content: &str) -> String {
+    /// Returns `(register_name, instruction_line)` – the caller must emit the instruction line.
+    pub fn get_string_ptr(&mut self, content: &str) -> (String, String) {
         let name = self.add_string_constant(content);
-        let len = *self.string_len.get(&name).unwrap();
-        let bitcast_reg = self.next_register();
-        self.debug_emit(&format!(
-            "    {} = bitcast [{} x i8]* {} to i8*",
-            bitcast_reg, len, name
-        ));
-        let result_reg = self.next_register();
-        self.debug_emit(&format!(
-            "    {} = getelementptr inbounds i8, i8* {}, i32 0",
-            result_reg, bitcast_reg
-        ));
-        result_reg
+        let reg = self.next_register();
+        let inst = format!("    {} = getelementptr i8, ptr {}, i64 0", reg, name);
+        (reg, inst)
     }
 
     /// Generate an i8* pointer to a binary constant given its constant name.
-    pub fn get_binary_ptr(&mut self, const_name: &str) -> String {
-        let len = *self.string_len.get(const_name).unwrap();
-        let bitcast_reg = self.next_register();
-        self.debug_emit(&format!(
-            "    {} = bitcast [{} x i8]* {} to i8*",
-            bitcast_reg, len, const_name
-        ));
-        let result_reg = self.next_register();
-        self.debug_emit(&format!(
-            "    {} = getelementptr inbounds i8, i8* {}, i32 0",
-            result_reg, bitcast_reg
-        ));
-        result_reg
+    /// Returns `(register_name, instruction_line)` – the caller must emit the instruction line.
+    pub fn get_binary_ptr(&mut self, const_name: &str) -> (String, String) {
+        let reg = self.next_register();
+        let inst = format!("    {} = getelementptr i8, ptr {}, i64 0", reg, const_name);
+        (reg, inst)
     }
 
-    /// Walk the AST and collect all string literals into the pending constant list.
+    // The rest unchanged...
     pub fn collect_strings(&mut self, node: &ASTNode) {
         match node {
             ASTNode::Program(stmts, _) => {

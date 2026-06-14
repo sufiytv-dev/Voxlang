@@ -120,6 +120,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 .map(|s| self.parse_type_str_with_imports(s, &empty_set))
                 .collect();
             let return_type = self.parse_type_str_with_imports(&f.return_type, &empty_set);
+            // FFI functions are never kernels → is_kernel = false
             self.symbols.register_function(
                 &f.name,
                 param_types,
@@ -127,6 +128,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 return_type,
                 None,
                 vec![],
+                false,
             );
         }
     }

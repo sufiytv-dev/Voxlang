@@ -1,18 +1,13 @@
 // type_map.rs - Vox → LLVM type mapping and related utilities.
 //
-// Extracted from the original utils.rs.
 // Contains methods for mapping Vox types to LLVM types, computing sizes,
 // stripping generic arguments/references, and resolving concrete field types.
 //
-// NEW (2026-06-05): Added type alias expansion in `map_type` and `size_of_type`
-// using `expand_type_aliases` from helpers.
-//
-// NEW (2026-06-XX): Added mappings for `*const u8`, `*mut u8`, and `usize`.
-//
-// UPDATED (2026-06-10): Changed `Result<T,E>` mapping to use anonymous struct
-// literals instead of named forward‑declared types. This avoids LLVM
-// "Cannot allocate unsized type" errors caused by using a named struct
-// before its definition.
+// UPDATED (2026-06-14):
+// - For NVPTX, uses opaque pointers (`ptr`) with address spaces.
+// - `device_ptr_type` returns `"ptr addrspace(5)"` for local memory.
+// - Reference parameters become `ptr addrspace(1)` for global memory.
+// - Allocas get `addrspace(5)` via `alloca_addrspace_suffix`.
 
 use crate::codegen::CodegenEngine;
 use crate::codegen::helpers::sanitize_type_name;
@@ -49,6 +44,28 @@ impl CodegenEngine {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Target detection helpers (NVPTX / AMD)
+    // ------------------------------------------------------------------------
+    /// Detect if target is NVPTX (NVIDIA GPU)
+    pub fn is_nvptx(&self) -> bool {
+        self.device_triple
+            .as_ref()
+            .map(|t| t.contains("nvptx"))
+            .unwrap_or(false)
+    }
+
+    /// Detect if target is AMDGCN (AMD GPU)
+    pub fn is_amdgcn(&self) -> bool {
+        self.device_triple
+            .as_ref()
+            .map(|t| t.contains("amdgcn"))
+            .unwrap_or(false)
+    }
+
+    // ------------------------------------------------------------------------
+    // Strip helpers
+    // ------------------------------------------------------------------------
     /// Strip generic arguments from a type string (e.g., `Vec<i32>` → `Vec`).
     pub(crate) fn strip_generic_args(ty: &str) -> String {
         if let Some(angle_pos) = ty.find('<') {
@@ -84,7 +101,31 @@ impl CodegenEngine {
         without_addrspace.trim().to_string()
     }
 
-    /// Return the LLVM pointer type to use for `alloca` (depends on device triple).
+    // ------------------------------------------------------------------------
+    // Address space and pointer type helpers (for device IR)
+    // ------------------------------------------------------------------------
+    /// Return an address space suffix for `alloca` (e.g., `, addrspace(5)` for GPU).
+    pub fn alloca_addrspace_suffix(&self) -> String {
+        if self.is_nvptx() || self.is_amdgcn() {
+            ", addrspace(5)".to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    /// For device IR, return the pointer type string for local memory (allocas).
+    /// For NVPTX/AMD, this is `ptr addrspace(5)`. For host, explicit element pointer.
+    pub fn device_ptr_type(&self, _elem_ty: &str) -> String {
+        if self.is_nvptx() || self.is_amdgcn() {
+            "ptr addrspace(5)".to_string()
+        } else {
+            // Host: keep explicit pointer type
+            format!("{}*", _elem_ty)
+        }
+    }
+
+    /// Return the LLVM pointer type to use for host `alloca` (opaque `ptr`).
+    /// Kept for host code only.
     pub fn alloca_pointer_type(&self) -> String {
         if let Some(triple) = &self.device_triple {
             if triple.contains("amdgcn") {
@@ -94,16 +135,9 @@ impl CodegenEngine {
         "ptr".to_string()
     }
 
-    /// Return an address space suffix for `alloca` (e.g., `, addrspace(5)` for AMDGPU).
-    pub fn alloca_addrspace_suffix(&self) -> String {
-        if let Some(triple) = &self.device_triple {
-            if triple.contains("amdgcn") {
-                return ", addrspace(5)".to_string();
-            }
-        }
-        "".to_string()
-    }
-
+    // ------------------------------------------------------------------------
+    // Type mapping
+    // ------------------------------------------------------------------------
     /// Resolve the LLVM type of a field in a concrete generic struct.
     pub fn get_concrete_field_llvm_type(
         &self,
@@ -143,12 +177,12 @@ impl CodegenEngine {
             trimmed, is_device
         ));
 
-        // NEW: expand type aliases recursively before mapping
+        // Expand type aliases recursively before mapping
         let expanded = self.expand_type_aliases(trimmed);
         if expanded != trimmed {
             self.debug_log_type(&format!("  expanded alias '{}' -> '{}'", trimmed, expanded));
         }
-        let trimmed_str = expanded.as_str(); // convert to &str for matching
+        let trimmed_str = expanded.as_str();
 
         // Plain Option without type parameter → anonymous { i32, i32 }
         if trimmed_str == "Option" {
@@ -174,18 +208,29 @@ impl CodegenEngine {
             return trimmed_str.to_string();
         }
 
-        // References
+        // --------------------------------------------------------------------
+        // References (&mut T, & T)
+        // --------------------------------------------------------------------
         if trimmed_str.starts_with("&mut ") {
             let inner = &trimmed_str[5..];
             let inner_ty = self.map_type(inner, is_device);
-            let result = format!("{}*", inner_ty);
+            let result = if is_device && self.is_nvptx() {
+                // Global address space for kernel arguments
+                "ptr addrspace(1)".to_string()
+            } else {
+                format!("{}*", inner_ty)
+            };
             self.debug_log_type(&format!("  -> &mut {} -> {}", inner, result));
             return result;
         }
         if trimmed_str.starts_with("& ") {
             let inner = &trimmed_str[2..];
             let inner_ty = self.map_type(inner, is_device);
-            let result = format!("{}*", inner_ty);
+            let result = if is_device && self.is_nvptx() {
+                "ptr addrspace(1)".to_string()
+            } else {
+                format!("{}*", inner_ty)
+            };
             self.debug_log_type(&format!("  -> & {} -> {}", inner, result));
             return result;
         }
@@ -261,13 +306,10 @@ impl CodegenEngine {
             }
         }
 
-        // =====================================================================
-        // FIXED: Result<T,E> → anonymous struct literal (no forward declaration)
-        // =====================================================================
+        // Result<T,E> → anonymous struct literal (no forward declaration)
         if let Some((base_name, args)) = parse_generic_type(trimmed_str) {
             if base_name == "Result" && args.len() == 2 {
                 let (ok_ty, err_ty) = (args[0].clone(), args[1].clone());
-                // If either type is unknown (contains '?'), fall back to anonymous
                 if ok_ty.contains('?') || err_ty.contains('?') {
                     self.debug_log_type(&format!(
                         "  -> Result with unknown parameters: Ok='{}', Err='{}' -> {{ i32, i32 }}",
@@ -277,7 +319,6 @@ impl CodegenEngine {
                 }
                 let ok_llvm = self.map_type(&ok_ty, is_device);
                 let err_llvm = self.map_type(&err_ty, is_device);
-                // Layout: { i32 (discriminant), T (Ok payload), E (Err payload) }
                 let anonymous_struct = format!("{{ i32, {}, {} }}", ok_llvm, err_llvm);
                 self.debug_log_type(&format!(
                     "  -> Result<{},{}> -> {}",
@@ -287,7 +328,7 @@ impl CodegenEngine {
             }
         }
 
-        // FIX #1: Special‑case non‑generic struct with empty angle brackets (e.g., "Point<>")
+        // Special‑case non‑generic struct with empty angle brackets (e.g., "Point<>")
         if let Some((base_name, args)) = parse_generic_type(trimmed_str) {
             if let Some(generic_params) = self.struct_generic_params.get(&base_name) {
                 if generic_params.is_empty() && args.iter().all(|a| a.is_empty() || a == "?") {
@@ -354,15 +395,14 @@ impl CodegenEngine {
             return result;
         }
 
-        // Enum types (except Option and Result, which are already handled above) → anonymous { i32, i32 }
-        // This fallback is only for enums without payloads (unit enums) or those we don't special‑case.
+        // Enum types (except Option and Result) → anonymous { i32, i32 }
         let base_enum = Self::strip_generic_args(trimmed_str);
         if self.enum_variants.contains_key(&base_enum) {
             self.debug_log_type(&format!("  -> enum {} -> {{ i32, i32 }}", base_enum));
             return "{ i32, i32 }".to_string();
         }
 
-        // Primitives and fallback (including new mappings for *const u8, *mut u8, usize)
+        // Primitives and fallback
         let result = match trimmed_str {
             "i8" => "i8",
             "i8*" => "i8*",
@@ -408,7 +448,6 @@ impl CodegenEngine {
 
     /// Compute the size in bytes of a Vox type.
     pub fn size_of_type(&self, vox_type: &str) -> u64 {
-        // Expand type aliases before computing size
         let expanded = self.expand_type_aliases(vox_type);
         let ty = expanded.as_str();
         match ty {
@@ -439,20 +478,11 @@ impl CodegenEngine {
             t if t.starts_with("[]") => 24,
             t if t.starts_with('%') => {
                 let struct_name = &t[1..];
-                // First, check if this is a built‑in Option or Result struct that we generated
-                // but whose fields are not in `struct_fields`. Compute the size manually.
                 if struct_name.starts_with("Option_") {
-                    // %Option_T -> size = discriminant (4) + size of T
                     if let Some(underscore_pos) = struct_name.find('_') {
                         let ty_part = &struct_name[underscore_pos + 1..];
-                        // Reconstruct the Vox type from the mangled name (very crude)
-                        // For simplicity, assume the payload type is the part after the first '_'
-                        // This is a best‑effort fallback. In practice, Option<T> size is also
-                        // computed by the `struct_fields` entry when the struct is defined.
-                        // If not found, we fall back to 4+4 = 8 (assuming i32 payload).
-                        let mut payload_size = 4; // default to i32
+                        let mut payload_size = 4;
                         if let Some((base, _)) = parse_generic_type(ty_part) {
-                            // Try to get size of base type (ignoring generics)
                             payload_size = self.size_of_type(&base);
                         } else {
                             payload_size = self.size_of_type(ty_part);
@@ -460,22 +490,18 @@ impl CodegenEngine {
                         return 4 + payload_size;
                     }
                 } else if struct_name.starts_with("Result_") {
-                    // %Result_T_E -> size = discriminant (4) + size(T) + size(E)
                     let mut total = 4;
-                    // Split by '_' after "Result"
                     let parts: Vec<&str> = struct_name.split('_').collect();
                     if parts.len() >= 3 {
-                        // parts[0] = "Result", parts[1] = T, parts[2] = E (mangled)
                         let t_part = parts[1];
                         let e_part = parts[2];
                         total += self.size_of_type(t_part);
                         total += self.size_of_type(e_part);
                     } else {
-                        total += 4 + 4; // fallback
+                        total += 4 + 4;
                     }
                     return total;
                 }
-                // For user‑defined structs, use the field information.
                 if let Some(fields) = self.struct_fields.get(struct_name) {
                     let mut total = 0;
                     for (_, fty) in fields {
@@ -483,7 +509,6 @@ impl CodegenEngine {
                     }
                     total
                 } else {
-                    // Unknown named struct – assume 8 bytes (pointer)
                     8
                 }
             }
@@ -492,16 +517,12 @@ impl CodegenEngine {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Public helper for type substitution (used by generic.rs and others)
-    // ------------------------------------------------------------------------
     /// Substitute types in a type string using a substitution map.
     pub(crate) fn substitute_type_string(ty: &str, subst: &HashMap<String, String>) -> String {
         let mut result = ty.to_string();
         for (gp, conc) in subst {
             result = result.replace(gp, conc);
         }
-        // FIX #2: Clean up any remaining empty generic brackets, e.g. "Point<>" -> "Point"
         if result.ends_with("<>") {
             result = result.trim_end_matches("<>").to_string();
         }

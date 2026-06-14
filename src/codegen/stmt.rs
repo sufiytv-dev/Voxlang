@@ -4,7 +4,7 @@
 use crate::codegen::CodegenEngine;
 use crate::comptime::ComptimeEvaluator;
 use crate::diagnostic::{Diagnostic, emit_diagnostic};
-use crate::parser::{ASTNode, MatchArm, MatchPattern};
+use crate::parser::{ASTNode, KernelAttr, MatchArm, MatchPattern};
 
 // --------------------------------------------------------------------------
 // Permanent debug logging (always enabled)
@@ -37,7 +37,6 @@ impl CodegenEngine {
                 span: _,
             } => {
                 log_stmt(&format!("compiling struct definition '{}'", name));
-                // Store field information and generic parameters for later use.
                 self.struct_fields.insert(
                     name.to_string(),
                     fields
@@ -48,9 +47,6 @@ impl CodegenEngine {
                 self.struct_generic_params
                     .insert(name.clone(), generic_params.clone());
 
-                // Emit a type definition only for non‑generic structs.
-                // Generic structs will have concrete instantiations generated on demand
-                // inside map_type (see utils.rs).
                 if generic_params.is_empty() {
                     let field_types: Vec<String> =
                         fields.iter().map(|f| self.map_type(&f.ty, false)).collect();
@@ -79,6 +75,7 @@ impl CodegenEngine {
                 params,
                 body,
                 device_triple,
+                attr,
                 span,
             } => {
                 log_stmt(&format!("processing kernel '{}'", name));
@@ -103,43 +100,117 @@ impl CodegenEngine {
                     let saved_kernel_name = self.current_kernel_name.take();
                     self.current_kernel_name = Some(name.clone());
 
-                    self.compile_device_function(name, params, body);
-                    self.pending_kernel_stubs
-                        .push((name.clone(), params.clone()));
+                    // 1. Compile device function (stores kernel_attrs and param_types)
+                    self.compile_device_function(name, params, body, attr);
+
+                    // 2. Generate host launch stub: {name}_launch
+                    let stub_name = format!("{}_launch", name);
+                    let param_decls: Vec<String> = params
+                        .iter()
+                        .map(|p| format!("{} %{}", self.map_type(&p.ty, false), p.name))
+                        .collect();
+                    let param_names: Vec<String> = params.iter().map(|p| format!("%{}", p.name)).collect();
+
+                    let (block_x, block_y, block_z) = match self.kernel_attrs.get(name) {
+                        Some(attr) => (attr.block.0, attr.block.1, attr.block.2),
+                        None => (1, 1, 1),
+                    };
+
+                    let mut stub_ir = String::new();
+                    stub_ir.push_str(&format!(
+                        "define void @{}({}) {{\n",
+                        stub_name,
+                        param_decls.join(", ")
+                    ));
+                    stub_ir.push_str("entry:\n");
+
+                    let arg_array = self.next_register();
+                    stub_ir.push_str(&format!(
+                        "    {} = alloca i8*, i32 {}, align 8\n",
+                        arg_array,
+                        params.len()
+                    ));
+
+                    for (i, (param, name_reg)) in params.iter().zip(param_names.iter()).enumerate() {
+                        let param_llvm = self.map_type(&param.ty, false);
+                        let tmp = self.next_register();
+                        stub_ir.push_str(&format!("    {} = alloca {}\n", tmp, param_llvm));
+                        stub_ir.push_str(&format!(
+                            "    store {} {}, {}* {}\n",
+                            param_llvm, name_reg, param_llvm, tmp
+                        ));
+                        let ptr_to_tmp = self.next_register();
+                        stub_ir.push_str(&format!(
+                            "    {} = bitcast {}* {} to i8*\n",
+                            ptr_to_tmp, param_llvm, tmp
+                        ));
+                        let gep = self.next_register();
+                        stub_ir.push_str(&format!(
+                            "    {} = getelementptr i8*, i8** {}, i32 {}\n",
+                            gep, arg_array, i
+                        ));
+                        stub_ir.push_str(&format!("    store i8* {}, i8** {}\n", ptr_to_tmp, gep));
+                    }
+
+                    let (kernel_name_ptr, ptr_inst) = self.get_string_ptr(name);
+                    stub_ir.push_str(&ptr_inst);
+                    stub_ir.push('\n');
+                    let launch_ret = self.next_register();
+                    stub_ir.push_str(&format!(
+                        "    {} = call i32 @vox_launch_kernel_3d(i8* {}, i32 1, i32 1, i32 1, i32 {}, i32 {}, i32 {}, i8** {}, i32 {})\n",
+                        launch_ret,
+                        kernel_name_ptr,
+                        block_x, block_y, block_z,
+                        arg_array,
+                        params.len()
+                    ));
+
+                    let success_i1 = self.next_register();
+                    stub_ir.push_str(&format!("    {} = icmp eq i32 {}, 0\n", success_i1, launch_ret));
+                    let fail_label = self.next_block();
+                    let cont_label = self.next_block();
+                    stub_ir.push_str(&format!(
+                        "    br i1 {}, label %{}, label %{}\n",
+                        success_i1, cont_label, fail_label
+                    ));
+                    stub_ir.push_str(&format!("{}:\n", fail_label));
+                    stub_ir.push_str("    call void @vox_panic()\n");
+                    stub_ir.push_str("    unreachable\n");
+                    stub_ir.push_str(&format!("{}:\n", cont_label));
+                    stub_ir.push_str("    ret void\n");
+                    stub_ir.push_str("}\n\n");
+
+                    self.function_return_types.insert(stub_name, "void".to_string());
+                    self.ir.push_str(&stub_ir);
 
                     self.current_kernel_name = saved_kernel_name;
                 } else {
-                    log_stmt(&format!(
-                        "compiling kernel '{}' as CPU fallback function '{}_cpu'",
-                        name, name
-                    ));
-                    // 1. Compile the kernel body as a normal CPU function
+                    // CPU fallback: generate a normal function and a launch stub that calls it
                     let cpu_func_name = format!("{}_cpu", name);
                     let cpu_func = ASTNode::FunctionDef {
                         name: cpu_func_name.clone(),
+                        generic_params: Vec::new(),
                         params: params.clone(),
                         return_type: "void".to_string(),
                         return_refinement: None,
                         body: body.to_vec(),
                         span: *span,
-                        generic_params: Vec::new(),
                     };
                     self.compile_statement(&cpu_func);
 
-                    // 2. Emit a launch stub "{}_launch" that calls the CPU version
-                    let mut stub_ir = String::new();
-                    stub_ir.push_str(&format!("define void @{}_launch(", name));
-                    let param_strings: Vec<String> = params
+                    let stub_name = format!("{}_launch", name);
+                    let param_decls: Vec<String> = params
                         .iter()
                         .map(|p| format!("{} %{}", self.map_type(&p.ty, false), p.name))
                         .collect();
-                    stub_ir.push_str(&param_strings.join(", "));
-                    stub_ir.push_str(") {\n");
-                    stub_ir.push_str("entry:\n");
                     let call_args: Vec<String> = params
                         .iter()
                         .map(|p| format!("{} %{}", self.map_type(&p.ty, false), p.name))
                         .collect();
+
+                    let mut stub_ir = String::new();
+                    stub_ir.push_str(&format!("define void @{}({}) {{\n", stub_name, param_decls.join(", ")));
+                    stub_ir.push_str("entry:\n");
                     stub_ir.push_str(&format!(
                         "    call void @{}({})\n",
                         cpu_func_name,
@@ -148,10 +219,7 @@ impl CodegenEngine {
                     stub_ir.push_str("    ret void\n");
                     stub_ir.push_str("}\n\n");
 
-                    // Record the correct return type for the launch stub
-                    self.function_return_types
-                        .insert(format!("{}_launch", name), "void".to_string());
-
+                    self.function_return_types.insert(stub_name, "void".to_string());
                     self.ir.push_str(&stub_ir);
                 }
             }
@@ -183,7 +251,6 @@ impl CodegenEngine {
                     );
                     self.debug_emit_device(&store_line);
 
-                    // Store both LLVM type and Vox type
                     self.var_vox_types.insert(name.clone(), ty_str.to_string());
                     self.variable_symbols
                         .insert(name.clone(), (elem_ty, alloc_reg, true, false));
@@ -192,11 +259,6 @@ impl CodegenEngine {
                 }
             }
 
-            // -------------------------------------------------------------
-            // MODIFIED: FunctionDef with module prefix support, reliable closing brace,
-            //           and function stack push/pop for debugging.
-            //           FIX: Emit `ret void` for unterminated void functions.
-            // -------------------------------------------------------------
             ASTNode::FunctionDef {
                 name,
                 generic_params,
@@ -205,7 +267,6 @@ impl CodegenEngine {
                 body,
                 ..
             } => {
-                // Skip generic function templates – only concrete monomorphised versions are emitted.
                 if !generic_params.is_empty() {
                     log_stmt(&format!(
                         "skipping generic function '{}' (will be monomorphised)",
@@ -234,7 +295,6 @@ impl CodegenEngine {
                 self.function_return_types
                     .insert(actual_name.clone(), return_type.clone());
 
-                // NEW: Push function name onto the stack for brace emission logging
                 self.current_function_stack.push(actual_name.clone());
                 self.debug_log(&format!(
                     "Pushed function '{}' onto stack (depth: {})",
@@ -277,6 +337,24 @@ impl CodegenEngine {
                 self.debug_emit(&func_sig);
                 self.debug_emit("entry:");
 
+                // -------------------------------------------------------------
+                // NEW: Load GPU binary at start of main function
+                // -------------------------------------------------------------
+                if actual_name == "main" {
+                    if let Some(binary_const) = &self.kernel_binary_const {
+                        let binary_const_owned = binary_const.clone(); // owned String
+                        let (binary_ptr, ptr_inst) = self.get_binary_ptr(&binary_const_owned);
+                        self.debug_emit(&ptr_inst);
+                        let binary_size = self.string_len.get(&binary_const_owned).copied().unwrap_or(0);
+                        let data_len = binary_size.saturating_sub(1);
+                        self.debug_emit(&format!(
+                            "    call void @vox_load_device_module(i8* {}, i64 {})",
+                            binary_ptr, data_len
+                        ));
+                    }
+                }
+                // -------------------------------------------------------------
+
                 for param in params {
                     let llvm_ty = self.map_type(&param.ty, false);
                     let alloc_reg = self.fresh_alloca_name(&param.name);
@@ -304,11 +382,6 @@ impl CodegenEngine {
                     }
                 }
 
-                // -----------------------------------------------------------------
-                // FIX: Handle unterminated functions correctly.
-                // - If return type is `void` and block not terminated, emit `ret void`.
-                // - For non‑void, emit `unreachable` (or a default return value).
-                // -----------------------------------------------------------------
                 if !self.is_current_block_terminated() && !self.has_error {
                     if effective_return_type == "void" {
                         log_stmt("Void function ended without terminator, emitting ret void");
@@ -323,16 +396,12 @@ impl CodegenEngine {
                     }
                 }
 
-                // -----------------------------------------------------------------
-                // CRITICAL FIX: Always emit the closing brace, and do it via debug_emit
-                // so that block_terminated is reset automatically.
-                // -----------------------------------------------------------------
                 log_stmt(&format!(
                     "Adding closing brace for function: {}",
                     actual_name
                 ));
-                self.debug_emit("}"); // closes the function
-                self.debug_emit(""); // add a blank line for readability
+                self.debug_emit("}");
+                self.debug_emit("");
                 if self.debug {
                     crate::diagnostic::debug_log(format!(
                         "=== Finished emitting function '{}', current IR length: {} characters ===",
@@ -341,7 +410,6 @@ impl CodegenEngine {
                     ));
                 }
 
-                // NEW: Pop function name from stack after closing brace
                 let popped = self.current_function_stack.pop();
                 self.debug_log(&format!(
                     "Popped function '{:?}' from stack (remaining depth: {})",
@@ -349,7 +417,6 @@ impl CodegenEngine {
                     self.current_function_stack.len()
                 ));
 
-                // Restore state
                 self.current_function_name = old_func_name;
                 self.current_return_type = old_return_type;
                 self.register_counter = saved_counter;
@@ -368,7 +435,6 @@ impl CodegenEngine {
                     name, ty, mutable
                 ));
 
-                // Global variable (module scope)
                 if !self.in_function {
                     if let Some(ty_str) = ty {
                         if ty_str.starts_with("[]") {
@@ -416,9 +482,6 @@ impl CodegenEngine {
                     return;
                 }
 
-                // ==========================================================
-                // FIX: Use qualified resolved type lookup
-                // ==========================================================
                 let vox_type_str = if let Some(t) = ty {
                     t.clone()
                 } else if let Some(resolved) =
@@ -437,15 +500,12 @@ impl CodegenEngine {
                     self.infer_vox_type(value)
                 };
 
-                // FIX #3: Trim trailing `<>` from resolved type to avoid creating duplicate
-                //         concrete structs for non‑generic types (e.g., `Point<>` → `Point`).
                 let vox_type_str = if vox_type_str.ends_with("<>") {
                     vox_type_str.trim_end_matches("<>").to_string()
                 } else {
                     vox_type_str
                 };
 
-                // ---------- Dynamic array handling ----------
                 if vox_type_str.starts_with("[]") {
                     let elements = match &**value {
                         ASTNode::ArrayLiteral { elements, .. } => elements,
@@ -572,14 +632,12 @@ impl CodegenEngine {
                         }
                     }
 
-                    // Store Vox type and LLVM info
                     self.var_vox_types.insert(name.clone(), vox_type_str);
                     self.variable_symbols
                         .insert(name.clone(), (struct_ty, arr_ptr, false, *mutable));
                     return;
                 }
 
-                // ---------- Fixed‑size array or primitive / struct ----------
                 let llvm_ty = self.map_type(&vox_type_str, false);
                 let alloc_reg = self.fresh_alloca_name(name);
                 let alloc_line = format!("    {} = alloca {}", alloc_reg, llvm_ty);
@@ -619,7 +677,6 @@ impl CodegenEngine {
                         ));
                     }
                 } else {
-                    // Determine expected type: explicit annotation, or resolved type from inference (qualified)
                     let expected_owned = if let Some(ty_str) = ty.as_deref() {
                         Some(ty_str.to_string())
                     } else {
@@ -638,6 +695,9 @@ impl CodegenEngine {
                 }
             }
 
+            // -----------------------------------------------------------------
+            // FIXED: Assignment handling with proper DerefExpr support.
+            // -----------------------------------------------------------------
             ASTNode::Assignment { lhs, value, .. } => {
                 log_stmt("compiling assignment");
                 let val_reg = self.compile_expression(value, None);
@@ -645,7 +705,6 @@ impl CodegenEngine {
                     ASTNode::Identifier(name, _) => {
                         let (ty_str, alloc_reg, _, _) =
                             self.variable_symbols.get(name).cloned().unwrap_or_else(|| {
-                                // Fallback – generate a unique name to avoid collisions
                                 let fallback_alloc = self.fresh_alloca_name(name);
                                 ("i32".to_string(), fallback_alloc, false, false)
                             });
@@ -656,25 +715,56 @@ impl CodegenEngine {
                         self.debug_emit(&store_line);
                     }
                     ASTNode::DerefExpr(inner, _) => {
-                        let ptr_reg = self.compile_expression(inner, None);
-                        let pointee_ty = if let ASTNode::Identifier(ref_name, _) = &**inner {
-                            if let Some((ty, _, _, _)) = self.variable_symbols.get(ref_name) {
-                                ty.trim_end_matches('*').to_string()
+                        // Compile the dereference as an lvalue to get a pointer to the pointee.
+                        use crate::codegen::expr::{CodegenTarget, ExprEmitter};
+                        let mut emitter = ExprEmitter {
+                            engine: self,
+                            target: CodegenTarget::Host,
+                            lvalue: true,
+                            expected_type: None,
+                        };
+                        let ptr_reg = emitter.compile(lhs);
+                        if self.has_error {
+                            return;
+                        }
+                        // Determine the pointee type (the value type to store) from the inner identifier's Vox type.
+                        let pointee_vox_ty = if let ASTNode::Identifier(ref_name, _) = &**inner {
+                            if let Some(vox_ty) = self.var_vox_types.get(ref_name) {
+                                let mut stripped = vox_ty.as_str();
+                                while stripped.starts_with('&') {
+                                    if let Some(s) = stripped.strip_prefix("&mut ") {
+                                        stripped = s;
+                                    } else if let Some(s) = stripped.strip_prefix("& ") {
+                                        stripped = s;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                stripped.to_string()
                             } else {
-                                "i32".to_string()
+                                self.infer_vox_type(inner)
                             }
                         } else {
-                            "i32".to_string()
+                            self.infer_vox_type(inner)
                         };
-                        let store_line = format!(
-                            "    store {} {}, {}* {}",
-                            pointee_ty, val_reg, pointee_ty, ptr_reg
-                        );
-                        self.debug_emit(&store_line);
+                        let pointee_llvm_ty = self.map_type(&pointee_vox_ty, false);
+                        // The pointer type (the type of `ptr_reg`) is needed for the store instruction.
+                        // For host, this is e.g. `i32*`; for device, it may be `ptr addrspace(1)`.
+                        let ptr_ty = if let ASTNode::Identifier(ref_name, _) = &**inner {
+                            if let Some((llvm_ty, _, _, _)) = self.variable_symbols.get(ref_name) {
+                                llvm_ty.clone()
+                            } else {
+                                format!("{}*", pointee_llvm_ty)
+                            }
+                        } else {
+                            format!("{}*", pointee_llvm_ty)
+                        };
+                        self.debug_emit(&format!(
+                            "    store {} {}, {} {}",
+                            pointee_llvm_ty, val_reg, ptr_ty, ptr_reg
+                        ));
                     }
                     ASTNode::FieldAccess { expr, field, span } => {
-                        // Use ExprEmitter with lvalue = true to get a pointer to the field.
-                        // This correctly handles any number of references (&, &mut).
                         use crate::codegen::expr::{CodegenTarget, ExprEmitter};
                         let mut emitter = ExprEmitter {
                             engine: self,
@@ -687,10 +777,7 @@ impl CodegenEngine {
                             return;
                         }
 
-                        // Determine the LLVM type of the field for the store instruction.
-                        // First, get the base Vox type and strip all references.
                         let mut base_vox_ty = self.infer_vox_type(expr);
-                        // Strip outer references (e.g., &mut Point -> Point)
                         while base_vox_ty.starts_with('&') {
                             if let Some(s) = base_vox_ty.strip_prefix("&mut ") {
                                 base_vox_ty = s.to_string();
@@ -786,7 +873,6 @@ impl CodegenEngine {
             } => {
                 log_stmt("compiling if statement");
 
-                // Flatten the then_branch if it contains exactly one Block node.
                 let then_stmts = if then_branch.len() == 1 {
                     if let ASTNode::Block { statements, .. } = &then_branch[0] {
                         log_stmt(&format!(
@@ -801,7 +887,6 @@ impl CodegenEngine {
                     then_branch.as_slice()
                 };
 
-                // Flatten the else_branch similarly.
                 let else_stmts = if let Some(branch) = else_branch {
                     if branch.len() == 1 {
                         if let ASTNode::Block { statements, .. } = &branch[0] {
@@ -833,7 +918,6 @@ impl CodegenEngine {
                 ));
                 self.block_terminated = true;
 
-                // Then block
                 self.debug_emit(&format!("{}:", then_label));
                 let then_terminated = {
                     for stmt in then_stmts {
@@ -852,7 +936,6 @@ impl CodegenEngine {
                     self.block_terminated = true;
                 }
 
-                // Else block
                 let else_terminated = if let Some(stmts) = else_stmts {
                     self.debug_emit(&format!("{}:", else_label));
                     for stmt in stmts {
@@ -874,7 +957,6 @@ impl CodegenEngine {
                     self.block_terminated = true;
                 }
 
-                // Only emit the merge block if at least one branch did not terminate
                 if !then_terminated || !else_terminated {
                     self.debug_emit(&format!("{}:", merge_label));
                 }
@@ -885,7 +967,6 @@ impl CodegenEngine {
             } => {
                 log_stmt("compiling while statement");
 
-                // Flatten the loop body if it contains exactly one Block node.
                 let body_stmts = if body.len() == 1 {
                     if let ASTNode::Block { statements, .. } = &body[0] {
                         log_stmt(&format!(
@@ -940,7 +1021,6 @@ impl CodegenEngine {
             } => {
                 log_stmt("compiling parallel loop");
 
-                // Flatten the parallel loop body if it contains exactly one Block node.
                 let body_stmts = if body.len() == 1 {
                     if let ASTNode::Block { statements, .. } = &body[0] {
                         log_stmt(&format!(
@@ -1093,7 +1173,6 @@ impl CodegenEngine {
                     .unwrap_or_else(|| "void".to_string());
                 match expr_opt {
                     Some(expr) => {
-                        // FIX: pass the expected return type to the expression compiler
                         let val_reg = self.compile_expression(expr, Some(&ret_type));
                         let llvm_ret_type = self.map_type(&ret_type, false);
 
@@ -1116,7 +1195,6 @@ impl CodegenEngine {
                             }
                         }
 
-                        // If the value is a pointer and the return type is not a pointer, load the value.
                         let final_val = if val_reg.ends_with('*') && !llvm_ret_type.ends_with('*') {
                             let loaded = self.next_register();
                             self.debug_emit(&format!(
@@ -1150,9 +1228,6 @@ impl CodegenEngine {
                 let _ = self.compile_expression(node, None);
             }
 
-            // -----------------------------------------------------------------
-            // NEW: Handle Block statements – expand the statements inside.
-            // -----------------------------------------------------------------
             ASTNode::Block {
                 statements,
                 span: _,

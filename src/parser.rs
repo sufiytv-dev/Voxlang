@@ -3,6 +3,8 @@
 // Handles Voxlang syntax: functions, structs, enums, type aliases, use statements,
 // control flow (`if`, `while`, `for`, `parallel`), pattern matching (`match`, `if let`, `while let`),
 // and expressions with precedence. Blocks are delimited by `:` and closed by `}`.
+//
+// NEW: Kernel attribute `@kernel(block=(x,y,z))` and kernel launch syntax `launch name(...)(...)`.
 
 use crate::diagnostic::{Diagnostic, emit_diagnostic, global_debug};
 use crate::frontend::span::Span;
@@ -70,6 +72,20 @@ pub struct MatchArm {
     pub span: Span,
 }
 
+/// Kernel block configuration attribute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KernelAttr {
+    pub block: (u32, u32, u32), // (x, y, z)
+}
+
+impl Default for KernelAttr {
+    fn default() -> Self {
+        Self {
+            block: (256, 1, 1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ASTNode {
     Program(Vec<ASTNode>, Span),
@@ -123,6 +139,14 @@ pub enum ASTNode {
         params: Vec<Param>,
         body: Vec<ASTNode>,
         device_triple: String,
+        attr: KernelAttr,      // NEW: store block dimensions
+        span: Span,
+    },
+
+    KernelLaunch {
+        kernel: Box<ASTNode>,                      // identifier of kernel
+        grid: (Box<ASTNode>, Box<ASTNode>, Box<ASTNode>), // (x,y,z) expressions
+        args: Vec<ASTNode>,                       // actual arguments to kernel
         span: Span,
     },
 
@@ -323,7 +347,7 @@ impl<'a> Parser<'a> {
         Self {
             tokens,
             pos: 0,
-            debug: global_debug(), // respect global debug flag by default
+            debug: global_debug(),
             has_errors: false,
             block_depth: 0,
         }
@@ -514,6 +538,8 @@ impl<'a> Parser<'a> {
             self.consume_newlines();
             let result = match directive {
                 CompilerDirective::Kernel => {
+                    // Parse optional attribute `(block=(x,y,z))`
+                    let attr = self.parse_kernel_attribute();
                     if let ASTNode::FunctionDef {
                         name,
                         params,
@@ -527,6 +553,7 @@ impl<'a> Parser<'a> {
                             params,
                             body,
                             device_triple: "nvptx64-nvidia-cuda".to_string(),
+                            attr,
                             span: func_span,
                         }
                     } else {
@@ -660,6 +687,84 @@ impl<'a> Parser<'a> {
                 self.debug_log("parsing expression or assignment");
                 self.parse_expression_or_assignment()
             }
+        }
+    }
+
+    /// Parse kernel attribute: `(block=(x,y,z))` or nothing.
+    fn parse_kernel_attribute(&mut self) -> KernelAttr {
+        if !self.match_token(TokenKind::LeftParen) {
+            return KernelAttr::default();
+        }
+        self.skip_newlines();
+        // Check if the next token is an identifier (any identifier)
+        if !matches!(self.peek_kind(), Some(TokenKind::Identifier(_))) {
+            self.emit_error(
+                &Diagnostic::error("Expected 'block' in kernel attribute")
+                    .with_code("VX0180")
+                    .with_span(self.current_span()),
+            );
+            self.skip_to_expression_end();
+            return KernelAttr::default();
+        }
+        let ident = self.advance().unwrap();
+        if let TokenKind::Identifier(ref s) = ident.kind {
+            if s != "block" {
+                self.emit_error(
+                    &Diagnostic::error(&format!("Expected 'block', found '{}'", s))
+                        .with_code("VX0181")
+                        .with_span(ident.span),
+                );
+                self.skip_to_expression_end();
+                return KernelAttr::default();
+            }
+        } else {
+            self.emit_error(
+                &Diagnostic::error("Expected 'block' in kernel attribute")
+                    .with_code("VX0182")
+                    .with_span(ident.span),
+            );
+            self.skip_to_expression_end();
+            return KernelAttr::default();
+        }
+        self.expect(TokenKind::Assign);
+        self.expect(TokenKind::LeftParen);
+        let x = self.parse_u32_literal();
+        self.expect(TokenKind::Comma);
+        let y = self.parse_u32_literal();
+        self.expect(TokenKind::Comma);
+        let z = self.parse_u32_literal();
+        self.expect(TokenKind::RightParen);
+        self.expect(TokenKind::RightParen);
+        KernelAttr { block: (x, y, z) }
+    }
+
+    fn parse_u32_literal(&mut self) -> u32 {
+        if let Some(&TokenKind::IntegerLiteral(val)) = self.peek_kind() {
+            self.advance();
+            if val < 0 || val > u32::MAX as i64 {
+                self.emit_error(
+                    &Diagnostic::error("Block dimension must be a positive 32-bit integer")
+                        .with_code("VX0183")
+                        .with_span(self.current_span()),
+                );
+                return 1;
+            }
+            val as u32
+        } else {
+            self.emit_error(
+                &Diagnostic::error("Expected integer literal for block dimension")
+                    .with_code("VX0184")
+                    .with_span(self.current_span()),
+            );
+            1
+        }
+    }
+
+    fn skip_to_expression_end(&mut self) {
+        // Skip until we hit a token that ends an expression or statement boundary
+        while !self.is_at_end() && !self.check(TokenKind::Newline) && !self.check(TokenKind::ScopeClose)
+        {
+            self.advance();
         }
     }
 
@@ -2050,6 +2155,59 @@ impl<'a> Parser<'a> {
                 )
             }
             Some(&TokenKind::Match) => self.parse_match_expr(),
+            Some(&TokenKind::Launch) => {
+                // New kernel launch syntax: launch kernel_name(grid_x,grid_y,grid_z)(args...)
+                let start_span = self.current_span();
+                self.advance(); // consume 'launch'
+                // Parse kernel name (identifier)
+                let kernel_token = self.expect_identifier();
+                let kernel_name = match &kernel_token.kind {
+                    TokenKind::Identifier(s) => s.clone(),
+                    _ => {
+                        return self.parse_error(
+                            "Expected kernel name after 'launch'",
+                            kernel_token,
+                            "VX0185",
+                        );
+                    }
+                };
+                let kernel = Box::new(ASTNode::Identifier(kernel_name, kernel_token.span));
+
+                // Parse grid dimensions: ( expr , expr , expr )
+                self.expect(TokenKind::LeftParen);
+                let grid_x = Box::new(self.parse_expression());
+                self.expect(TokenKind::Comma);
+                let grid_y = Box::new(self.parse_expression());
+                self.expect(TokenKind::Comma);
+                let grid_z = Box::new(self.parse_expression());
+                self.expect(TokenKind::RightParen);
+
+                // Parse argument list: ( ... )
+                self.expect(TokenKind::LeftParen);
+                let mut args = Vec::new();
+                if !self.check(TokenKind::RightParen) {
+                    args.push(self.parse_expression());
+                    while self.match_token(TokenKind::Comma) {
+                        args.push(self.parse_expression());
+                    }
+                }
+                self.expect(TokenKind::RightParen);
+
+                let end_span = self.current_span();
+                let span = self.span_until(
+                    start_span,
+                    &Token {
+                        kind: TokenKind::EOF,
+                        span: end_span,
+                    },
+                );
+                ASTNode::KernelLaunch {
+                    kernel,
+                    grid: (grid_x, grid_y, grid_z),
+                    args,
+                    span,
+                }
+            }
             Some(&TokenKind::Identifier(_)) => {
                 let mut segments = Vec::new();
                 let first_tok = self.advance().unwrap();
@@ -2302,17 +2460,55 @@ impl<'a> Parser<'a> {
                     }
                 };
                 let end_span = self.current_span();
-                expr = ASTNode::FieldAccess {
-                    expr: Box::new(expr),
-                    field,
-                    span: self.span_until(
-                        start_span,
-                        &Token {
-                            kind: TokenKind::EOF,
-                            span: end_span,
-                        },
-                    ),
-                };
+
+                // Keep the old kernel.launch syntax for compatibility (optional)
+                if field == "launch" && self.match_token(TokenKind::LeftParen) {
+                    // Parse grid dimensions: (expr, expr, expr)
+                    self.skip_newlines();
+                    let grid_x = Box::new(self.parse_expression());
+                    self.skip_newlines();
+                    self.expect(TokenKind::Comma);
+                    self.skip_newlines();
+                    let grid_y = Box::new(self.parse_expression());
+                    self.skip_newlines();
+                    self.expect(TokenKind::Comma);
+                    self.skip_newlines();
+                    let grid_z = Box::new(self.parse_expression());
+                    self.skip_newlines();
+                    self.expect(TokenKind::RightParen);
+                    // Now parse the argument list: (args...)
+                    self.skip_newlines();
+                    self.expect(TokenKind::LeftParen);
+                    let mut args = Vec::new();
+                    self.skip_newlines();
+                    if !self.check(TokenKind::RightParen) {
+                        args.push(self.parse_expression());
+                        while self.match_token(TokenKind::Comma) {
+                            self.skip_newlines();
+                            args.push(self.parse_expression());
+                        }
+                    }
+                    self.skip_newlines();
+                    self.expect(TokenKind::RightParen);
+                    expr = ASTNode::KernelLaunch {
+                        kernel: Box::new(expr),
+                        grid: (grid_x, grid_y, grid_z),
+                        args,
+                        span: self.span_until(start_span, self.peek().unwrap()),
+                    };
+                } else {
+                    expr = ASTNode::FieldAccess {
+                        expr: Box::new(expr),
+                        field,
+                        span: self.span_until(
+                            start_span,
+                            &Token {
+                                kind: TokenKind::EOF,
+                                span: end_span,
+                            },
+                        ),
+                    };
+                }
             } else if self.match_token(TokenKind::LeftBracket) {
                 let start_span = expr.span();
                 self.skip_newlines();
@@ -2571,6 +2767,7 @@ impl ASTNode {
             ASTNode::UseDecl { span, .. } => *span,
             ASTNode::FunctionDef { span, .. } => *span,
             ASTNode::KernelFn { span, .. } => *span,
+            ASTNode::KernelLaunch { span, .. } => *span,
             ASTNode::IfStatement { span, .. } => *span,
             ASTNode::IfLetStatement { span, .. } => *span,
             ASTNode::WhileStatement { span, .. } => *span,

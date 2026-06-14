@@ -1,6 +1,7 @@
 # Voxlang – Verified Heterogeneous Systems Programming
 
-Voxlang is a modern statically typed systems programming language that combines ownership‑based memory safety, compile‑time refinement types (Z3), and first‑class heterogeneous compute (CPU + GPU).
+Voxlang is a modern statically typed systems programming language that combines ownership‑based memory safety, compile‑time refinement types (Z3), and first‑class heterogeneous compute (CPU + GPU).  
+**Runs on Windows, macOS, and Linux (x86_64) with full GPU support for NVIDIA CUDA and AMD ROCm/HIP.**
 
 > **Syntax is different from C.** Please read the [Syntax Rules](#syntax-rules) before writing your first program.
 
@@ -36,9 +37,11 @@ fn main() -> i32:
         return 0
     }
 }
+
 Quick Examples
 Refinement types (preconditions / postconditions)
 vox
+
 fn divide(a: i32, b: i32 where b != 0) -> i32 where result == a / b:
     return a / b
 }
@@ -46,8 +49,10 @@ fn divide(a: i32, b: i32 where b != 0) -> i32 where result == a / b:
 fn main():
     let result = divide(100, 5)   # verified at compile time
 }
+
 Ownership and borrowing
 vox
+
 fn take_ownership(s: String):
     # s is moved here
 }
@@ -56,13 +61,17 @@ fn main():
     let s = String("hello")
     take_ownership(s)      # s moved, cannot use again
 }
+
 GPU kernel (@kernel)
 vox
+
 @kernel fn add(a: i32, b: i32, result: &mut i32):
     *result = a + b
 }
+
 Compile‑time evaluation (@comptime)
 vox
+
 fn main():
     let a: i32 = @comptime {
         let x = 5
@@ -70,16 +79,20 @@ fn main():
         y + 3
     }
 }
+
 Parallel loop (race‑free)
 vox
+
 fn main():
     let mut sum = 0
     parallel for i in 0..10:
         sum = sum + i
     }
 }
+
 ? operator – propagate errors (fully supported)
 vox
+
 fn may_fail(flag: i32) -> Result<i32, &str>:
     if flag == 0:
         return Result::Ok(42)
@@ -92,8 +105,10 @@ fn use_question(flag: i32) -> Result<i32, &str>:
     let x = may_fail(flag)?
     return Result::Ok(x)
 }
+
 Generic Vec<T> and HashMap<K,V>
 vox
+
 fn main():
     let mut v: Vec<i32> = Vec::new()
     push(v, 10)
@@ -101,7 +116,9 @@ fn main():
     assert(len(v) == 2, "expected length 2")
     let last = pop(v)   # returns Option<i32>
 }
+
 vox
+
 fn main():
     let mut m: HashMap<&str, i32> = HashMap::new()
     insert(m, "a", 1)
@@ -112,8 +129,10 @@ fn main():
         None    -> println("none")
     }
 }
+
 Pattern matching
 vox
+
 fn main():
     let opt: Option<i32> = Some(42)
     match opt:
@@ -121,59 +140,77 @@ fn main():
         None    -> println("none")
     }
 }
+
 Getting Started
 Prerequisites
-Rust (stable)
 
-LLVM tools (clang, llc)
+    Rust (stable) – install via rustup
 
-(Optional) ROCm/HIP or CUDA for GPU support
+    LLVM tools (clang, llc) – included with Xcode (macOS), MSVC (Windows), or sudo apt install clang lld (Linux)
 
-(Optional) Z3 library for refinement verification
+    Z3 Prover – required for refinement verification
 
-Build
+        Windows: download from Z3 releases and add to PATH
+
+        macOS: brew install z3 or port install z3
+
+        Linux: sudo apt install z3 (Ubuntu/Debian) or sudo dnf install z3 (Fedora)
+
+    (Optional) GPU SDK – CUDA 11.8+ for NVIDIA GPUs, or ROCm 6.x+ for AMD GPUs
+
+Build from Source
 bash
+
+git clone https://github.com/sufiytv-dev/Voxlang
+cd Voxlang
 cargo build --release
+
+The binary will be at target/release/vox (or vox.exe on Windows). Copy it to a directory in your PATH or run cargo install --path .
+Prebuilt Binaries
+
+Prebuilt binaries are available for Windows, macOS, and Linux (x86_64) on the releases page.
+See Installation Guide for detailed instructions.
 Basic Commands
 Command	Description
 vox test	Run all examples
 vox check examples/hello.vx	Only verify
 vox build examples/hello.vx	Compile to native binary
 vox run examples/hello.vx	Build and run
-vox run --gpu hip examples/gpu_add.vx	GPU example (HIP)
+vox run --gpu cuda examples/kernel.vx	Run GPU kernel with CUDA
+vox run --gpu hip examples/kernel.vx	Run GPU kernel with HIP/ROCm
 vox update --write .	Refresh remote import hashes
 vox index .	Generate symbol index
-vox lsp	Experimental – Start LSP server (basic diagnostics only)
-vox shell	Experimental – Interactive REPL (basic evaluation)
-vox watch	Experimental – File watcher (polling‑based)
-vox clean	Remove target/
-Note: LSP, Watch, and Shell are under active development and not yet feature‑complete. Use them for early experimentation only.
+vox lsp (experimental)	Start LSP server (basic diagnostics only)
+vox shell (experimental)	Interactive REPL (basic evaluation)
+vox watch (experimental)	File watcher (polling‑based)
+vox clean	Remove target/ directory
 
-
-IMPORTANT: we do plan to add a full cross-OS installer, and making the remaining pieces feature complete.
+    Note: LSP, Watch, and Shell are under active development and not yet feature‑complete. Use them for early experimentation only.
 
 C‑Bridge – Safe C Imports
+
 Simply write import "mylib.h" in your .vx file. The compiler parses the header, generates safe Vox wrappers, and caches them. All pointers are checked for null, buffer lengths are verified, and ownership is tracked.
-
 Documentation
-Full language reference – coming soon
 
-Examples – see examples/ directory
+    Full language reference – coming soon
 
-Contributing – CONTRIBUTING.md
+    Examples – see examples/ directory
 
-Security – SECURITY.md
+    Contributing
+
+    Security
 
 License
+
 MIT License – see LICENSE for details.
-
 Acknowledgments
-Rust – ownership and borrow checker inspiration
 
-Z3 Prover – refinement verification
+    Rust – ownership and borrow checker inspiration
 
-LLVM – code generation
+    Z3 Prover – refinement verification
 
-ROCm / CUDA – GPU backends
+    LLVM – code generation
+
+    ROCm / CUDA – GPU backends
 
 Voxlang – Correctness you can prove.

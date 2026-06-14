@@ -232,6 +232,7 @@ impl<'a> Lexer<'a> {
                     "and" => TokenKind::And,
                     "or" => TokenKind::Or,
                     "not" => TokenKind::Not,
+                    "launch" => TokenKind::Launch,
                     "_" => TokenKind::Underscore,
                     _ => TokenKind::Identifier(ident),
                 };

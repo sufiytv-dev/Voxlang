@@ -1,4 +1,4 @@
-// vox_rt.rs - Runtime support for dynamic arrays, strings, parallel loops, GPU, Vec<T>, and HashMap<K,V>.
+// vox_rt.rs - Runtime support for dynamic arrays, strings, parallel loops, GPU (CUDA & HIP), Vec<T>, and HashMap<K,V>.
 // Uses std for logging/threading, direct FFI for C library functions.
 //
 // FEATURES:
@@ -29,6 +29,18 @@ fn vox_rt_log(level: &str, message: &str) {
     eprintln!("[VOX_RT][{}] {}", level, message);
 }
 
+// Helper to log a hex dump of a memory region (for debugging)
+#[allow(dead_code)]
+fn log_hex_dump(ptr: *const c_void, len: usize, label: &str) {
+    if ptr.is_null() || len == 0 {
+        vox_rt_log("debug", &format!("{}: (null or empty)", label));
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    vox_rt_log("debug", &format!("{} ({} bytes): {}", label, len, hex));
+}
+
 // ------------------------------------------------------------------
 // Panic functions – now clearly separated
 // ------------------------------------------------------------------
@@ -37,7 +49,6 @@ fn vox_rt_log(level: &str, message: &str) {
 #[no_mangle]
 pub extern "C" fn vox_panic() -> ! {
     eprintln!("VOX PANIC: assertion failed (no details)");
-    // Update the function name in the hint string here:
     eprintln!("Hint: Use vox_print_int / vox_debug_print_str before assertions to track values.");
     std::process::exit(1);
 }
@@ -258,7 +269,6 @@ pub extern "C" fn vox_print_ptr(ptr: *mut c_void) {
     eprintln!("[DEBUG] ptr = {:p}", ptr);
 }
 
-// Change this function name from vox_print_str to vox_debug_print_str
 #[no_mangle]
 pub extern "C" fn vox_debug_print_str(ptr: *const c_char) {
     if ptr.is_null() {
@@ -270,7 +280,7 @@ pub extern "C" fn vox_debug_print_str(ptr: *const c_char) {
 }
 
 // ------------------------------------------------------------------
-// epintf / printf support (write to stderr / stdout)
+// eprintf / printf support (write to stderr / stdout)
 // ------------------------------------------------------------------
 /// Write a string to stderr (raw bytes, no newline). Returns 0 on success, non‑zero on error.
 #[no_mangle]
@@ -1149,11 +1159,443 @@ pub extern "C" fn vox_dispatch_parallel(
     vox_rt_log("debug", "  -> all threads finished");
 }
 
+// ==================================================================
+// GPU Runtime Support
+// ==================================================================
+//
+// The following modules implement the GPU backend functions.
+// Exactly one of the features `vox_gpu_cuda` or `vox_gpu_enabled` can be active.
+// If neither is enabled, a fallback CPU implementation is used.
+
 // ------------------------------------------------------------------
-// GPU Runtime Support – HIP with graceful fallback (unchanged, but added logging)
+// CUDA backend (Driver API, enabled with `vox_gpu_cuda`)
+// ------------------------------------------------------------------
+#[cfg(feature = "vox_gpu_cuda")]
+mod gpu_cuda {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    use std::sync::Once;
+
+    // CUDA Driver API types (opaque)
+    type CUdevice = i32;
+    type CUcontext = *mut c_void;
+    type CUmodule = *mut c_void;
+    type CUfunction = *mut c_void;
+    type CUdeviceptr = u64;
+    type CUresult = i32;
+
+    const CUDA_SUCCESS: CUresult = 0;
+    const CU_CTX_SCHED_AUTO: u32 = 0;
+
+    extern "C" {
+        fn cuInit(flags: u32) -> CUresult;
+        fn cuDeviceGet(device: *mut CUdevice, ordinal: i32) -> CUresult;
+        fn cuCtxCreate(ctx: *mut CUcontext, flags: u32, dev: CUdevice) -> CUresult;
+        fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
+        fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult;
+        fn cuModuleGetFunction(func: *mut CUfunction, module: CUmodule, name: *const c_char) -> CUresult;
+        fn cuLaunchKernel(
+            f: CUfunction,
+            gridX: u32, gridY: u32, gridZ: u32,
+            blockX: u32, blockY: u32, blockZ: u32,
+            sharedMemBytes: u32, hStream: *mut c_void,
+            kernelParams: *mut *mut c_void, extra: *mut *mut c_void,
+        ) -> CUresult;
+        fn cuMemAlloc(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
+        fn cuMemFree(dptr: CUdeviceptr) -> CUresult;
+        fn cuMemcpyHtoD(dstDevice: CUdeviceptr, srcHost: *const c_void, ByteCount: usize) -> CUresult;
+        fn cuMemcpyDtoH(dstHost: *mut c_void, srcDevice: CUdeviceptr, ByteCount: usize) -> CUresult;
+        fn cuCtxSynchronize() -> CUresult;
+        fn cuGetErrorString(error: CUresult, pStr: *mut *const c_char) -> CUresult;
+    }
+
+    static CUDA_CONTEXT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    static CUDA_MODULE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    static CUDA_FAILED: AtomicBool = AtomicBool::new(false);
+    static CUDA_INIT_ONCE: Once = Once::new();
+
+    fn get_error_string(err: CUresult) -> String {
+        unsafe {
+            let mut s: *const c_char = ptr::null();
+            if cuGetErrorString(err, &mut s) == CUDA_SUCCESS && !s.is_null() {
+                std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
+            } else {
+                format!("CUDA error {}", err)
+            }
+        }
+    }
+
+    // Ensure CUDA is initialised and context is set for the calling thread.
+    fn cuda_ensure_init() -> bool {
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        CUDA_INIT_ONCE.call_once(|| {
+            unsafe {
+                vox_rt_log("info", "Initializing CUDA Driver API...");
+                let err = cuInit(0);
+                if err != CUDA_SUCCESS {
+                    vox_rt_log("error", &format!("cuInit failed: {}", get_error_string(err)));
+                    CUDA_FAILED.store(true, Ordering::SeqCst);
+                    return;
+                }
+                let mut device: CUdevice = 0;
+                let err = cuDeviceGet(&mut device, 0);
+                if err != CUDA_SUCCESS {
+                    vox_rt_log("error", &format!("cuDeviceGet failed: {}", get_error_string(err)));
+                    CUDA_FAILED.store(true, Ordering::SeqCst);
+                    return;
+                }
+                let mut ctx: CUcontext = ptr::null_mut();
+                let err = cuCtxCreate(&mut ctx, CU_CTX_SCHED_AUTO, device);
+                if err != CUDA_SUCCESS {
+                    vox_rt_log("error", &format!("cuCtxCreate failed: {}", get_error_string(err)));
+                    CUDA_FAILED.store(true, Ordering::SeqCst);
+                    return;
+                }
+                CUDA_CONTEXT.store(ctx as *mut c_void, Ordering::SeqCst);
+                vox_rt_log("info", "CUDA context created successfully");
+            }
+        });
+
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let ctx = CUDA_CONTEXT.load(Ordering::SeqCst);
+        if ctx.is_null() {
+            vox_rt_log("error", "CUDA context is null");
+            CUDA_FAILED.store(true, Ordering::SeqCst);
+            return false;
+        }
+
+        unsafe {
+            let err = cuCtxSetCurrent(ctx as CUcontext);
+            if err != CUDA_SUCCESS {
+                vox_rt_log("error", &format!("cuCtxSetCurrent failed: {}", get_error_string(err)));
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+                return false;
+            }
+        }
+        true
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_load_device_module(ptx_data: *mut c_void, ptx_size: usize) {
+        vox_rt_log(
+            "info",
+            &format!(
+                "vox_load_device_module(ptx_data={:p}, size={})",
+                ptx_data, ptx_size
+            ),
+        );
+        log_hex_dump(ptx_data, std::cmp::min(ptx_size, 128), "PTX first 128 bytes");
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            vox_rt_log("warning", "CUDA previously failed, ignoring load");
+            return;
+        }
+        if !cuda_ensure_init() {
+            return;
+        }
+        if ptx_data.is_null() {
+            vox_rt_log("error", "null PTX data");
+            CUDA_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+        unsafe {
+            if !CUDA_MODULE.load(Ordering::SeqCst).is_null() {
+                vox_rt_log("debug", "Module already loaded");
+                return;
+            }
+
+            // Create a null-terminated copy of the PTX string.
+            let mut ptx_string = Vec::with_capacity(ptx_size + 1);
+            let src = std::slice::from_raw_parts(ptx_data as *const u8, ptx_size);
+            ptx_string.extend_from_slice(src);
+            ptx_string.push(0); // null terminator
+
+            let mut module: CUmodule = ptr::null_mut();
+            let err = cuModuleLoadData(&mut module, ptx_string.as_ptr() as *const c_void);
+            if err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuModuleLoadData failed: {}", get_error_string(err)),
+                );
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+            } else {
+                CUDA_MODULE.store(module as *mut c_void, Ordering::SeqCst);
+                vox_rt_log("info", "CUDA module loaded successfully");
+            }
+        }
+    }
+
+    // Legacy 1D launch – kept for compatibility
+    #[no_mangle]
+    pub extern "C" fn vox_launch_kernel_1d(
+        kernel_name: *mut c_void,
+        arg_ptrs: *mut *mut c_void,
+        num_args: i32,
+        grid_x: i32,
+        block_x: i32,
+    ) -> i32 {
+        vox_launch_kernel_3d(kernel_name, grid_x, 1, 1, block_x, 1, 1, arg_ptrs, num_args)
+    }
+
+    // New 3D launch function with maximum debugging
+    #[no_mangle]
+    pub extern "C" fn vox_launch_kernel_3d(
+        kernel_name: *mut c_void,
+        grid_x: i32, grid_y: i32, grid_z: i32,
+        block_x: i32, block_y: i32, block_z: i32,
+        arg_ptrs: *mut *mut c_void,
+        num_args: i32,
+    ) -> i32 {
+        vox_rt_log(
+            "info",
+            &format!(
+                "vox_launch_kernel_3d(kernel_name={:p}, grid=({},{},{}), block=({},{},{}), num_args={})",
+                kernel_name, grid_x, grid_y, grid_z, block_x, block_y, block_z, num_args
+            ),
+        );
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            vox_rt_log("warning", "CUDA previously failed, skipping kernel launch");
+            return -1;
+        }
+        let name_cstr = unsafe { std::ffi::CStr::from_ptr(kernel_name as *const c_char) };
+        let name = name_cstr.to_string_lossy();
+        vox_rt_log("info", &format!("  kernel='{}'", name));
+
+        if !cuda_ensure_init() {
+            CUDA_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        let module = CUDA_MODULE.load(Ordering::SeqCst);
+        if module.is_null() {
+            vox_rt_log("error", "No device module loaded");
+            CUDA_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+
+        unsafe {
+            let mut kernel: CUfunction = ptr::null_mut();
+            let err = cuModuleGetFunction(&mut kernel, module as CUmodule, kernel_name as *const c_char);
+            if err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuModuleGetFunction failed: {}", get_error_string(err)),
+                );
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+                return -1;
+            }
+            vox_rt_log("info", "Kernel function retrieved");
+
+            // Debug: print each argument pointer and its first 4/8 bytes
+            vox_rt_log("debug", "Inspecting kernel arguments:");
+            for i in 0..num_args as usize {
+                let arg_ptr = *arg_ptrs.add(i);
+                if arg_ptr.is_null() {
+                    vox_rt_log("error", &format!("Argument {} pointer is null", i));
+                    CUDA_FAILED.store(true, Ordering::SeqCst);
+                    return -1;
+                }
+                let first_word = *(arg_ptr as *const u32);
+                vox_rt_log("debug", &format!("  Arg[{}]: ptr={:p}, first 4 bytes = 0x{:08x}", i, arg_ptr, first_word));
+                // Also attempt to read as pointer if it looks like one (for debugging)
+                if first_word & 0xFFFF0000 != 0 {
+                    let as_ptr = *(arg_ptr as *const *const c_void);
+                    vox_rt_log("debug", &format!("         as pointer: {:p}", as_ptr));
+                }
+            }
+
+            // Launch kernel with full 3D grid and block dimensions
+            let launch_err = cuLaunchKernel(
+                kernel,
+                grid_x as u32, grid_y as u32, grid_z as u32,
+                block_x as u32, block_y as u32, block_z as u32,
+                0,
+                ptr::null_mut(),
+                arg_ptrs,
+                ptr::null_mut(),
+            );
+            if launch_err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuLaunchKernel failed: {}", get_error_string(launch_err)),
+                );
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+                return -1;
+            }
+            vox_rt_log("info", "Kernel launched, synchronising...");
+
+            // Synchronise and capture any kernel execution error
+            let sync_err = cuCtxSynchronize();
+            if sync_err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuCtxSynchronize failed: {}", get_error_string(sync_err)),
+                );
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+                return -1;
+            }
+
+            vox_rt_log("info", "Kernel execution completed successfully");
+        }
+        0
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_malloc(size: usize) -> *mut c_void {
+        vox_rt_log("debug", &format!("vox_gpu_malloc(size={})", size));
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            vox_rt_log("warning", "CUDA failed, returning host memory");
+            let ptr = unsafe { calloc(1, size) };
+            vox_rt_log("debug", &format!("  -> {:p} (host fallback)", ptr));
+            return ptr;
+        }
+        if !cuda_ensure_init() {
+            CUDA_FAILED.store(true, Ordering::SeqCst);
+            let ptr = unsafe { calloc(1, size) };
+            vox_rt_log(
+                "debug",
+                &format!("  -> {:p} (host fallback after init fail)", ptr),
+            );
+            return ptr;
+        }
+        unsafe {
+            let mut dptr: CUdeviceptr = 0;
+            let err = cuMemAlloc(&mut dptr, size);
+            if err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuMemAlloc(size={}) failed: {}", size, get_error_string(err)),
+                );
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+                let ptr = calloc(1, size);
+                vox_rt_log("debug", &format!("  -> {:p} (host fallback)", ptr));
+                return ptr;
+            } else {
+                let ptr = dptr as *mut c_void;
+                vox_rt_log("debug", &format!("  -> device ptr {:p}", ptr));
+                ptr
+            }
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_free(ptr: *mut c_void) {
+        vox_rt_log("debug", &format!("vox_gpu_free({:p})", ptr));
+        if ptr.is_null() {
+            return;
+        }
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            unsafe {
+                free(ptr);
+                vox_rt_log("debug", "  -> freed host memory");
+            }
+            return;
+        }
+        unsafe {
+            let dptr = ptr as CUdeviceptr;
+            let err = cuMemFree(dptr);
+            if err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuMemFree failed: {}", get_error_string(err)),
+                );
+            } else {
+                vox_rt_log("debug", "  -> freed device memory");
+            }
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_memcpy_host_to_device(
+        dst: *mut c_void,
+        src: *mut c_void,
+        size: usize,
+    ) {
+        vox_rt_log(
+            "debug",
+            &format!(
+                "vox_gpu_memcpy_host_to_device(dst={:p}, src={:p}, size={})",
+                dst, src, size
+            ),
+        );
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            vox_rt_log("warning", "CUDA failed, skipping copy");
+            return;
+        }
+        if size == 0 {
+            vox_rt_log("debug", "  -> size zero, nothing to copy");
+            return;
+        }
+        unsafe {
+            let err = cuMemcpyHtoD(dst as CUdeviceptr, src, size);
+            if err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuMemcpyHtoD failed: {} (dst={:p}, src={:p}, size={})", get_error_string(err), dst, src, size),
+                );
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+            } else {
+                vox_rt_log("info", "H2D copy succeeded");
+            }
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_memcpy_device_to_host(
+        dst: *mut c_void,
+        src: *mut c_void,
+        size: usize,
+    ) {
+        vox_rt_log(
+            "debug",
+            &format!(
+                "vox_gpu_memcpy_device_to_host(dst={:p}, src={:p}, size={})",
+                dst, src, size
+            ),
+        );
+        if CUDA_FAILED.load(Ordering::SeqCst) {
+            unsafe {
+                ptr::write_bytes(dst, 0, size);
+            }
+            vox_rt_log("warning", "CUDA failed, zeroing destination memory");
+            return;
+        }
+        if size == 0 {
+            vox_rt_log("debug", "  -> size zero, nothing to copy");
+            return;
+        }
+        unsafe {
+            let err = cuMemcpyDtoH(dst, src as CUdeviceptr, size);
+            if err != CUDA_SUCCESS {
+                vox_rt_log(
+                    "error",
+                    &format!("cuMemcpyDtoH failed: {} (dst={:p}, src={:p}, size={})", get_error_string(err), dst, src, size),
+                );
+                CUDA_FAILED.store(true, Ordering::SeqCst);
+                ptr::write_bytes(dst, 0, size);
+                vox_rt_log("warning", "CUDA copy failed, zeroed destination memory");
+            } else {
+                vox_rt_log("info", "D2H copy succeeded");
+                // Log first few bytes of copied data for debugging
+                if size > 0 {
+                    let mut buf = vec![0u8; std::cmp::min(size, 32)];
+                    std::ptr::copy_nonoverlapping(dst, buf.as_mut_ptr() as *mut c_void, buf.len());
+                    log_hex_dump(buf.as_ptr() as *mut c_void, buf.len(), "Copied data (host)");
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// HIP backend (original, enabled with `vox_gpu_enabled`)
 // ------------------------------------------------------------------
 #[cfg(feature = "vox_gpu_enabled")]
-mod gpu {
+mod gpu_hip {
     use super::*;
     use std::ffi::{c_char, c_int};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1185,7 +1627,6 @@ mod gpu {
             extra: *mut *mut c_void,
         ) -> i32;
         fn hipDeviceSynchronize() -> i32;
-        fn hipGetLastError() -> i32;
         fn hipGetErrorString(error: i32) -> *const c_char;
     }
 
@@ -1277,12 +1718,6 @@ mod gpu {
             return;
         }
         unsafe {
-            let first_two = *(hsaco_data as *const u16);
-            if first_two == 0x2f2f {
-                vox_rt_log("warning", "Placeholder HSACO, GPU disabled");
-                GPU_FAILED.store(true, Ordering::SeqCst);
-                return;
-            }
             if !HIP_MODULE.is_null() {
                 vox_rt_log("debug", "Module already loaded");
                 return;
@@ -1308,6 +1743,7 @@ mod gpu {
         }
     }
 
+    // Legacy 1D launch – kept for compatibility
     #[no_mangle]
     pub extern "C" fn vox_launch_kernel_1d(
         kernel_name: *mut c_void,
@@ -1316,16 +1752,28 @@ mod gpu {
         grid_x: i32,
         block_x: i32,
     ) -> i32 {
+        vox_launch_kernel_3d(kernel_name, grid_x, 1, 1, block_x, 1, 1, arg_ptrs, num_args)
+    }
+
+    // New 3D launch function
+    #[no_mangle]
+    pub extern "C" fn vox_launch_kernel_3d(
+        kernel_name: *mut c_void,
+        grid_x: i32, grid_y: i32, grid_z: i32,
+        block_x: i32, block_y: i32, block_z: i32,
+        arg_ptrs: *mut *mut c_void,
+        num_args: i32,
+    ) -> i32 {
         vox_rt_log(
             "info",
             &format!(
-                "vox_launch_kernel_1d(kernel_name={:p}, arg_ptrs={:p}, num_args={}, grid={}, block={})",
-                kernel_name, arg_ptrs, num_args, grid_x, block_x
+                "vox_launch_kernel_3d(kernel_name={:p}, grid=({},{},{}), block=({},{},{}), num_args={})",
+                kernel_name, grid_x, grid_y, grid_z, block_x, block_y, block_z, num_args
             ),
         );
         if GPU_FAILED.load(Ordering::SeqCst) {
             vox_rt_log("warning", "GPU previously failed, skipping kernel launch");
-            return 0;
+            return -1;
         }
         let name_cstr = unsafe { std::ffi::CStr::from_ptr(kernel_name as *const c_char) };
         let name = name_cstr.to_string_lossy();
@@ -1333,13 +1781,13 @@ mod gpu {
 
         if hip_ensure_init() != 0 {
             GPU_FAILED.store(true, Ordering::SeqCst);
-            return 0;
+            return -1;
         }
         unsafe {
             if HIP_MODULE.is_null() {
                 vox_rt_log("error", "No device module loaded");
                 GPU_FAILED.store(true, Ordering::SeqCst);
-                return 0;
+                return -1;
             }
             let mut kernel: *mut c_void = ptr::null_mut();
             let err = hipModuleGetFunction(&mut kernel, HIP_MODULE, kernel_name as *const c_char);
@@ -1349,9 +1797,24 @@ mod gpu {
                     &format!("hipModuleGetFunction failed: {}", get_error_string(err)),
                 );
                 GPU_FAILED.store(true, Ordering::SeqCst);
-                return 0;
+                return -1;
             }
             vox_rt_log("info", "Kernel function retrieved");
+
+            // Debug: print each argument pointer
+            vox_rt_log("debug", "Inspecting kernel arguments:");
+            for i in 0..num_args as usize {
+                let arg_ptr = *arg_ptrs.add(i);
+                if arg_ptr.is_null() {
+                    vox_rt_log("error", &format!("Argument {} pointer is null", i));
+                    GPU_FAILED.store(true, Ordering::SeqCst);
+                    return -1;
+                }
+                let first_word = *(arg_ptr as *const u32);
+                vox_rt_log("debug", &format!("  Arg[{}]: ptr={:p}, first 4 bytes = 0x{:08x}", i, arg_ptr, first_word));
+            }
+
+            // Launch kernel with full 3D grid and block dimensions
             const HIP_LAUNCH_PARAM_BUFFER_POINTER: usize = 0x01;
             const HIP_LAUNCH_PARAM_BUFFER_SIZE: usize = 0x02;
             const HIP_LAUNCH_PARAM_END: usize = 0x00;
@@ -1359,48 +1822,35 @@ mod gpu {
                 &HIP_LAUNCH_PARAM_BUFFER_POINTER as *const _ as *mut c_void,
                 arg_ptrs as *mut c_void,
                 &HIP_LAUNCH_PARAM_BUFFER_SIZE as *const _ as *mut c_void,
-                &num_args as *const _ as *mut c_void,
+                &(num_args as usize) as *const _ as *mut c_void,
                 &HIP_LAUNCH_PARAM_END as *const _ as *mut c_void,
                 ptr::null_mut(),
             ];
-            let err = hipModuleLaunchKernel(
+            let launch_err = hipModuleLaunchKernel(
                 kernel,
-                grid_x as u32,
-                1,
-                1,
-                block_x as u32,
-                1,
-                1,
+                grid_x as u32, grid_y as u32, grid_z as u32,
+                block_x as u32, block_y as u32, block_z as u32,
                 0,
                 ptr::null_mut(),
                 config.as_ptr() as *mut *mut c_void,
                 ptr::null_mut(),
             );
-            if err != 0 {
+            if launch_err != 0 {
                 vox_rt_log(
                     "error",
-                    &format!("hipModuleLaunchKernel failed: {}", get_error_string(err)),
+                    &format!("hipModuleLaunchKernel failed: {}", get_error_string(launch_err)),
                 );
                 GPU_FAILED.store(true, Ordering::SeqCst);
-                return 0;
+                return -1;
             }
-            let err = hipDeviceSynchronize();
-            if err != 0 {
+            let sync_err = hipDeviceSynchronize();
+            if sync_err != 0 {
                 vox_rt_log(
                     "error",
-                    &format!("hipDeviceSynchronize failed: {}", get_error_string(err)),
+                    &format!("hipDeviceSynchronize failed: {}", get_error_string(sync_err)),
                 );
                 GPU_FAILED.store(true, Ordering::SeqCst);
-                return 0;
-            }
-            let async_err = hipGetLastError();
-            if async_err != 0 {
-                vox_rt_log(
-                    "error",
-                    &format!("Async error after launch: {}", get_error_string(async_err)),
-                );
-                GPU_FAILED.store(true, Ordering::SeqCst);
-                return 0;
+                return -1;
             }
             vox_rt_log("info", "Kernel executed successfully");
         }
@@ -1488,6 +1938,10 @@ mod gpu {
             vox_rt_log("warning", "GPU failed, skipping copy");
             return;
         }
+        if size == 0 {
+            vox_rt_log("debug", "  -> size zero, nothing to copy");
+            return;
+        }
         unsafe {
             let err = hipMemcpy(dst, src, size, hipMemcpyHostToDevice);
             if err != 0 {
@@ -1522,6 +1976,10 @@ mod gpu {
             vox_rt_log("warning", "GPU failed, zeroing destination memory");
             return;
         }
+        if size == 0 {
+            vox_rt_log("debug", "  -> size zero, nothing to copy");
+            return;
+        }
         unsafe {
             let err = hipMemcpy(dst, src, size, hipMemcpyDeviceToHost);
             if err != 0 {
@@ -1534,13 +1992,21 @@ mod gpu {
                 vox_rt_log("warning", "GPU copy failed, zeroed destination memory");
             } else {
                 vox_rt_log("info", "D2H copy succeeded");
+                if size > 0 {
+                    let mut buf = vec![0u8; std::cmp::min(size, 32)];
+                    std::ptr::copy_nonoverlapping(dst, buf.as_mut_ptr() as *mut c_void, buf.len());
+                    log_hex_dump(buf.as_ptr() as *mut c_void, buf.len(), "Copied data (host)");
+                }
             }
         }
     }
 }
 
-#[cfg(not(feature = "vox_gpu_enabled"))]
-mod gpu {
+// ------------------------------------------------------------------
+// Fallback when no GPU feature is enabled
+// ------------------------------------------------------------------
+#[cfg(not(any(feature = "vox_gpu_cuda", feature = "vox_gpu_enabled")))]
+mod gpu_fallback {
     use super::*;
 
     #[no_mangle]
@@ -1551,6 +2017,7 @@ mod gpu {
         );
     }
 
+    // Legacy 1D launch – kept for compatibility
     #[no_mangle]
     pub extern "C" fn vox_launch_kernel_1d(
         kernel_name: *mut c_void,
@@ -1559,10 +2026,27 @@ mod gpu {
         _grid_x: i32,
         _block_x: i32,
     ) -> i32 {
+        vox_launch_kernel_3d(kernel_name, _grid_x, 1, 1, _block_x, 1, 1, _arg_ptrs, _num_args)
+    }
+
+    // New 3D launch function (fallback – CPU stub)
+    #[no_mangle]
+    pub extern "C" fn vox_launch_kernel_3d(
+        kernel_name: *mut c_void,
+        grid_x: i32, grid_y: i32, grid_z: i32,
+        block_x: i32, block_y: i32, block_z: i32,
+        _arg_ptrs: *mut *mut c_void,
+        _num_args: i32,
+    ) -> i32 {
         let name = unsafe { std::ffi::CStr::from_ptr(kernel_name as *const c_char) };
         vox_rt_log(
             "info",
-            &format!("CPU execution stub for '{}'", name.to_string_lossy()),
+            &format!(
+                "CPU execution stub for '{}' (grid={},{},{}, block={},{},{})",
+                name.to_string_lossy(),
+                grid_x, grid_y, grid_z,
+                block_x, block_y, block_z
+            ),
         );
         0
     }
@@ -1607,3 +2091,11 @@ mod gpu {
         }
     }
 }
+
+// Re-export the appropriate GPU functions based on the active feature.
+#[cfg(feature = "vox_gpu_cuda")]
+pub use gpu_cuda::*;
+#[cfg(feature = "vox_gpu_enabled")]
+pub use gpu_hip::*;
+#[cfg(not(any(feature = "vox_gpu_cuda", feature = "vox_gpu_enabled")))]
+pub use gpu_fallback::*;

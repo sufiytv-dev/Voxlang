@@ -6,7 +6,7 @@ use crate::comptime::ComptimeEvaluator;
 use crate::diagnostic::{Diagnostic, Suggestion, emit_diagnostic};
 use crate::frontend::span::Span;
 use crate::frontend::token::TokenKind;
-use crate::parser::{ASTNode, MatchArm, MatchPattern};
+use crate::parser::{ASTNode, KernelAttr, MatchArm, MatchPattern};
 use crate::refinement;
 use crate::semantics::SemanticAnalyzer;
 use crate::semantics::symbol::SymbolTable;
@@ -27,6 +27,7 @@ pub(crate) fn node_span(node: &ASTNode) -> Span {
         ASTNode::UseDecl { span, .. } => *span,
         ASTNode::FunctionDef { span, .. } => *span,
         ASTNode::KernelFn { span, .. } => *span,
+        ASTNode::KernelLaunch { span, .. } => *span,
         ASTNode::IfStatement { span, .. } => *span,
         ASTNode::IfLetStatement { span, .. } => *span,
         ASTNode::WhileLetStatement { span, .. } => *span,
@@ -232,6 +233,9 @@ impl SemanticAnalyzer<'_> {
                 ASTNode::TryExpr { .. } => {
                     return true;
                 }
+                ASTNode::KernelLaunch { .. } => {
+                    // Kernel launch is an expression, not a return
+                }
                 _ => {}
             }
         }
@@ -436,6 +440,47 @@ impl SemanticAnalyzer<'_> {
     }
 
     // -------------------------------------------------------------------------
+    // Kernel block dimension validation
+    // -------------------------------------------------------------------------
+    fn validate_kernel_block(&mut self, attr: &KernelAttr, span: Span) -> bool {
+        let (bx, by, bz) = attr.block;
+        let max_total = 1024;
+        let max_dim = 1024;
+        if bx == 0 || by == 0 || bz == 0 {
+            emit_diagnostic(
+                &Diagnostic::error("Kernel block dimensions must be positive integers")
+                    .with_code("VX0293")
+                    .with_span(span),
+            );
+            return false;
+        }
+        if bx > max_dim || by > max_dim || bz > max_dim {
+            emit_diagnostic(
+                &Diagnostic::error(&format!(
+                    "Kernel block dimension exceeds limit (max {})",
+                    max_dim
+                ))
+                .with_code("VX0294")
+                .with_span(span),
+            );
+            return false;
+        }
+        if bx * by * bz > max_total {
+            emit_diagnostic(
+                &Diagnostic::error(&format!(
+                    "Kernel block has too many threads ({} > {})",
+                    bx * by * bz,
+                    max_total
+                ))
+                .with_code("VX0295")
+                .with_span(span),
+            );
+            return false;
+        }
+        true
+    }
+
+    // -------------------------------------------------------------------------
     // Statement analysis (top‑level entry point for checking)
     // -------------------------------------------------------------------------
     pub(crate) fn analyze_statement(&mut self, node: &ASTNode) {
@@ -538,6 +583,7 @@ impl SemanticAnalyzer<'_> {
                     return_ty,
                     None,
                     vec![],
+                    false,
                 );
                 self.symbols.enter_scope();
                 self.borrowed_in_scope.push(Vec::new());
@@ -563,32 +609,35 @@ impl SemanticAnalyzer<'_> {
                 params,
                 body,
                 device_triple: _,
+                attr,
                 span: _,
             } => {
-                let empty_set = HashSet::new();
-                let param_types: Vec<Type> = params
-                    .iter()
-                    .map(|p| self.parse_type_str_with_imports(&p.ty, &empty_set))
-                    .collect();
-                let param_refinements: Vec<Option<Box<ASTNode>>> =
-                    params.iter().map(|p| p.refinement.clone()).collect();
-                self.symbols.register_function(
+                // Validate block dimensions
+                if !self.validate_kernel_block(attr, node_span(node)) {
+                    self.error_occurred = true;
+                    return;
+                }
+
+                // =============================================================
+                // Register kernel and its launch stub using register_function_def
+                // =============================================================
+                let generic_params = Vec::<String>::new(); // kernels have no generics
+                let return_type_str = "void".to_string();
+                let return_refinement = None;
+                let span = node_span(node);
+
+                self.symbols.register_function_def(
                     name,
-                    param_types.clone(),
-                    param_refinements.clone(),
-                    Type::Concrete("void".to_string()),
-                    None,
-                    vec![],
+                    generic_params,
+                    params.clone(),
+                    return_type_str,
+                    return_refinement,
+                    body.clone(),
+                    span,
+                    true, // is_kernel = true
                 );
-                let launch_name = format!("{}_launch", name);
-                self.symbols.register_function(
-                    &launch_name,
-                    param_types,
-                    vec![None; param_refinements.len()],
-                    Type::Concrete("void".to_string()),
-                    None,
-                    vec![],
-                );
+
+                // Now enter scope and analyze the kernel body (same as before)
                 self.symbols.enter_scope();
                 self.borrowed_in_scope.push(Vec::new());
                 let old_in_kernel = self.in_kernel;
@@ -599,6 +648,8 @@ impl SemanticAnalyzer<'_> {
                 self.current_return_refinement = None;
                 self.current_function_name = Some(name.clone());
                 self.in_kernel = true;
+
+                let empty_set = HashSet::new();
                 for param in params {
                     let param_type = self.parse_type_str_with_imports(&param.ty, &empty_set);
                     if !self
@@ -1058,6 +1109,7 @@ impl SemanticAnalyzer<'_> {
                     return_refinement.clone(),
                     body.clone(),
                     *span,
+                    false,
                 );
                 self.symbols.enter_scope();
                 self.borrowed_in_scope.push(Vec::new());
@@ -3043,10 +3095,11 @@ impl SemanticAnalyzer<'_> {
                     return_type,
                     _return_refinement,
                     generic_params,
-                ) = if let Some((ptypes, pref, ret, retref, gparams)) =
+                    _is_kernel,
+                ) = if let Some((ptypes, pref, ret, retref, gparams, _is_kernel)) =
                     self.symbols.lookup_function(callee)
                 {
-                    (ptypes, pref, ret, retref, gparams)
+                    (ptypes, pref, ret, retref, gparams, _is_kernel)
                 } else {
                     emit_diagnostic(
                         &Diagnostic::error(&format!(
@@ -3195,6 +3248,140 @@ impl SemanticAnalyzer<'_> {
                     release_borrows(self);
                     Some(return_type)
                 }
+            }
+            ASTNode::KernelLaunch { kernel, grid, args, span } => {
+                // Resolve kernel name
+                let kernel_name = match kernel.as_ref() {
+                    ASTNode::Identifier(name, _) => name,
+                    _ => {
+                        emit_diagnostic(
+                            &Diagnostic::error("Expected identifier for kernel name in launch")
+                                .with_code("VX0296")
+                                .with_span(node_span(kernel)),
+                        );
+                        self.error_occurred = true;
+                        return None;
+                    }
+                };
+                // Lookup function info; must be a kernel
+                let (param_types, _, _, _, _, is_kernel) =
+                    match self.symbols.lookup_function(kernel_name) {
+                        Some(info) => info,
+                        None => {
+                            emit_diagnostic(
+                                &Diagnostic::error(&format!("Unknown function '{}' used as kernel", kernel_name))
+                                    .with_code("VX0297")
+                                    .with_span(*span),
+                            );
+                            self.error_occurred = true;
+                            return None;
+                        }
+                    };
+                if !is_kernel {
+                    emit_diagnostic(
+                        &Diagnostic::error(&format!("'{}' is not a kernel (missing @kernel)", kernel_name))
+                            .with_code("VX0298")
+                            .with_span(*span),
+                    );
+                    self.error_occurred = true;
+                    return None;
+                }
+                if args.len() != param_types.len() {
+                    emit_diagnostic(
+                        &Diagnostic::error(&format!(
+                            "Kernel '{}' expects {} arguments, got {}",
+                            kernel_name,
+                            param_types.len(),
+                            args.len()
+                        ))
+                        .with_code("VX0299")
+                        .with_span(*span),
+                    );
+                    self.error_occurred = true;
+                    return None;
+                }
+                // Type-check each argument
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_ty = match self.analyze_expression(arg, Some(&param_types[i])) {
+                        Some(ty) => ty,
+                        None => return None,
+                    };
+                    if !self.unify.unify(&param_types[i], &arg_ty, node_span(arg)) {
+                        let span = node_span(arg);
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Kernel argument {} mismatch: expected `{}`, got `{}`",
+                                i,
+                                param_types[i].to_string(),
+                                arg_ty.to_string()
+                            ))
+                            .with_code("VX0300")
+                            .with_span(span),
+                        );
+                        self.error_occurred = true;
+                        return None;
+                    }
+                }
+                // Type-check grid expressions (must be i32)
+                let (gx, gy, gz) = grid;
+                let mut check_grid = |expr: &ASTNode, dim: &str| -> bool {
+                    let ty = match self.analyze_expression(expr, Some(&Type::Concrete("i32".to_string()))) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    if ty != Type::Concrete("i32".to_string()) {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Kernel grid dimension '{}' must be i32, got {}",
+                                dim,
+                                ty.to_string()
+                            ))
+                            .with_code("VX0301")
+                            .with_span(node_span(expr)),
+                        );
+                        self.error_occurred = true;
+                        false
+                    } else {
+                        true
+                    }
+                };
+                if !check_grid(gx, "grid_x") || !check_grid(gy, "grid_y") || !check_grid(gz, "grid_z") {
+                    return None;
+                }
+
+                // Handle move/borrow for arguments (same as regular function call)
+                for arg in args {
+                    if let ASTNode::Identifier(name, _) = arg {
+                        if let Some((ty, alive, _)) = self.symbols.lookup_state(name) {
+                            if !alive {
+                                let span = node_span(arg);
+                                emit_diagnostic(
+                                    &Diagnostic::error(&format!(
+                                        "Use of moved or mutably borrowed value: '{}'",
+                                        name
+                                    ))
+                                    .with_code("VX0302")
+                                    .with_span(span),
+                                );
+                                self.error_occurred = true;
+                                return None;
+                            }
+                            if !SymbolTable::is_copy_type(&ty) {
+                                if !self.symbols.mark_moved(name, node_span(arg)) {
+                                    self.error_occurred = true;
+                                }
+                            }
+                        }
+                    }
+                    if let ASTNode::BorrowExpr { expr, span, .. } = arg {
+                        if let ASTNode::Identifier(name, _) = &**expr {
+                            self.symbols.release_borrow(name, *span);
+                        }
+                    }
+                }
+
+                // Kernel launch returns void
+                Some(Type::Concrete("void".to_string()))
             }
             ASTNode::BorrowExpr {
                 mutable,

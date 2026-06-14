@@ -4,7 +4,7 @@
 //! This module contains functions for substituting generic parameters in types
 //! and AST nodes, as well as a helper for unifying generic parameters.
 
-use crate::parser::{ASTNode, MatchArm, Param};
+use crate::parser::{ASTNode, KernelAttr, MatchArm, Param};
 use crate::semantics::SemanticAnalyzer;
 use crate::semantics::types::Type;
 use std::collections::HashMap;
@@ -291,6 +291,7 @@ impl SemanticAnalyzer<'_> {
                 params,
                 body,
                 device_triple,
+                attr,
                 span,
             } => {
                 let new_params = params
@@ -310,6 +311,26 @@ impl SemanticAnalyzer<'_> {
                         .map(|s| Self::substitute_types_in_node(s, subst))
                         .collect(),
                     device_triple: device_triple.clone(),
+                    attr: attr.clone(),
+                    span: *span,
+                }
+            }
+            KernelLaunch { kernel, grid, args, span } => {
+                let new_kernel = Box::new(Self::substitute_types_in_node(kernel, subst));
+                let (gx, gy, gz) = grid;
+                let new_grid = (
+                    Box::new(Self::substitute_types_in_node(gx, subst)),
+                    Box::new(Self::substitute_types_in_node(gy, subst)),
+                    Box::new(Self::substitute_types_in_node(gz, subst)),
+                );
+                let new_args = args
+                    .iter()
+                    .map(|a| Self::substitute_types_in_node(a, subst))
+                    .collect();
+                KernelLaunch {
+                    kernel: new_kernel,
+                    grid: new_grid,
+                    args: new_args,
                     span: *span,
                 }
             }

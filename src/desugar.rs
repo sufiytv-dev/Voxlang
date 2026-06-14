@@ -3,7 +3,7 @@
 // Runs immediately after parsing, before semantic analysis.
 
 use crate::diagnostic::debug_log;
-use crate::parser::{ASTNode, MatchArm, MatchPattern};
+use crate::parser::{ASTNode, KernelAttr, MatchArm, MatchPattern};
 use std::cell::Cell;
 
 thread_local! {
@@ -110,6 +110,7 @@ pub fn desugar(node: ASTNode) -> ASTNode {
             params,
             body,
             device_triple,
+            attr,
             span,
         } => {
             let new_body = body.into_iter().map(desugar).collect();
@@ -118,6 +119,30 @@ pub fn desugar(node: ASTNode) -> ASTNode {
                 params,
                 body: new_body,
                 device_triple,
+                attr,
+                span,
+            }
+        }
+
+        ASTNode::KernelLaunch {
+            kernel,
+            grid,
+            args,
+            span,
+        } => {
+            // Kernel launch is already core syntax – just desugar the sub‑expressions
+            let new_kernel = Box::new(desugar(*kernel));
+            let (gx, gy, gz) = grid;
+            let new_grid = (
+                Box::new(desugar(*gx)),
+                Box::new(desugar(*gy)),
+                Box::new(desugar(*gz)),
+            );
+            let new_args = args.into_iter().map(desugar).collect();
+            ASTNode::KernelLaunch {
+                kernel: new_kernel,
+                grid: new_grid,
+                args: new_args,
                 span,
             }
         }

@@ -6,9 +6,14 @@
 // borrow/deref, calls (including generic function monomorphisation), and
 // built‑ins for Vec, HashMap, String, etc.
 //
-// UPDATED (2026-06-09): Added proper support for `Result<T,E>` with correct
-// field indices (0=discriminant, 1=Ok payload, 2=Err payload). Updated match
-// expression binding to extract the correct payload field based on the variant.
+// UPDATED (2026-06-14): Fixed device IR generation for loads/stores.
+// Now emits opaque pointer types with correct address spaces for NVPTX.
+//
+// FIXED (2026-06-14): KernelLaunch now correctly handles &mut arguments:
+// - Copies the initial value from the host variable (not a temporary pointer)
+// - Stores the device pointer value in a temporary on the stack, then passes
+//   the address of that temporary to the kernel launch API.
+// - Uses the correct size for the pointee type
 
 use crate::codegen::CodegenEngine;
 use crate::codegen::type_map::parse_generic_type;
@@ -43,6 +48,15 @@ impl<'a> ExprEmitter<'a> {
         match self.target {
             CodegenTarget::Host => self.engine.debug_emit(line),
             CodegenTarget::Device => self.engine.debug_emit_device(line),
+        }
+    }
+
+    /// Helper: return the pointer type to use for a load/store of an alloca on the device.
+    fn device_ptr_type(&self, elem_ty: &str) -> String {
+        if self.target == CodegenTarget::Device {
+            self.engine.device_ptr_type(elem_ty)
+        } else {
+            format!("{}*", elem_ty)
         }
     }
 
@@ -150,9 +164,15 @@ impl<'a> ExprEmitter<'a> {
                         format!("@{}", name)
                     } else {
                         let load_reg = self.engine.next_register();
+                        let ptr_ty = if self.target == CodegenTarget::Host {
+                            format!("{}*", ty_str)
+                        } else {
+                            // For device, use opaque pointer with address space (local)
+                            self.engine.device_ptr_type(&ty_str)
+                        };
                         self.emit(&format!(
-                            "    {} = load {}, {}* @{}",
-                            load_reg, ty_str, ty_str, name
+                            "    {} = load {}, {} {}",
+                            load_reg, ty_str, ptr_ty, name
                         ));
                         load_reg
                     }
@@ -192,9 +212,15 @@ impl<'a> ExprEmitter<'a> {
                         alloc_reg
                     } else {
                         let result_reg = self.engine.next_register();
+                        let ptr_ty = if self.target == CodegenTarget::Host {
+                            format!("{}*", ty_str)
+                        } else {
+                            // For device, use opaque pointer with address space (local)
+                            self.engine.device_ptr_type(&ty_str)
+                        };
                         self.emit(&format!(
-                            "    {} = load {}, {}* {}",
-                            result_reg, ty_str, ty_str, alloc_reg
+                            "    {} = load {}, {} {}",
+                            result_reg, ty_str, ptr_ty, alloc_reg
                         ));
                         result_reg
                     }
@@ -238,7 +264,7 @@ impl<'a> ExprEmitter<'a> {
                         .engine
                         .map_type(ty, self.target == CodegenTarget::Device);
                     self.emit(&format!(
-                        "    {} = load {}, {}* {}",
+                        "    {} = load {}, {} {}",
                         loaded, ptr_ty, ptr_ty, ptr_reg
                     ));
                     ptr_reg = loaded;
@@ -891,12 +917,11 @@ impl<'a> ExprEmitter<'a> {
                         span,
                     } = &arm.pattern
                     {
-                        // Determine the correct payload field index based on enum and variant
                         let enum_base = CodegenEngine::strip_generic_args(&scr_vox_ty);
                         let payload_index = if enum_base == "Result" && variant == "Err" {
-                            2 // Err payload is at field index 2
+                            2
                         } else {
-                            1 // Ok payload or Option::Some payload
+                            1
                         };
 
                         for binding in bindings {
@@ -912,7 +937,6 @@ impl<'a> ExprEmitter<'a> {
                                             .map_type(&vox, self.target == CodegenTarget::Device);
                                         (Some(vox), llvm)
                                     } else if base_name == "Result" && args.len() == 2 {
-                                        // For Result, the payload type depends on the variant
                                         let vox = if variant == "Ok" {
                                             args[0].clone()
                                         } else {
@@ -1029,9 +1053,6 @@ impl<'a> ExprEmitter<'a> {
                 result_reg
             }
 
-            // --------------------------------------------------------------------
-            // CastExpr – FIXED to avoid unused registers
-            // --------------------------------------------------------------------
             ASTNode::CastExpr {
                 expr, target_type, ..
             } => {
@@ -1055,7 +1076,6 @@ impl<'a> ExprEmitter<'a> {
                     source_ty, target_llvm, raw_val
                 ));
 
-                // &str → i8* (extract data pointer)
                 if target_llvm == "i8*" && (source_ty == "&str" || source_ty.starts_with("&str")) {
                     let extracted = self.engine.next_register();
                     self.emit(&format!(
@@ -1065,7 +1085,6 @@ impl<'a> ExprEmitter<'a> {
                     return extracted;
                 }
 
-                // f64 → i32
                 if source_ty == "f64" && target_llvm == "i32" {
                     let result_reg = self.engine.next_register();
                     self.emit(&format!(
@@ -1074,7 +1093,6 @@ impl<'a> ExprEmitter<'a> {
                     ));
                     return result_reg;
                 }
-                // f64 → i64
                 if source_ty == "f64" && target_llvm == "i64" {
                     let result_reg = self.engine.next_register();
                     self.emit(&format!(
@@ -1083,7 +1101,6 @@ impl<'a> ExprEmitter<'a> {
                     ));
                     return result_reg;
                 }
-                // i32 → double
                 if source_ty == "i32" && target_llvm == "double" {
                     let result_reg = self.engine.next_register();
                     self.emit(&format!(
@@ -1093,7 +1110,6 @@ impl<'a> ExprEmitter<'a> {
                     return result_reg;
                 }
 
-                // Integer to pointer (inttoptr)
                 let source_is_integer = Self::is_integer_type(&source_ty);
                 if target_llvm.ends_with('*') && source_is_integer {
                     let int_ty = if source_ty == "i64" { "i64" } else { "i32" };
@@ -1105,7 +1121,6 @@ impl<'a> ExprEmitter<'a> {
                     return result_reg;
                 }
 
-                // Conversions that change representation
                 match target_llvm.as_str() {
                     "i8" => {
                         let result_reg = self.engine.next_register();
@@ -1133,7 +1148,6 @@ impl<'a> ExprEmitter<'a> {
                         ));
                         result_reg
                     }
-                    // No conversion needed – return the original value directly
                     _ => raw_val,
                 }
             }
@@ -1183,32 +1197,78 @@ impl<'a> ExprEmitter<'a> {
                 }
             },
 
+            // ****************************************************************
+            // FIXED DerefExpr – distinguishes between lvalue and rvalue contexts
+            // ****************************************************************
             ASTNode::DerefExpr(inner, _) => {
                 self.engine.debug_log("compile DerefExpr");
-                let ptr_reg = self.compile(inner);
-                let pointee_ty = if let ASTNode::Identifier(ref_name, _) = &**inner {
-                    if let Some((ty, _, _, _)) = self.engine.variable_symbols.get(ref_name) {
-                        let stripped = ty.trim_end_matches('*');
-                        if self.engine.enum_variants.contains_key(stripped) {
-                            return self.compile(inner);
-                        } else {
-                            stripped.to_string()
-                        }
+                // Save original lvalue flag
+                let saved_lvalue = self.lvalue;
+                // Compile inner as an lvalue to get the address of the pointer variable
+                self.lvalue = true;
+                let ptr_var_addr = self.compile(inner);  // e.g., %y.addr_1 (i32**)
+                self.lvalue = saved_lvalue;
+
+                // Determine the LLVM type of the pointer variable (the stored pointer)
+                let ptr_llvm_ty = if let ASTNode::Identifier(name, _) = &**inner {
+                    if let Some((ty, _, _, _)) = self.engine.variable_symbols.get(name) {
+                        // ty is the LLVM type of the variable, e.g., "i32*" for &mut i32
+                        ty.clone()
                     } else {
-                        "i32".to_string()
+                        // Fallback: guess from inner Vox type
+                        let inner_vox = self.engine.infer_vox_type(inner);
+                        let pointee = inner_vox
+                            .strip_prefix("&mut ")
+                            .or_else(|| inner_vox.strip_prefix("& "))
+                            .unwrap_or(&inner_vox);
+                        let pointee_llvm = self.engine.map_type(pointee, self.target == CodegenTarget::Device);
+                        format!("{}*", pointee_llvm)
                     }
                 } else {
-                    "i32".to_string()
+                    // For non-identifier inner (e.g., dereference of a call result), fallback
+                    let inner_vox = self.engine.infer_vox_type(inner);
+                    let pointee = inner_vox
+                        .strip_prefix("&mut ")
+                        .or_else(|| inner_vox.strip_prefix("& "))
+                        .unwrap_or(&inner_vox);
+                    let pointee_llvm = self.engine.map_type(pointee, self.target == CodegenTarget::Device);
+                    format!("{}*", pointee_llvm)
                 };
-                let llvm_pointee = self
-                    .engine
-                    .map_type(&pointee_ty, self.target == CodegenTarget::Device);
-                let result_reg = self.engine.next_register();
+
+                // Load the actual pointer from the pointer variable's address
+                let ptr_reg = self.engine.next_register();
+                let ptr_addr_ty = if self.target == CodegenTarget::Device {
+                    self.engine.device_ptr_type(&ptr_llvm_ty)  // e.g., "ptr addrspace(5)"
+                } else {
+                    format!("{}*", ptr_llvm_ty)                // e.g., "i32**"
+                };
                 self.emit(&format!(
-                    "    {} = load {}, {}* {}",
-                    result_reg, llvm_pointee, llvm_pointee, ptr_reg
+                    "    {} = load {}, {} {}",
+                    ptr_reg, ptr_llvm_ty, ptr_addr_ty, ptr_var_addr
                 ));
-                result_reg
+
+                if saved_lvalue {
+                    // lvalue: return the pointer to the pointee
+                    ptr_reg
+                } else {
+                    // rvalue: load the final value from that pointer
+                    let result_reg = self.engine.next_register();
+                    let pointee_llvm = if let Some(inner_ty) = ptr_llvm_ty.strip_suffix('*') {
+                        inner_ty.to_string()
+                    } else {
+                        "i32".to_string()
+                    };
+                    let ptr_ty = if self.target == CodegenTarget::Device {
+                        self.engine.device_ptr_type(&pointee_llvm)
+                    } else {
+                        format!("{}*", pointee_llvm)
+                    };
+                    self.emit(&format!(
+                        "    {} = load {}, {} {}",
+                        result_reg, pointee_llvm, ptr_ty, ptr_reg
+                    ));
+                    result_reg
+                }
             }
 
             ASTNode::CallExpr { callee, args, span } => {
@@ -1221,7 +1281,6 @@ impl<'a> ExprEmitter<'a> {
                     self.engine.generic_functions.contains_key(callee)
                 ));
 
-                // Qualified enum constructors (Option::Some, Result::Ok, etc.)
                 if actual_callee.contains("::") {
                     let parts: Vec<&str> = actual_callee.split("::").collect();
                     if parts.len() == 2 {
@@ -1254,12 +1313,11 @@ impl<'a> ExprEmitter<'a> {
                                         &payload_vox_ty,
                                         self.target == CodegenTarget::Device,
                                     );
-                                    // Determine field indices based on enum and variant
                                     let disc_field_idx = 0;
                                     let payload_field_idx = if stripped_enum == "Result" {
                                         if variant_name == "Err" { 2 } else { 1 }
                                     } else {
-                                        1 // Option and other enums use index 1 for payload
+                                        1
                                     };
                                     let opt_ty =
                                         concrete_ty.unwrap_or_else(|| "{ i32, i32 }".to_string());
@@ -1305,7 +1363,6 @@ impl<'a> ExprEmitter<'a> {
                     }
                 }
 
-                // Generic user functions
                 if !callee.contains("::") && self.engine.generic_functions.contains_key(callee) {
                     let (generic_params, param_tys, return_ty) =
                         self.engine.generic_functions.get(callee).unwrap().clone();
@@ -1425,7 +1482,6 @@ impl<'a> ExprEmitter<'a> {
                     }
                 }
 
-                // Unqualified enum constructors: None, Some, Ok, Err
                 match actual_callee.as_str() {
                     "None" => {
                         self.engine.debug_log("CallExpr: handling None");
@@ -1519,7 +1575,6 @@ impl<'a> ExprEmitter<'a> {
                         }
                         let payload_val = self.compile(&args[0]);
                         let payload_vox_ty = self.engine.infer_vox_type(&args[0]);
-                        // Build the full Result type (the Err part is unknown, but map_type will handle it)
                         let result_vox_ty = format!("Result<{}, ?>", payload_vox_ty);
                         let result_ty = self
                             .engine
@@ -1538,7 +1593,6 @@ impl<'a> ExprEmitter<'a> {
                         ));
                         self.emit(&format!("    store i32 0, i32* {}", disc_ptr));
 
-                        // Ok payload goes into field index 1
                         let payload_ptr = self.engine.next_register();
                         self.emit(&format!(
                             "    {} = getelementptr inbounds {}, {}* {}, i32 0, i32 1",
@@ -1587,7 +1641,6 @@ impl<'a> ExprEmitter<'a> {
                         ));
                         self.emit(&format!("    store i32 1, i32* {}", disc_ptr));
 
-                        // Err payload goes into field index 2
                         let payload_ptr = self.engine.next_register();
                         self.emit(&format!(
                             "    {} = getelementptr inbounds {}, {}* {}, i32 0, i32 2",
@@ -1608,7 +1661,6 @@ impl<'a> ExprEmitter<'a> {
                     _ => {}
                 }
 
-                // Vec::new
                 if actual_callee == "Vec::new" {
                     self.engine.debug_log("CallExpr: Vec::new");
                     if !args.is_empty() {
@@ -1655,7 +1707,6 @@ impl<'a> ExprEmitter<'a> {
                     return handle;
                 }
 
-                // HashMap::new
                 if actual_callee == "HashMap::new" {
                     self.engine.debug_log("CallExpr: HashMap::new");
                     if !args.is_empty() {
@@ -1690,7 +1741,6 @@ impl<'a> ExprEmitter<'a> {
                     return handle;
                 }
 
-                // insert (HashMap)
                 if actual_callee == "insert" {
                     self.engine.debug_log("CallExpr: insert");
                     if args.len() != 3 {
@@ -1758,7 +1808,6 @@ impl<'a> ExprEmitter<'a> {
                     return "0".to_string();
                 }
 
-                // get (HashMap)
                 if actual_callee == "get" {
                     self.engine.debug_log("CallExpr: get");
                     if args.len() != 2 {
@@ -1895,7 +1944,6 @@ impl<'a> ExprEmitter<'a> {
                     return phi;
                 }
 
-                // contains_key (HashMap)
                 if actual_callee == "contains_key" {
                     self.engine.debug_log("CallExpr: contains_key");
                     if args.len() != 2 {
@@ -1948,7 +1996,6 @@ impl<'a> ExprEmitter<'a> {
                     return flag;
                 }
 
-                // remove (HashMap)
                 if actual_callee == "remove" {
                     self.engine.debug_log("CallExpr: remove");
                     if args.len() != 2 {
@@ -2085,7 +2132,6 @@ impl<'a> ExprEmitter<'a> {
                     return phi;
                 }
 
-                // len (Vec, String, &str, array)
                 if actual_callee == "len" {
                     self.engine.debug_log("CallExpr: len");
                     if args.len() != 1 {
@@ -2164,7 +2210,6 @@ impl<'a> ExprEmitter<'a> {
                     }
                 }
 
-                // assert
                 if actual_callee == "assert" {
                     self.engine.debug_log("CallExpr: assert");
                     if args.len() != 2 {
@@ -2195,9 +2240,6 @@ impl<'a> ExprEmitter<'a> {
                     return "0".to_string();
                 }
 
-                // =============================================================
-                // exit – treat as void function, never returns
-                // =============================================================
                 if actual_callee == "exit" {
                     self.engine.debug_log("CallExpr: exit");
                     if args.len() != 1 {
@@ -2216,7 +2258,6 @@ impl<'a> ExprEmitter<'a> {
                     return "0".to_string();
                 }
 
-                // String::new
                 if actual_callee == "String::new" {
                     self.engine.debug_log("CallExpr: String::new");
                     if !args.is_empty() {
@@ -2246,7 +2287,6 @@ impl<'a> ExprEmitter<'a> {
                     return struct_val;
                 }
 
-                // String::from
                 if actual_callee == "String::from" {
                     self.engine.debug_log("CallExpr: String::from");
                     if args.len() != 1 {
@@ -2290,7 +2330,6 @@ impl<'a> ExprEmitter<'a> {
                     return struct_val;
                 }
 
-                // as_str (String -> &str)
                 if actual_callee == "as_str" {
                     self.engine.debug_log("CallExpr: as_str");
                     if args.len() != 1 {
@@ -2345,7 +2384,6 @@ impl<'a> ExprEmitter<'a> {
                     return result;
                 }
 
-                // push_str (String)
                 if actual_callee == "push_str" {
                     self.engine.debug_log("CallExpr: push_str");
                     if args.len() != 2 {
@@ -2386,9 +2424,6 @@ impl<'a> ExprEmitter<'a> {
                     return "0".to_string();
                 }
 
-                // -----------------------------------------------------------------
-                // NEW: as_ptr() method for &str and String
-                // -----------------------------------------------------------------
                 if callee == "as_ptr" {
                     if args.len() != 1 {
                         emit_diagnostic(
@@ -2416,30 +2451,22 @@ impl<'a> ExprEmitter<'a> {
                         return "0".to_string();
                     }
 
-                    // Compile the receiver (the string)
                     let arg_val = self.compile(&args[0]);
-
-                    // Extract the data pointer (first field)
                     let data_ptr = self.engine.next_register();
                     if arg_ty == "&str" {
-                        // &str is { i8*, i64 }
                         self.emit(&format!(
                             "    {} = extractvalue {{ i8*, i64 }} {}, 0",
                             data_ptr, arg_val
                         ));
                     } else {
-                        // String is { i8*, i64, i64 }
                         self.emit(&format!(
                             "    {} = extractvalue {{ i8*, i64, i64 }} {}, 0",
                             data_ptr, arg_val
                         ));
                     }
-
-                    // Return the pointer (i8*)
                     return data_ptr;
                 }
 
-                // Mangle qualified function names (module::function -> module_function)
                 let mangled_callee = if actual_callee.contains("::") {
                     actual_callee.replace("::", "_")
                 } else {
@@ -2450,7 +2477,6 @@ impl<'a> ExprEmitter<'a> {
                     actual_callee, mangled_callee
                 ));
 
-                // Struct constructor (unqualified)
                 if self.engine.struct_fields.contains_key(&mangled_callee) {
                     self.engine
                         .debug_log(&format!("CallExpr: struct constructor {}", mangled_callee));
@@ -2509,7 +2535,6 @@ impl<'a> ExprEmitter<'a> {
                     return alloca_reg;
                 }
 
-                // copy (no-op)
                 if mangled_callee == "copy" {
                     self.engine.debug_log("CallExpr: copy");
                     if args.len() != 1 {
@@ -2522,7 +2547,6 @@ impl<'a> ExprEmitter<'a> {
                     return self.compile(&args[0]);
                 }
 
-                // push (Vec)
                 if mangled_callee == "push" {
                     self.engine.debug_log("CallExpr: push");
                     if args.len() != 2 {
@@ -2584,7 +2608,6 @@ impl<'a> ExprEmitter<'a> {
                         }
                     }
 
-                    // Fallback: dynamic array
                     let array_expr = &args[0];
                     let array_name = match array_expr {
                         ASTNode::Identifier(name, _) => name,
@@ -2654,7 +2677,6 @@ impl<'a> ExprEmitter<'a> {
                     return "0".to_string();
                 }
 
-                // pop (Vec)
                 if mangled_callee == "pop" {
                     self.engine.debug_log("CallExpr: pop");
                     if args.len() != 1 {
@@ -2785,7 +2807,6 @@ impl<'a> ExprEmitter<'a> {
                         }
                     }
 
-                    // Fallback: dynamic array
                     let array_expr = &args[0];
                     let array_name = match array_expr {
                         ASTNode::Identifier(name, _) => name,
@@ -2855,7 +2876,6 @@ impl<'a> ExprEmitter<'a> {
                     return result;
                 }
 
-                // Fallback to normal function call
                 let base_callee = if mangled_callee.contains("::") {
                     mangled_callee
                         .split("::")
@@ -2933,9 +2953,14 @@ impl<'a> ExprEmitter<'a> {
                                     || vox_ty.starts_with("[]");
                                 if should_load {
                                     let loaded = self.engine.next_register();
+                                    let ptr_ty = if self.target == CodegenTarget::Device {
+                                        self.engine.device_ptr_type(&llvm_ty)
+                                    } else {
+                                        format!("{}*", llvm_ty)
+                                    };
                                     self.emit(&format!(
-                                        "    {} = load {}, {}* {}",
-                                        loaded, llvm_ty, llvm_ty, arg_reg
+                                        "    {} = load {}, {} {}",
+                                        loaded, llvm_ty, ptr_ty, arg_reg
                                     ));
                                     (llvm_ty, loaded)
                                 } else {
@@ -3015,9 +3040,6 @@ impl<'a> ExprEmitter<'a> {
                 }
             }
 
-            // --------------------------------------------------------------------
-            // Unary operators
-            // --------------------------------------------------------------------
             ASTNode::UnaryExpr { op, expr, .. } => {
                 self.engine
                     .debug_log(&format!("compile UnaryExpr {:?}", op));
@@ -3046,9 +3068,6 @@ impl<'a> ExprEmitter<'a> {
                 }
             }
 
-            // --------------------------------------------------------------------
-            // Binary operators (comparisons, arithmetic with overflow checks)
-            // --------------------------------------------------------------------
             ASTNode::BinaryExpr {
                 left, op, right, ..
             } => {
@@ -3315,77 +3334,128 @@ impl<'a> ExprEmitter<'a> {
                     self.emit(&line);
                     result_reg
                 } else {
-                    match op {
-                        TokenKind::Plus => {
-                            self.emit(&format!(
-                                "    {} = call i32 @vox_add_i32(i32 {}, i32 {})",
-                                result_reg, left_val, right_val
-                            ));
+                    let is_i64 = left_ty == "i64" || right_ty == "i64";
+                    let (int_ty, native_op) = match op {
+                        TokenKind::Plus => (if is_i64 { "i64" } else { "i32" }, "add"),
+                        TokenKind::Minus => (if is_i64 { "i64" } else { "i32" }, "sub"),
+                        TokenKind::Star => (if is_i64 { "i64" } else { "i32" }, "mul"),
+                        TokenKind::Div => (if is_i64 { "i64" } else { "i32" }, "sdiv"),
+                        TokenKind::Mod => (if is_i64 { "i64" } else { "i32" }, "srem"),
+                        TokenKind::Ampersand => ("i32", "and"),
+                        TokenKind::Pipe => ("i32", "or"),
+                        TokenKind::Caret => ("i32", "xor"),
+                        TokenKind::Shl => ("i32", "shl"),
+                        TokenKind::Shr => ("i32", "ashr"),
+                        _ => unreachable!(),
+                    };
+
+                    if self.target == CodegenTarget::Device {
+                        match op {
+                            TokenKind::Plus => {
+                                self.emit(&format!(
+                                    "    {} = {} {} {}, {}",
+                                    result_reg, native_op, int_ty, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Minus => {
+                                self.emit(&format!(
+                                    "    {} = {} {} {}, {}",
+                                    result_reg, native_op, int_ty, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Star => {
+                                self.emit(&format!(
+                                    "    {} = {} {} {}, {}",
+                                    result_reg, native_op, int_ty, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Div => {
+                                self.emit(&format!(
+                                    "    {} = {} {} {}, {}",
+                                    result_reg, native_op, int_ty, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Mod => {
+                                self.emit(&format!(
+                                    "    {} = {} {} {}, {}",
+                                    result_reg, native_op, int_ty, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Ampersand
+                            | TokenKind::Pipe
+                            | TokenKind::Caret
+                            | TokenKind::Shl
+                            | TokenKind::Shr => {
+                                self.emit(&format!(
+                                    "    {} = {} {} {}, {}",
+                                    result_reg, native_op, int_ty, left_val, right_val
+                                ));
+                            }
+                            _ => unreachable!(),
                         }
-                        TokenKind::Minus => {
-                            self.emit(&format!(
-                                "    {} = call i32 @vox_sub_i32(i32 {}, i32 {})",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Star => {
-                            self.emit(&format!(
-                                "    {} = call i32 @vox_mul_i32(i32 {}, i32 {})",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Div => {
-                            self.emit(&format!(
-                                "    {} = call i32 @vox_div_i32(i32 {}, i32 {})",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Mod => {
-                            self.emit(&format!(
-                                "    {} = call i32 @vox_rem_i32(i32 {}, i32 {})",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Ampersand => {
-                            self.emit(&format!(
-                                "    {} = and i32 {}, {}",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Pipe => {
-                            self.emit(&format!(
-                                "    {} = or i32 {}, {}",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Caret => {
-                            self.emit(&format!(
-                                "    {} = xor i32 {}, {}",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Shl => {
-                            self.emit(&format!(
-                                "    {} = shl i32 {}, {}",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        TokenKind::Shr => {
-                            self.emit(&format!(
-                                "    {} = ashr i32 {}, {}",
-                                result_reg, left_val, right_val
-                            ));
-                        }
-                        _ => {
-                            emit_diagnostic(
-                                &Diagnostic::error(&format!(
-                                    "Unsupported binary operator {:?}",
-                                    op
-                                ))
-                                .with_code("VX0422"),
-                            );
-                            self.engine.has_error = true;
-                            return "0".to_string();
+                    } else {
+                        match op {
+                            TokenKind::Plus => {
+                                self.emit(&format!(
+                                    "    {} = call i32 @vox_add_i32(i32 {}, i32 {})",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Minus => {
+                                self.emit(&format!(
+                                    "    {} = call i32 @vox_sub_i32(i32 {}, i32 {})",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Star => {
+                                self.emit(&format!(
+                                    "    {} = call i32 @vox_mul_i32(i32 {}, i32 {})",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Div => {
+                                self.emit(&format!(
+                                    "    {} = call i32 @vox_div_i32(i32 {}, i32 {})",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Mod => {
+                                self.emit(&format!(
+                                    "    {} = call i32 @vox_rem_i32(i32 {}, i32 {})",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Ampersand => {
+                                self.emit(&format!(
+                                    "    {} = and i32 {}, {}",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Pipe => {
+                                self.emit(&format!(
+                                    "    {} = or i32 {}, {}",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Caret => {
+                                self.emit(&format!(
+                                    "    {} = xor i32 {}, {}",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Shl => {
+                                self.emit(&format!(
+                                    "    {} = shl i32 {}, {}",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            TokenKind::Shr => {
+                                self.emit(&format!(
+                                    "    {} = ashr i32 {}, {}",
+                                    result_reg, left_val, right_val
+                                ));
+                            }
+                            _ => unreachable!(),
                         }
                     }
                     result_reg
@@ -3406,9 +3476,345 @@ impl<'a> ExprEmitter<'a> {
                             .with_span(*span),
                     );
                     self.engine.has_error = true;
-                    "0".to_string()
+                    return "0".to_string();
                 }
             },
+
+            ASTNode::KernelLaunch { kernel, grid, args, span } => {
+                self.engine.debug_log("compile KernelLaunch");
+
+                // Resolve kernel name
+                let kernel_name = match kernel.as_ref() {
+                    ASTNode::Identifier(name, _) => name.clone(),
+                    _ => {
+                        emit_diagnostic(
+                            &Diagnostic::error("Kernel launch requires a kernel identifier")
+                                .with_code("VX0305")
+                                .with_span(*span),
+                        );
+                        self.engine.has_error = true;
+                        return "0".to_string();
+                    }
+                };
+
+                // Retrieve kernel information from the engine
+                let (block_x, block_y, block_z) = match self.engine.kernel_attrs.get(&kernel_name) {
+                    Some(attr) => (attr.block.0, attr.block.1, attr.block.2),
+                    None => {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Kernel '{}' has no block dimensions defined (missing @kernel attribute?)",
+                                kernel_name
+                            ))
+                            .with_code("VX0310")
+                            .with_span(*span),
+                        );
+                        self.engine.has_error = true;
+                        return "0".to_string();
+                    }
+                };
+
+                // Look up kernel parameter types (Vox type strings) from the symbol table.
+                let param_vox_types = match self.engine.get_kernel_param_types(&kernel_name) {
+                    Some(types) => types.clone(),
+                    None => {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Cannot retrieve parameter types for kernel '{}'",
+                                kernel_name
+                            ))
+                            .with_code("VX0311")
+                            .with_span(*span),
+                        );
+                        self.engine.has_error = true;
+                        return "0".to_string();
+                    }
+                };
+
+                if args.len() != param_vox_types.len() {
+                    emit_diagnostic(
+                        &Diagnostic::error(&format!(
+                            "Kernel '{}' expects {} arguments, got {}",
+                            kernel_name,
+                            param_vox_types.len(),
+                            args.len()
+                        ))
+                        .with_code("VX0312")
+                        .with_span(*span),
+                    );
+                    self.engine.has_error = true;
+                    return "0".to_string();
+                }
+
+                // Compile grid dimensions (must be i32)
+                let (gx_expr, gy_expr, gz_expr) = grid;
+                let grid_x = self.compile(gx_expr);
+                let grid_y = self.compile(gy_expr);
+                let grid_z = self.compile(gz_expr);
+
+                // -------------------------------------------------------------
+                // 1. Allocate device memory for mutable reference (&mut) arguments
+                // -------------------------------------------------------------
+                let mut mutable_indices = Vec::new();
+                for (i, vt) in param_vox_types.iter().enumerate() {
+                    if vt.starts_with("&mut ") {
+                        mutable_indices.push(i);
+                    }
+                }
+                let mut device_ptrs = Vec::new(); // (arg_index, device_ptr_reg, size_in_bytes, pointee_vox)
+                for &idx in &mutable_indices {
+                    let pointee_vox = &param_vox_types[idx][5..]; // after "&mut "
+                    let size = self.engine.size_of_type(pointee_vox);
+                    if size == 0 {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Cannot determine size of pointee type '{}' for mutable parameter",
+                                pointee_vox
+                            ))
+                            .with_code("VX0313")
+                            .with_span(*span),
+                        );
+                        self.engine.has_error = true;
+                        return "0".to_string();
+                    }
+                    let dev_ptr = self.engine.next_register();
+                    self.emit(&format!(
+                        "    {} = call i8* @vox_gpu_malloc(i64 {})",
+                        dev_ptr, size
+                    ));
+                    let pointee_llvm = self
+                        .engine
+                        .map_type(pointee_vox, self.target == CodegenTarget::Device);
+                    let cast_ptr = self.engine.next_register();
+                    self.emit(&format!(
+                        "    {} = bitcast i8* {} to {}*",
+                        cast_ptr, dev_ptr, pointee_llvm
+                    ));
+                    device_ptrs.push((idx, cast_ptr, size, pointee_vox.to_string()));
+                }
+
+                // -------------------------------------------------------------
+                // 2. Build argument pointer array (void**)
+                // -------------------------------------------------------------
+                let arg_array = self.engine.next_register();
+                self.emit(&format!(
+                    "    {} = alloca i8*, i32 {}, align 8",
+                    arg_array,
+                    args.len()
+                ));
+
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_val = self.compile(arg); // SSA value
+                    let arg_vox = self.expr_type(arg).unwrap_or_else(|| "i32".to_string());
+
+                    if mutable_indices.contains(&i) {
+                        // Mutable reference argument: &mut T
+                        // The argument expression must be a BorrowExpr of a variable.
+                        // Retrieve the host variable's alloca pointer.
+                        let host_ptr = match arg {
+                            ASTNode::BorrowExpr { expr, .. } => match &**expr {
+                                ASTNode::Identifier(name, _) => {
+                                    if let Some((_, alloc_reg, _, _)) = self.engine.variable_symbols.get(name) {
+                                        alloc_reg.clone()
+                                    } else {
+                                        emit_diagnostic(
+                                            &Diagnostic::error(&format!("Cannot find host variable '{}' for mutable kernel argument", name))
+                                                .with_code("VX0314")
+                                                .with_span(*span),
+                                        );
+                                        self.engine.has_error = true;
+                                        return "0".to_string();
+                                    }
+                                }
+                                _ => {
+                                    emit_diagnostic(
+                                        &Diagnostic::error("Mutable kernel argument must be a borrow of a variable")
+                                            .with_code("VX0315")
+                                            .with_span(*span),
+                                    );
+                                    self.engine.has_error = true;
+                                    return "0".to_string();
+                                }
+                            },
+                            _ => {
+                                emit_diagnostic(
+                                    &Diagnostic::error("Mutable kernel argument must be a borrow expression")
+                                        .with_code("VX0316")
+                                        .with_span(*span),
+                                );
+                                self.engine.has_error = true;
+                                return "0".to_string();
+                            }
+                        };
+                        // Strip "&mut " from arg_vox to get the pointee Vox type
+                        let pointee_vox = arg_vox.strip_prefix("&mut ").unwrap_or(&arg_vox).to_string();
+                        let pointee_llvm = self.engine.map_type(&pointee_vox, false); // host LLVM type of pointee
+                        // Cast host pointer to i8*
+                        let host_i8 = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = bitcast {}* {} to i8*",
+                            host_i8, pointee_llvm, host_ptr
+                        ));
+                        // Get device pointer and cast to i8*
+                        let dev_ptr_reg = device_ptrs
+                            .iter()
+                            .find(|(idx, _, _, _)| *idx == i)
+                            .unwrap()
+                            .1
+                            .clone();
+                        let dev_i8 = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = bitcast {}* {} to i8*",
+                            dev_i8, pointee_llvm, dev_ptr_reg
+                        ));
+                        // Copy host value to device
+                        let size = self.engine.size_of_type(&pointee_vox);
+                        self.emit(&format!(
+                            "    call void @vox_gpu_memcpy_host_to_device(i8* {}, i8* {}, i64 {})",
+                            dev_i8, host_i8, size
+                        ));
+
+                        // *** FIX: create a temporary stack variable to hold the device pointer value ***
+                        // The argument array must contain a pointer to the argument value.
+                        // For a pointer argument (the device pointer itself), the "value" is the pointer.
+                        // We create a temporary i8*, store the device pointer in it, then pass the address of that temporary.
+                        let temp_ptr = self.engine.next_register();
+                        self.emit(&format!("    {} = alloca i8*", temp_ptr));
+                        self.emit(&format!("    store i8* {}, i8** {}", dev_i8, temp_ptr));
+                        let ptr_to_temp = self.engine.next_register();
+                        self.emit(&format!("    {} = bitcast i8** {} to i8*", ptr_to_temp, temp_ptr));
+
+                        let gep = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = getelementptr i8*, i8** {}, i32 {}",
+                            gep, arg_array, i
+                        ));
+                        self.emit(&format!("    store i8* {}, i8** {}", ptr_to_temp, gep));
+                    } else {
+                        // Non-mutable argument: normal value (i32, float, struct, etc.)
+                        // Create a temporary alloca to hold the value and store its address.
+                        let arg_llvm = self
+                            .engine
+                            .map_type(&arg_vox, self.target == CodegenTarget::Device);
+                        let tmp = self.engine.next_register();
+                        self.emit(&format!("    {} = alloca {}", tmp, arg_llvm));
+                        self.emit(&format!(
+                            "    store {} {}, {}* {}",
+                            arg_llvm, arg_val, arg_llvm, tmp
+                        ));
+                        let ptr_to_tmp = self.engine.next_register();
+                        self.emit(&format!("    {} = bitcast {}* {} to i8*", ptr_to_tmp, arg_llvm, tmp));
+                        let gep = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = getelementptr i8*, i8** {}, i32 {}",
+                            gep, arg_array, i
+                        ));
+                        self.emit(&format!("    store i8* {}, i8** {}", ptr_to_tmp, gep));
+                    }
+                }
+
+                // -----------------------------------------------------------------
+                // 3. Launch the kernel
+                // -----------------------------------------------------------------
+                let (kernel_name_ptr, ptr_inst) = self.engine.get_string_ptr(&kernel_name);
+                self.emit(&ptr_inst);
+                let launch_ret = self.engine.next_register();
+                self.emit(&format!(
+                    "    {} = call i32 @vox_launch_kernel_3d(i8* {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i8** {}, i32 {})",
+                    launch_ret,
+                    kernel_name_ptr,
+                    grid_x, grid_y, grid_z,
+                    block_x, block_y, block_z,
+                    arg_array,
+                    args.len()
+                ));
+
+                let success_i1 = self.engine.next_register();
+                self.emit(&format!("    {} = icmp eq i32 {}, 0", success_i1, launch_ret));
+                let fail_label = self.engine.next_block();
+                let cont_label = self.engine.next_block();
+                self.emit(&format!(
+                    "    br i1 {}, label %{}, label %{}",
+                    success_i1, cont_label, fail_label
+                ));
+                self.emit(&format!("{}:", fail_label));
+                self.emit(&format!("    call void @vox_panic()"));
+                self.emit(&format!("    unreachable"));
+                self.emit(&format!("{}:", cont_label));
+
+                // -------------------------------------------------------------
+                // 4. Copy back results for &mut parameters (device → host)
+                // -------------------------------------------------------------
+                for (idx, dev_ptr, size, pointee_vox) in &device_ptrs {
+                    let host_ptr = match &args[*idx] {
+                        ASTNode::BorrowExpr { expr, .. } => match &**expr {
+                            ASTNode::Identifier(name, _) => {
+                                if let Some((_, alloc_reg, _, _)) = self.engine.variable_symbols.get(name) {
+                                    alloc_reg.clone()
+                                } else {
+                                    emit_diagnostic(
+                                        &Diagnostic::error(&format!(
+                                            "Cannot find host variable '{}' for mutable kernel argument",
+                                            name
+                                        ))
+                                        .with_code("VX0314")
+                                        .with_span(*span),
+                                    );
+                                    self.engine.has_error = true;
+                                    return "0".to_string();
+                                }
+                            }
+                            _ => {
+                                emit_diagnostic(
+                                    &Diagnostic::error("Mutable kernel argument must be a simple borrow of a variable")
+                                        .with_code("VX0315")
+                                        .with_span(*span),
+                                );
+                                self.engine.has_error = true;
+                                return "0".to_string();
+                            }
+                        },
+                        _ => {
+                            emit_diagnostic(
+                                &Diagnostic::error("Mutable kernel argument must be a borrow expression")
+                                    .with_code("VX0316")
+                                    .with_span(*span),
+                            );
+                            self.engine.has_error = true;
+                            return "0".to_string();
+                        }
+                    };
+                    let pointee_llvm = self
+                        .engine
+                        .map_type(pointee_vox, self.target == CodegenTarget::Device);
+                    let dev_i8 = self.engine.next_register();
+                    self.emit(&format!(
+                        "    {} = bitcast {}* {} to i8*",
+                        dev_i8, pointee_llvm, dev_ptr
+                    ));
+                    self.emit(&format!(
+                        "    call void @vox_gpu_memcpy_device_to_host(i8* {}, i8* {}, i64 {})",
+                        host_ptr, dev_i8, size
+                    ));
+                }
+
+                // -------------------------------------------------------------
+                // 5. Free device memory
+                // -------------------------------------------------------------
+                for (_, dev_ptr, _, pointee_vox) in &device_ptrs {
+                    let pointee_llvm = self
+                        .engine
+                        .map_type(pointee_vox, self.target == CodegenTarget::Device);
+                    let dev_i8 = self.engine.next_register();
+                    self.emit(&format!(
+                        "    {} = bitcast {}* {} to i8*",
+                        dev_i8, pointee_llvm, dev_ptr
+                    ));
+                    self.emit(&format!("    call void @vox_gpu_free(i8* {})", dev_i8));
+                }
+
+                "0".to_string()
+            }
 
             _ => {
                 self.engine

@@ -374,6 +374,7 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
             params,
             body,
             device_triple,
+            attr,
             span,
         } => {
             let mut new_body = Vec::new();
@@ -391,9 +392,35 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
                     params: params.clone(),
                     body: new_body,
                     device_triple: device_triple.clone(),
+                    attr: attr.clone(),
                     span: *span,
                 },
                 errors,
+            )
+        }
+
+        ASTNode::KernelLaunch { kernel, grid, args, span } => {
+            let (new_kernel, err1) = resolve_imports(kernel, resolver);
+            let (new_grid_x, err2) = resolve_imports(&*grid.0, resolver);
+            let (new_grid_y, err3) = resolve_imports(&*grid.1, resolver);
+            let (new_grid_z, err4) = resolve_imports(&*grid.2, resolver);
+            let mut new_args = Vec::new();
+            let mut err5 = false;
+            for arg in args {
+                let (new_arg, e) = resolve_imports(arg, resolver);
+                if e {
+                    err5 = true;
+                }
+                new_args.push(new_arg);
+            }
+            (
+                ASTNode::KernelLaunch {
+                    kernel: Box::new(new_kernel),
+                    grid: (Box::new(new_grid_x), Box::new(new_grid_y), Box::new(new_grid_z)),
+                    args: new_args,
+                    span: *span,
+                },
+                err1 || err2 || err3 || err4 || err5,
             )
         }
 
@@ -718,6 +745,7 @@ pub fn node_span(node: &ASTNode) -> Span {
         ASTNode::Block { span, .. } => *span,
         ASTNode::FunctionDef { span, .. } => *span,
         ASTNode::KernelFn { span, .. } => *span,
+        ASTNode::KernelLaunch { span, .. } => *span,
         ASTNode::IfStatement { span, .. } => *span,
         ASTNode::IfLetStatement { span, .. } => *span,
         ASTNode::WhileStatement { span, .. } => *span,

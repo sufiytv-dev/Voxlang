@@ -15,7 +15,7 @@ mod string_const;
 mod type_map;
 
 use crate::diagnostic::{Diagnostic, debug_log, emit_diagnostic};
-use crate::parser::ASTNode;
+use crate::parser::{ASTNode, KernelAttr};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,10 +33,9 @@ pub struct CodegenEngine {
     pub var_vox_types: HashMap<String, String>,
     pub generic_functions: HashMap<String, (Vec<String>, Vec<String>, String)>,
     pub generic_function_asts: HashMap<String, ASTNode>,
-    pub pending_kernel_stubs: Vec<(String, Vec<crate::parser::Param>)>,
     pub kernel_binary_const: Option<String>,
     pub register_counter: usize,
-    pub alloca_counter: usize, // NEW: separate counter for named allocas
+    pub alloca_counter: usize, // separate counter for named allocas
     pub variable_symbols: HashMap<String, (String, String, bool, bool)>,
     pub string_counter: usize,
     pub string_map: HashMap<String, String>,
@@ -76,11 +75,23 @@ pub struct CodegenEngine {
     pub brace_emission_log: Vec<String>,
     pub current_function_stack: Vec<String>,
 
-    // NEW: type aliases from semantic analysis
+    // type aliases from semantic analysis
     pub type_aliases: HashMap<String, String>,
 
     // Register allocation tracking for debugging
     pub register_allocations: Vec<(usize, String, String)>,
+
+    // kernel attributes (block dimensions) for each kernel
+    pub kernel_attrs: HashMap<String, KernelAttr>,
+
+    // GPU architecture (e.g., "sm_75", "gfx1200")
+    pub gpu_arch: Option<String>,
+
+    // Kernel parameter types (Vox types) for each kernel – used during launch codegen
+    pub kernel_param_types: HashMap<String, Vec<String>>,
+
+    // NEW: Buffer for forward declarations of monomorphised functions
+    pub pending_declarations: Vec<String>,
 }
 
 impl CodegenEngine {
@@ -93,7 +104,6 @@ impl CodegenEngine {
             device_triple_override: None,
             current_kernel_name: None,
             struct_generic_params: HashMap::new(),
-            pending_kernel_stubs: Vec::new(),
             kernel_binary_const: None,
             generic_functions: HashMap::new(),
             generic_function_asts: HashMap::new(),
@@ -101,7 +111,7 @@ impl CodegenEngine {
             pending_concrete_struct_defs: RefCell::new(Vec::new()),
             var_vox_types: HashMap::new(),
             register_counter: 0,
-            alloca_counter: 0, // NEW: initialize to 0
+            alloca_counter: 0,
             variable_symbols: HashMap::new(),
             string_counter: 0,
             string_map: HashMap::new(),
@@ -137,6 +147,10 @@ impl CodegenEngine {
             current_function_stack: Vec::new(),
             type_aliases: HashMap::new(),
             register_allocations: Vec::new(),
+            kernel_attrs: HashMap::new(),
+            gpu_arch: None,
+            kernel_param_types: HashMap::new(),
+            pending_declarations: Vec::new(),
         };
 
         let mut option_map = HashMap::new();
@@ -174,7 +188,12 @@ impl CodegenEngine {
         self.gpu_mode = mode.map(|s| s.to_string());
     }
 
-    /// NEW: set the type alias map from the semantic analyser.
+    /// Set the GPU architecture (e.g., "sm_75", "gfx1200")
+    pub fn set_gpu_arch(&mut self, arch: Option<String>) {
+        self.gpu_arch = arch;
+    }
+
+    /// set the type alias map from the semantic analyser.
     pub fn set_type_aliases(&mut self, aliases: HashMap<String, String>) {
         self.type_aliases = aliases;
     }
@@ -192,6 +211,11 @@ impl CodegenEngine {
         for def in defs {
             self.debug_emit(&def);
         }
+    }
+
+    /// Retrieve the stored Vox parameter types for a kernel function.
+    pub fn get_kernel_param_types(&self, name: &str) -> Option<&Vec<String>> {
+        self.kernel_param_types.get(name)
     }
 
     pub fn compile_expression(&mut self, node: &ASTNode, expected_type: Option<&str>) -> String {
@@ -270,6 +294,12 @@ impl CodegenEngine {
         if self.has_error {
             self.debug_log("[CODEGEN] has_error after emit_module_header, aborting");
             return String::new();
+        }
+
+        // Emit all pending forward declarations at module scope
+        let decls = std::mem::take(&mut self.pending_declarations);
+        for decl in decls {
+            self.debug_emit(&decl);
         }
 
         self.has_kernel = self.contains_kernel(ast);
@@ -362,10 +392,13 @@ impl CodegenEngine {
         self.imported_modules = imported;
         print_program(self, ast, "after Phase2");
 
-        // Phase 3: compile original program (skip types already emitted)
+        // =============================================================
+        // Phase 3: compile original program (skip types and main)
+        // =============================================================
         self.debug_log(
-            "Phase 3: compiling original program statements (excluding type definitions)",
+            "Phase 3: compiling original program statements (excluding type definitions and main)",
         );
+        let mut main_ast = None; // [FIX] Store main function AST for later compilation
         match ast {
             ASTNode::Program(statements, _) => {
                 self.debug_log(&format!(
@@ -379,6 +412,14 @@ impl CodegenEngine {
                     ));
                     if matches!(stmt, ASTNode::StructDef { .. } | ASTNode::EnumDef { .. }) {
                         continue;
+                    }
+                    // [FIX] Skip main function now – we will compile it after device binary is ready
+                    if let ASTNode::FunctionDef { name, .. } = stmt {
+                        if name == "main" {
+                            self.debug_log("[CODEGEN][Phase3] Deferring compilation of 'main' until after device binary generation");
+                            main_ast = Some(stmt.clone());
+                            continue;
+                        }
                     }
                     if self.has_error {
                         break;
@@ -410,12 +451,17 @@ impl CodegenEngine {
         // Phase 5: emit concrete struct definitions
         self.emit_pending_concrete_structs();
 
+        // [FIX] Generate device binary (PTX/HSACO) and set kernel_binary_const
         if self.gpu_mode.is_some() && self.has_kernel && !self.device_ir.is_empty() {
             let triple = self.device_triple.clone();
             if let Some(triple) = triple {
                 if let Some(binary) = self.finalize_device_code(&triple) {
                     let binary_const = self.add_binary_constant(&binary);
-                    self.kernel_binary_const = Some(binary_const);
+                    self.kernel_binary_const = Some(binary_const.clone());
+                    self.debug_log(&format!(
+                        "[CODEGEN] Device binary generated and stored as constant '{}'",
+                        binary_const
+                    ));
                 } else {
                     emit_diagnostic(
                         &Diagnostic::warning(
@@ -427,12 +473,35 @@ impl CodegenEngine {
             }
         }
 
-        if self.gpu_mode.is_some() {
-            let stubs = std::mem::take(&mut self.pending_kernel_stubs);
-            for (name, params) in stubs {
-                self.emit_kernel_launch_stub(&name, &params);
+        // [FIX] Now compile main (if it exists) – it will see kernel_binary_const and emit the load call
+        if let Some(main_node) = main_ast {
+            self.debug_log("[CODEGEN] Compiling deferred 'main' function (after device binary generation)");
+            // Ensure that the main function is emitted after all other declarations (including the device binary constant)
+            self.compile_statement(&main_node);
+            if self.has_error {
+                return String::new();
             }
         }
+
+        // =================================================================
+        // Phase 4.5: compile any monomorphised functions generated during main compilation
+        // =================================================================
+        while !self.pending_monomorphised_functions.is_empty() {
+            self.debug_log(&format!(
+                "[CODEGEN][Phase4.5] compiling {} monomorphised functions",
+                self.pending_monomorphised_functions.len()
+            ));
+            let pending = std::mem::take(&mut self.pending_monomorphised_functions);
+            for func_node in &pending {
+                self.compile_statement(func_node);
+                if self.has_error {
+                    return String::new();
+                }
+            }
+        }
+
+        // Launch stubs are no longer emitted – kernel launches are compiled directly
+        // from ASTNode::KernelLaunch in expr.rs. The pending_kernel_stubs field has been removed.
 
         for worker in &self.pending_workers {
             self.ir.push_str(worker);

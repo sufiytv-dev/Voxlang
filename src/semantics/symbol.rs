@@ -5,7 +5,7 @@ use crate::diagnostic::{Diagnostic, Suggestion, emit_diagnostic};
 use crate::frontend::span::Span;
 use crate::module::ModuleSymbolTable;
 use crate::parser::{ASTNode, EnumVariant, Param, StructField};
-use crate::semantics::builtins::register_builtins; // <-- import built-in registration
+use crate::semantics::builtins::register_builtins;
 use crate::semantics::types::Type;
 use std::collections::{HashMap, HashSet};
 
@@ -59,6 +59,7 @@ pub struct SymbolTable {
             Type,
             Option<Box<ASTNode>>,
             Vec<String>,
+            bool,   // is_kernel
         ),
     >,
     pub fn_defs: HashMap<
@@ -71,6 +72,7 @@ pub struct SymbolTable {
             Option<Box<ASTNode>>,
             Vec<ASTNode>,
             Span,
+            bool,   // is_kernel
         ),
     >,
     pub(crate) structs: HashMap<String, StructInfo>,
@@ -492,6 +494,7 @@ impl SymbolTable {
         return_type: Type,
         return_refinement: Option<Box<ASTNode>>,
         generic_params: Vec<String>,
+        is_kernel: bool,
     ) {
         self.functions.insert(
             name.to_string(),
@@ -501,6 +504,7 @@ impl SymbolTable {
                 return_type,
                 return_refinement,
                 generic_params,
+                is_kernel,
             ),
         );
     }
@@ -514,6 +518,7 @@ impl SymbolTable {
         return_refinement: Option<Box<ASTNode>>,
         body: Vec<ASTNode>,
         span: Span,
+        is_kernel: bool,
     ) {
         use crate::semantics::types::parse_type_str;
         let gp_set: HashSet<_> = generic_params.iter().cloned().collect();
@@ -537,6 +542,7 @@ impl SymbolTable {
                 return_refinement.clone(),
                 body.clone(),
                 span,
+                is_kernel,
             ),
         );
         let param_types: Vec<Type> = params
@@ -547,12 +553,37 @@ impl SymbolTable {
             params.iter().map(|p| p.refinement.clone()).collect();
         self.register_function(
             name,
-            param_types,
+            param_types.clone(),
             param_refinements,
             return_ty,
             return_refinement,
             generic_params,
+            is_kernel,
         );
+
+        // =====================================================================
+        // FIX: For kernel functions, automatically register a launch stub.
+        // The stub has the same parameter types (including &mut) and returns void.
+        // =====================================================================
+        if is_kernel {
+            let launch_name = format!("{}_launch", name);
+            // No generics on the launch stub.
+            let launch_return = Type::Concrete("void".to_string());
+            // Parameter types are exactly the same as the kernel.
+            let launch_param_types = param_types.clone();
+            // No refinements on the launch stub.
+            let launch_param_refinements = vec![None; launch_param_types.len()];
+            self.register_function(
+                &launch_name,
+                launch_param_types,
+                launch_param_refinements,
+                launch_return,
+                None,
+                vec![], // no generic parameters
+                false,  // not a kernel itself
+            );
+            self.dbg(&format!("Registered implicit launch stub '{}'", launch_name));
+        }
     }
 
     pub fn lookup_function(
@@ -564,6 +595,7 @@ impl SymbolTable {
         Type,
         Option<Box<ASTNode>>,
         Vec<String>,
+        bool,
     )> {
         self.functions.get(name).cloned()
     }

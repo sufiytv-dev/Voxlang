@@ -175,6 +175,10 @@ impl CodegenEngine {
     }
 
     /// Generate a monomorphised version of a generic function on the fly.
+    ///
+    /// **FIXED**: Forward declarations are now buffered in `pending_declarations`
+    /// and will be emitted at module scope, preventing illegal `declare` lines
+    /// from appearing inside function bodies.
     pub(crate) fn generate_monomorphised_function(
         &mut self,
         generic_name: &str,
@@ -201,7 +205,7 @@ impl CodegenEngine {
                 let monomorphised_func = ASTNode::FunctionDef {
                     name: monomorphised_name.to_string(),
                     generic_params: vec![],
-                    params,
+                    params: params.clone(),
                     return_type: return_type.clone(),
                     return_refinement,
                     body,
@@ -213,6 +217,22 @@ impl CodegenEngine {
                 ));
                 self.function_return_types
                     .insert(monomorphised_name.to_string(), return_type.clone());
+
+                // Emit forward declaration so calls can resolve it.
+                let ret_llvm = self.map_type(&return_type, false);
+                let param_llvm: Vec<String> = params
+                    .iter()
+                    .map(|p| self.map_type(&p.ty, false))
+                    .collect();
+                let declare_line = format!(
+                    "declare {} @{}({})",
+                    ret_llvm,
+                    monomorphised_name,
+                    param_llvm.join(", ")
+                );
+                // Buffer the declaration – it will be emitted at module scope later.
+                self.pending_declarations.push(declare_line);
+
                 self.pending_monomorphised_functions
                     .push(monomorphised_func.clone());
                 self.debug_log(&format!(
