@@ -10,10 +10,12 @@
 // - POST‑PROCESSING: converts explicit pointer types to opaque `ptr` with address spaces.
 // - FIXED NVVM: use function attribute "kernel" placed correctly before '{'.
 // - FIXED NVVM: emit !nvvm.annotations metadata with correct syntax (!0 = !{...}).
+// - IMPROVED: Linker path resolution – searches known locations if self.lld_path is None.
+// - BETTER: Error messages when llc or ld.lld fail.
 
 use crate::codegen::CodegenEngine;
 use crate::codegen::helpers::create_temp_file;
-use crate::diagnostic::{Diagnostic, emit_diagnostic, debug_log};
+use crate::diagnostic::{Diagnostic, debug_log, emit_diagnostic};
 use crate::parser::ASTNode;
 use std::fs;
 use std::path::PathBuf;
@@ -35,7 +37,10 @@ impl CodegenEngine {
         };
         self.device_ir
             .push_str(&format!("target datalayout = \"{}\"\n\n", datalayout));
-        debug_log(format!("[DEVICE] Emitted global header for triple: {}", triple));
+        debug_log(format!(
+            "[DEVICE] Emitted global header for triple: {}",
+            triple
+        ));
     }
 
     // ------------------------------------------------------------------------
@@ -65,8 +70,15 @@ impl CodegenEngine {
 
             // Extract the function type from the IR to build correct metadata.
             // Find the function definition line again to parse argument types.
-            let def_start = if let Some(p) = ir.find(&pattern) { p } else { continue };
-            let def_end = ir[def_start..].find('{').map(|p| def_start + p).unwrap_or(def_start);
+            let def_start = if let Some(p) = ir.find(&pattern) {
+                p
+            } else {
+                continue;
+            };
+            let def_end = ir[def_start..]
+                .find('{')
+                .map(|p| def_start + p)
+                .unwrap_or(def_start);
             let def_line = &ir[def_start..def_end];
             // def_line example: "define void @add_kernel(i32 %a, i32 %b, ptr addrspace(1) %result)"
             // Extract argument types.
@@ -109,6 +121,45 @@ impl CodegenEngine {
 
         self.device_ir = ir;
         debug_log("[DEVICE] Added kernel attributes and NVVM annotations");
+    }
+
+    /// Helper to locate `ld.lld` if `self.lld_path` is not usable.
+    fn find_lld(&self) -> PathBuf {
+        // If we already have a path and it exists, use it.
+        if let Some(ref path) = self.lld_path {
+            if path.exists() {
+                return path.clone();
+            }
+            debug_log(&format!(
+                "[DEVICE] stored lld_path '{}' does not exist, falling back to search",
+                path.display()
+            ));
+        }
+
+        // Common locations to search for ld.lld on Windows.
+        let candidates = vec![
+            // ROCm bin directory (most important for HIP)
+            PathBuf::from("C:\\Program Files\\AMD\\ROCm\\7.1\\bin\\ld.lld.exe"),
+            PathBuf::from("C:\\Program Files\\AMD\\ROCm\\7.0\\bin\\ld.lld.exe"),
+            // LLVM from scoop
+            PathBuf::from("C:\\Users\\Sufiy\\scoop\\apps\\llvm\\current\\bin\\ld.lld.exe"),
+            // Standard LLVM installation
+            PathBuf::from("C:\\Program Files\\LLVM\\bin\\ld.lld.exe"),
+            // Just the name (relies on PATH)
+            PathBuf::from("ld.lld"),
+            PathBuf::from("ld.lld.exe"),
+        ];
+
+        for candidate in candidates {
+            if candidate.exists() {
+                debug_log(&format!("[DEVICE] Found ld.lld at {}", candidate.display()));
+                return candidate;
+            }
+        }
+
+        // Final fallback – we will try to run "ld.lld" and let the OS search PATH.
+        debug_log("[DEVICE] No explicit ld.lld found, will rely on PATH");
+        PathBuf::from("ld.lld")
     }
 
     /// Finalize device code by compiling the accumulated device IR to a binary
@@ -179,7 +230,10 @@ impl CodegenEngine {
             let _ = fs::remove_file(&ir_path);
             return None;
         }
-        debug_log(format!("Wrote device IR to temporary file: {}", ir_path.display()));
+        debug_log(format!(
+            "Wrote device IR to temporary file: {}",
+            ir_path.display()
+        ));
 
         if triple.contains("nvptx") {
             let default_arch = "sm_70".to_string();
@@ -217,8 +271,11 @@ impl CodegenEngine {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 debug_log(format!("[DEVICE] llc stderr: {}", stderr));
                 emit_diagnostic(
-                    &Diagnostic::error(&format!("llc failed to compile PTX (arch={}): {}", gpu_arch, stderr))
-                        .with_code("VX0417"),
+                    &Diagnostic::error(&format!(
+                        "llc failed to compile PTX (arch={}): {}",
+                        gpu_arch, stderr
+                    ))
+                    .with_code("VX0417"),
                 );
                 let _ = fs::remove_file(&ir_path);
                 let _ = fs::remove_file(&out_path);
@@ -292,19 +349,21 @@ impl CodegenEngine {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 debug_log(format!("[DEVICE] llc stderr: {}", stderr));
                 emit_diagnostic(
-                    &Diagnostic::error(&format!("llc failed to compile device IR to object file (arch={}): {}", gpu_arch, stderr))
-                        .with_code("VX0417"),
+                    &Diagnostic::error(&format!(
+                        "llc failed to compile device IR to object file (arch={}): {}",
+                        gpu_arch, stderr
+                    ))
+                    .with_code("VX0417"),
                 );
                 let _ = fs::remove_file(&ir_path);
                 let _ = fs::remove_file(&obj_path);
                 return None;
             }
 
-            let ld_path = self
-                .lld_path
-                .as_ref()
-                .map(|p| p.as_os_str())
-                .unwrap_or_else(|| "ld.lld".as_ref());
+            // Determine the linker executable
+            let linker = self.find_lld();
+            debug_log(&format!("[DEVICE] Using linker: {}", linker.display()));
+
             let (hsaco_path, _hsaco_file) = match create_temp_file("vox_hsaco", ".hsaco") {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -317,7 +376,7 @@ impl CodegenEngine {
                     return None;
                 }
             };
-            let mut link_cmd = Command::new(ld_path);
+            let mut link_cmd = Command::new(&linker);
             link_cmd
                 .arg("-shared")
                 .arg("-export-dynamic")
@@ -329,8 +388,12 @@ impl CodegenEngine {
                 Ok(o) => o,
                 Err(e) => {
                     emit_diagnostic(
-                        &Diagnostic::error(&format!("Failed to execute ld.lld: {}", e))
-                            .with_code("VX0416"),
+                        &Diagnostic::error(&format!(
+                            "Failed to execute linker '{}': {}",
+                            linker.display(),
+                            e
+                        ))
+                        .with_code("VX0416"),
                     );
                     let _ = fs::remove_file(&ir_path);
                     let _ = fs::remove_file(&obj_path);
@@ -340,10 +403,14 @@ impl CodegenEngine {
             };
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                debug_log(format!("[DEVICE] ld.lld stderr: {}", stderr));
+                debug_log(format!("[DEVICE] Linker stderr: {}", stderr));
                 emit_diagnostic(
-                    &Diagnostic::error(&format!("ld.lld failed to link object into HSACO: {}", stderr))
-                        .with_code("VX0417"),
+                    &Diagnostic::error(&format!(
+                        "Linker '{}' failed to link object into HSACO: {}",
+                        linker.display(),
+                        stderr
+                    ))
+                    .with_code("VX0417"),
                 );
                 let _ = fs::remove_file(&ir_path);
                 let _ = fs::remove_file(&obj_path);

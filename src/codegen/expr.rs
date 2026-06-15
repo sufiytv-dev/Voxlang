@@ -1206,13 +1206,13 @@ impl<'a> ExprEmitter<'a> {
                 let saved_lvalue = self.lvalue;
                 // Compile inner as an lvalue to get the address of the pointer variable
                 self.lvalue = true;
-                let ptr_var_addr = self.compile(inner);  // e.g., %y.addr_1 (i32**)
+                let ptr_var_addr = self.compile(inner); // e.g., %y.addr_1 (i32**)
                 self.lvalue = saved_lvalue;
 
                 // Determine the LLVM type of the pointer variable (the stored pointer)
                 let ptr_llvm_ty = if let ASTNode::Identifier(name, _) = &**inner {
                     if let Some((ty, _, _, _)) = self.engine.variable_symbols.get(name) {
-                        // ty is the LLVM type of the variable, e.g., "i32*" for &mut i32
+                        // ty is the LLVM type of the variable, e.g., "ptr addrspace(1)" for &mut i32
                         ty.clone()
                     } else {
                         // Fallback: guess from inner Vox type
@@ -1221,7 +1221,9 @@ impl<'a> ExprEmitter<'a> {
                             .strip_prefix("&mut ")
                             .or_else(|| inner_vox.strip_prefix("& "))
                             .unwrap_or(&inner_vox);
-                        let pointee_llvm = self.engine.map_type(pointee, self.target == CodegenTarget::Device);
+                        let pointee_llvm = self
+                            .engine
+                            .map_type(pointee, self.target == CodegenTarget::Device);
                         format!("{}*", pointee_llvm)
                     }
                 } else {
@@ -1231,16 +1233,18 @@ impl<'a> ExprEmitter<'a> {
                         .strip_prefix("&mut ")
                         .or_else(|| inner_vox.strip_prefix("& "))
                         .unwrap_or(&inner_vox);
-                    let pointee_llvm = self.engine.map_type(pointee, self.target == CodegenTarget::Device);
+                    let pointee_llvm = self
+                        .engine
+                        .map_type(pointee, self.target == CodegenTarget::Device);
                     format!("{}*", pointee_llvm)
                 };
 
                 // Load the actual pointer from the pointer variable's address
                 let ptr_reg = self.engine.next_register();
                 let ptr_addr_ty = if self.target == CodegenTarget::Device {
-                    self.engine.device_ptr_type(&ptr_llvm_ty)  // e.g., "ptr addrspace(5)"
+                    self.engine.device_ptr_type(&ptr_llvm_ty) // e.g., "ptr addrspace(5)"
                 } else {
-                    format!("{}*", ptr_llvm_ty)                // e.g., "i32**"
+                    format!("{}*", ptr_llvm_ty) // e.g., "i32**"
                 };
                 self.emit(&format!(
                     "    {} = load {}, {} {}",
@@ -1255,13 +1259,24 @@ impl<'a> ExprEmitter<'a> {
                     let result_reg = self.engine.next_register();
                     let pointee_llvm = if let Some(inner_ty) = ptr_llvm_ty.strip_suffix('*') {
                         inner_ty.to_string()
+                    } else if ptr_llvm_ty == "ptr addrspace(1)" {
+                        // For an opaque pointer, we need to know the pointee type from Vox.
+                        let inner_vox = self.expr_type(inner).unwrap_or_default();
+                        let pointee_vox = inner_vox.strip_prefix("&mut ").unwrap_or(&inner_vox);
+                        self.engine.map_type(pointee_vox, true)
                     } else {
                         "i32".to_string()
                     };
-                    let ptr_ty = if self.target == CodegenTarget::Device {
-                        self.engine.device_ptr_type(&pointee_llvm)
+                    // The pointer type to use for the load is exactly the type of the pointer variable.
+                    // That type is stored in self.engine.variable_symbols for identifiers.
+                    let ptr_ty = if let ASTNode::Identifier(name, _) = &**inner {
+                        if let Some((ty, _, _, _)) = self.engine.variable_symbols.get(name) {
+                            ty.clone()
+                        } else {
+                            self.engine.device_ptr_type(&pointee_llvm)
+                        }
                     } else {
-                        format!("{}*", pointee_llvm)
+                        self.engine.device_ptr_type(&pointee_llvm)
                     };
                     self.emit(&format!(
                         "    {} = load {}, {} {}",
@@ -3480,7 +3495,12 @@ impl<'a> ExprEmitter<'a> {
                 }
             },
 
-            ASTNode::KernelLaunch { kernel, grid, args, span } => {
+            ASTNode::KernelLaunch {
+                kernel,
+                grid,
+                args,
+                span,
+            } => {
                 self.engine.debug_log("compile KernelLaunch");
 
                 // Resolve kernel name
@@ -3614,7 +3634,9 @@ impl<'a> ExprEmitter<'a> {
                         let host_ptr = match arg {
                             ASTNode::BorrowExpr { expr, .. } => match &**expr {
                                 ASTNode::Identifier(name, _) => {
-                                    if let Some((_, alloc_reg, _, _)) = self.engine.variable_symbols.get(name) {
+                                    if let Some((_, alloc_reg, _, _)) =
+                                        self.engine.variable_symbols.get(name)
+                                    {
                                         alloc_reg.clone()
                                     } else {
                                         emit_diagnostic(
@@ -3638,16 +3660,21 @@ impl<'a> ExprEmitter<'a> {
                             },
                             _ => {
                                 emit_diagnostic(
-                                    &Diagnostic::error("Mutable kernel argument must be a borrow expression")
-                                        .with_code("VX0316")
-                                        .with_span(*span),
+                                    &Diagnostic::error(
+                                        "Mutable kernel argument must be a borrow expression",
+                                    )
+                                    .with_code("VX0316")
+                                    .with_span(*span),
                                 );
                                 self.engine.has_error = true;
                                 return "0".to_string();
                             }
                         };
                         // Strip "&mut " from arg_vox to get the pointee Vox type
-                        let pointee_vox = arg_vox.strip_prefix("&mut ").unwrap_or(&arg_vox).to_string();
+                        let pointee_vox = arg_vox
+                            .strip_prefix("&mut ")
+                            .unwrap_or(&arg_vox)
+                            .to_string();
                         let pointee_llvm = self.engine.map_type(&pointee_vox, false); // host LLVM type of pointee
                         // Cast host pointer to i8*
                         let host_i8 = self.engine.next_register();
@@ -3682,7 +3709,10 @@ impl<'a> ExprEmitter<'a> {
                         self.emit(&format!("    {} = alloca i8*", temp_ptr));
                         self.emit(&format!("    store i8* {}, i8** {}", dev_i8, temp_ptr));
                         let ptr_to_temp = self.engine.next_register();
-                        self.emit(&format!("    {} = bitcast i8** {} to i8*", ptr_to_temp, temp_ptr));
+                        self.emit(&format!(
+                            "    {} = bitcast i8** {} to i8*",
+                            ptr_to_temp, temp_ptr
+                        ));
 
                         let gep = self.engine.next_register();
                         self.emit(&format!(
@@ -3703,7 +3733,10 @@ impl<'a> ExprEmitter<'a> {
                             arg_llvm, arg_val, arg_llvm, tmp
                         ));
                         let ptr_to_tmp = self.engine.next_register();
-                        self.emit(&format!("    {} = bitcast {}* {} to i8*", ptr_to_tmp, arg_llvm, tmp));
+                        self.emit(&format!(
+                            "    {} = bitcast {}* {} to i8*",
+                            ptr_to_tmp, arg_llvm, tmp
+                        ));
                         let gep = self.engine.next_register();
                         self.emit(&format!(
                             "    {} = getelementptr i8*, i8** {}, i32 {}",
@@ -3730,7 +3763,10 @@ impl<'a> ExprEmitter<'a> {
                 ));
 
                 let success_i1 = self.engine.next_register();
-                self.emit(&format!("    {} = icmp eq i32 {}, 0", success_i1, launch_ret));
+                self.emit(&format!(
+                    "    {} = icmp eq i32 {}, 0",
+                    success_i1, launch_ret
+                ));
                 let fail_label = self.engine.next_block();
                 let cont_label = self.engine.next_block();
                 self.emit(&format!(
@@ -3749,7 +3785,9 @@ impl<'a> ExprEmitter<'a> {
                     let host_ptr = match &args[*idx] {
                         ASTNode::BorrowExpr { expr, .. } => match &**expr {
                             ASTNode::Identifier(name, _) => {
-                                if let Some((_, alloc_reg, _, _)) = self.engine.variable_symbols.get(name) {
+                                if let Some((_, alloc_reg, _, _)) =
+                                    self.engine.variable_symbols.get(name)
+                                {
                                     alloc_reg.clone()
                                 } else {
                                     emit_diagnostic(
@@ -3776,9 +3814,11 @@ impl<'a> ExprEmitter<'a> {
                         },
                         _ => {
                             emit_diagnostic(
-                                &Diagnostic::error("Mutable kernel argument must be a borrow expression")
-                                    .with_code("VX0316")
-                                    .with_span(*span),
+                                &Diagnostic::error(
+                                    "Mutable kernel argument must be a borrow expression",
+                                )
+                                .with_code("VX0316")
+                                .with_span(*span),
                             );
                             self.engine.has_error = true;
                             return "0".to_string();

@@ -32,7 +32,8 @@ impl CodegenEngine {
 
         // Store the parameter types (Vox types) for this kernel – used by launch code
         let param_types: Vec<String> = params.iter().map(|p| p.ty.clone()).collect();
-        self.kernel_param_types.insert(name.to_string(), param_types);
+        self.kernel_param_types
+            .insert(name.to_string(), param_types);
 
         let param_decls: Vec<String> = params
             .iter()
@@ -172,7 +173,8 @@ impl CodegenEngine {
                         let pointee_ty = if let ASTNode::Identifier(ref_name, _) = &**inner {
                             if let Some(vox_ty) = self.var_vox_types.get(ref_name) {
                                 // Strip the reference (&mut or &) to get the pointee Vox type.
-                                let inner_vox = if let Some(stripped) = vox_ty.strip_prefix("&mut ") {
+                                let inner_vox = if let Some(stripped) = vox_ty.strip_prefix("&mut ")
+                                {
                                     stripped
                                 } else if let Some(stripped) = vox_ty.strip_prefix("& ") {
                                     stripped

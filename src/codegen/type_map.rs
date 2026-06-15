@@ -211,27 +211,20 @@ impl CodegenEngine {
         // --------------------------------------------------------------------
         // References (&mut T, & T)
         // --------------------------------------------------------------------
-        if trimmed_str.starts_with("&mut ") {
-            let inner = &trimmed_str[5..];
+        if trimmed_str.starts_with("&mut ") || trimmed_str.starts_with("& ") {
+            let inner = if trimmed_str.starts_with("&mut ") {
+                &trimmed_str[5..]
+            } else {
+                &trimmed_str[2..]
+            };
             let inner_ty = self.map_type(inner, is_device);
-            let result = if is_device && self.is_nvptx() {
-                // Global address space for kernel arguments
+            let result = if is_device {
+                // On GPU, kernel arguments that are pointers must be in address space 1 (global)
                 "ptr addrspace(1)".to_string()
             } else {
                 format!("{}*", inner_ty)
             };
-            self.debug_log_type(&format!("  -> &mut {} -> {}", inner, result));
-            return result;
-        }
-        if trimmed_str.starts_with("& ") {
-            let inner = &trimmed_str[2..];
-            let inner_ty = self.map_type(inner, is_device);
-            let result = if is_device && self.is_nvptx() {
-                "ptr addrspace(1)".to_string()
-            } else {
-                format!("{}*", inner_ty)
-            };
-            self.debug_log_type(&format!("  -> & {} -> {}", inner, result));
+            self.debug_log_type(&format!("  -> {} -> {}", trimmed_str, result));
             return result;
         }
 
