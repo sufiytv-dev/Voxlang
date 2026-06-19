@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::diagnostic::debug_log;
 use crate::std::walkdir::WalkDir;
 
 pub mod frontend {
@@ -33,6 +32,7 @@ pub mod ui;
 pub mod update;
 pub mod watch;
 
+use crate::diagnostic::debug_log;
 use codegen::CodegenEngine;
 use core::cmp;
 use desugar::desugar;
@@ -388,6 +388,16 @@ fn has_kernel(node: &ASTNode, device_triple: &mut Option<String>) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Returns the correct static library file name for the given target triple.
+fn get_static_lib_name(target_triple: &str) -> String {
+    if target_triple.contains("windows") && target_triple.contains("msvc") {
+        "vox_rt.lib".to_string()
+    } else {
+        // Unix-like: rustc creates libvox_rt.a
+        "libvox_rt.a".to_string()
     }
 }
 
@@ -864,7 +874,7 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
 }
 
 // ============================================================================
-// UPDATED cmd_build with robust library generation and absolute paths
+// UPDATED cmd_build with robust library generation and path handling
 // ============================================================================
 fn cmd_build(
     file: &str,
@@ -977,13 +987,9 @@ fn cmd_build(
     let cache_dir = get_output_dir(profile).join(".vox_rt_cache");
     std::fs::create_dir_all(&cache_dir).expect("Failed to create runtime cache dir");
 
-    let lib_name = "vox_rt";
-    let lib_extension = if target_triple.contains("msvc") {
-        ".lib"
-    } else {
-        ".a"
-    };
-    let static_lib = cache_dir.join(format!("{}{}", lib_name, lib_extension));
+    // Determine the correct static library name and path
+    let lib_name = get_static_lib_name(&target_triple);
+    let static_lib = cache_dir.join(&lib_name);
 
     // -------------------------------------------------------------------------
     // Rebuild vox_rt with the appropriate feature flags (or none if CPU fallback)
@@ -1002,19 +1008,21 @@ fn cmd_build(
 
     if need_rebuild {
         let mut rustc_cmd = Command::new("rustc");
+        // Use -o to specify the exact output path
         rustc_cmd
             .arg("--crate-type=staticlib")
             .arg("--target")
-            .arg(target_triple)
+            .arg(&target_triple)
             .arg("-C")
             .arg("panic=abort")
             .arg("-C")
             .arg("opt-level=3")
             .arg("-C")
             .arg("overflow-checks=off")
-            .arg("--out-dir")
-            .arg(&cache_dir)
+            .arg("-o")
+            .arg(&static_lib) // output directly to the desired name
             .arg("src/vox_rt.rs");
+
         if target_triple.contains("msvc") {
             rustc_cmd.arg("-C").arg("target-feature=+crt-static");
         }
@@ -1026,8 +1034,12 @@ fn cmd_build(
                 rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_enabled\"");
             }
         }
-        let status = rustc_cmd.status().expect("failed to run rustc");
-        if !status.success() {
+
+        // Capture output to show errors
+        let output = rustc_cmd.output().expect("failed to run rustc");
+        if !output.status.success() {
+            eprintln!("rustc stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+            eprintln!("rustc stdout:\n{}", String::from_utf8_lossy(&output.stdout));
             eprintln!("Compilation of vox_rt.rs failed");
             return diagnostic::exit_code::LINKER_ERROR;
         }
@@ -1049,7 +1061,7 @@ fn cmd_build(
     // -------------------------------------------------------------------------
     let mut link_cmd = Command::new(&linker);
 
-    // Link directly from .ll (as in 0.4)
+    // Link directly from .ll
     link_cmd.arg(&debug_ir_path).arg("-o").arg(&exe_path);
 
     // Set the target triple explicitly (important for Windows)
@@ -1104,8 +1116,8 @@ fn cmd_build(
     }
     debug_log("[DISCOVERY] Set LIB environment variable for linking.");
 
-    // Link against vox_rt
-    link_cmd.arg("-lvox_rt");
+    // Link against vox_rt (the name is already correct)
+    link_cmd.arg("-lvox_rt"); // For Unix, linker looks for libvox_rt.a; for Windows, vox_rt.lib
 
     // Standard system libraries – exactly as in 0.4
     if target_triple.contains("msvc") {
