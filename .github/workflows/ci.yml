@@ -42,11 +42,6 @@ jobs:
           sudo apt update
           sudo apt install -y clang lld z3
 
-      - name: Install LLVM (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install llvm --version=18.1.8
-
       - name: Compile VXM Orchestrator
         run: cargo build -p vxm --release
 
@@ -81,22 +76,16 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # ----- Set up MSVC environment on Windows -----
+      - name: Setup MSVC environment (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install Dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt update
           sudo apt install -y clang lld z3
-
-      - name: Install LLVM (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install llvm --version=18.1.8
-
-      - name: Debug Windows environment
-        if: matrix.os == 'windows-latest'
-        run: |
-          echo "LIB=$env:LIB"
-          echo "Path=$env:Path"
 
       - name: Build Vox Compiler
         run: cargo build --release
