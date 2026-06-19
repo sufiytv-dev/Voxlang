@@ -8,6 +8,7 @@
 // - `device_ptr_type` returns `"ptr addrspace(5)"` for local memory.
 // - Reference parameters become `ptr addrspace(1)` for global memory.
 // - Allocas get `addrspace(5)` via `alloca_addrspace_suffix`.
+// - Added support for qualified struct names (e.g., `math::Point`).
 
 use crate::codegen::CodegenEngine;
 use crate::codegen::helpers::sanitize_type_name;
@@ -37,9 +38,9 @@ fn mangle_struct_name(base: &str, args: &[String]) -> String {
 }
 
 impl CodegenEngine {
-    /// Log a type mapping debug message if `self.debug` is enabled.
+    /// Log a type mapping debug message if global debug is enabled.
     fn debug_log_type(&self, msg: &str) {
-        if self.debug {
+        if crate::diagnostic::global_debug() {
             crate::diagnostic::debug_log(format!("[CODEGEN:TYPE_MAP] {}", msg));
         }
     }
@@ -101,6 +102,15 @@ impl CodegenEngine {
         without_addrspace.trim().to_string()
     }
 
+    /// Strip the module prefix from a qualified name (e.g., `math::Point` → `Point`).
+    pub(crate) fn strip_module_prefix(ty: &str) -> String {
+        if let Some(last) = ty.rsplit("::").next() {
+            last.to_string()
+        } else {
+            ty.to_string()
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Address space and pointer type helpers (for device IR)
     // ------------------------------------------------------------------------
@@ -146,8 +156,10 @@ impl CodegenEngine {
         field_name: &str,
         is_device: bool,
     ) -> Option<String> {
-        let fields = self.struct_fields.get(base_struct)?;
-        let generic_params = self.struct_generic_params.get(base_struct)?;
+        // Strip module prefix from base_struct if present
+        let base_no_module = Self::strip_module_prefix(base_struct);
+        let fields = self.struct_fields.get(&base_no_module)?;
+        let generic_params = self.struct_generic_params.get(&base_no_module)?;
 
         let (_, args) = parse_generic_type(concrete_struct_ty)?;
         if args.len() != generic_params.len() {
@@ -323,33 +335,35 @@ impl CodegenEngine {
 
         // Special‑case non‑generic struct with empty angle brackets (e.g., "Point<>")
         if let Some((base_name, args)) = parse_generic_type(trimmed_str) {
-            if let Some(generic_params) = self.struct_generic_params.get(&base_name) {
+            let base_no_module = Self::strip_module_prefix(&base_name);
+            if let Some(generic_params) = self.struct_generic_params.get(&base_no_module) {
                 if generic_params.is_empty() && args.iter().all(|a| a.is_empty() || a == "?") {
                     self.debug_log_type(&format!(
                         "  -> non‑generic struct with empty brackets '{}' -> %{}",
-                        trimmed_str, base_name
+                        trimmed_str, base_no_module
                     ));
-                    return format!("%{}", base_name);
+                    return format!("%{}", base_no_module);
                 }
             }
         }
 
         // Generic structs (e.g., Pair<T,U>) – generate a concrete named struct on demand.
         if let Some((base_name, args)) = parse_generic_type(trimmed_str) {
-            if self.struct_fields.contains_key(&base_name) {
-                let mangled = mangle_struct_name(&base_name, &args);
+            let base_no_module = Self::strip_module_prefix(&base_name);
+            if self.struct_fields.contains_key(&base_no_module) {
+                let mangled = mangle_struct_name(&base_no_module, &args);
                 {
                     let cache = self.concrete_struct_defs.borrow();
                     if cache.contains_key(&mangled) {
                         self.debug_log_type(&format!(
                             "  -> generic struct {}{:?} -> cached {}",
-                            base_name, args, mangled
+                            base_no_module, args, mangled
                         ));
                         return mangled;
                     }
                 }
-                let generic_fields = self.struct_fields.get(&base_name).unwrap();
-                let generic_params = self.struct_generic_params.get(&base_name).unwrap();
+                let generic_fields = self.struct_fields.get(&base_no_module).unwrap();
+                let generic_params = self.struct_generic_params.get(&base_no_module).unwrap();
                 let mut subst = HashMap::new();
                 for (gp, arg) in generic_params.iter().zip(args.iter()) {
                     subst.insert(gp.clone(), arg.clone());
@@ -374,7 +388,7 @@ impl CodegenEngine {
                     .insert(mangled.clone(), struct_body);
                 self.debug_log_type(&format!(
                     "  -> generic struct {}{:?} -> new named struct {}",
-                    base_name, args, mangled
+                    base_no_module, args, mangled
                 ));
                 return mangled;
             }
@@ -382,15 +396,17 @@ impl CodegenEngine {
 
         // Plain struct (non‑generic) – already defined as %StructName.
         let base_name = Self::strip_generic_args(trimmed_str);
-        if self.struct_fields.contains_key(&base_name) {
-            let result = format!("%{}", base_name);
+        let base_no_module = Self::strip_module_prefix(&base_name);
+        if self.struct_fields.contains_key(&base_no_module) {
+            let result = format!("%{}", base_no_module);
             self.debug_log_type(&format!("  -> struct {} -> {}", base_name, result));
             return result;
         }
 
         // Enum types (except Option and Result) → anonymous { i32, i32 }
         let base_enum = Self::strip_generic_args(trimmed_str);
-        if self.enum_variants.contains_key(&base_enum) {
+        let base_enum_no_module = Self::strip_module_prefix(&base_enum);
+        if self.enum_variants.contains_key(&base_enum_no_module) {
             self.debug_log_type(&format!("  -> enum {} -> {{ i32, i32 }}", base_enum));
             return "{ i32, i32 }".to_string();
         }
@@ -471,9 +487,10 @@ impl CodegenEngine {
             t if t.starts_with("[]") => 24,
             t if t.starts_with('%') => {
                 let struct_name = &t[1..];
-                if struct_name.starts_with("Option_") {
-                    if let Some(underscore_pos) = struct_name.find('_') {
-                        let ty_part = &struct_name[underscore_pos + 1..];
+                let struct_no_module = Self::strip_module_prefix(struct_name);
+                if struct_no_module.starts_with("Option_") {
+                    if let Some(underscore_pos) = struct_no_module.find('_') {
+                        let ty_part = &struct_no_module[underscore_pos + 1..];
                         let mut payload_size = 4;
                         if let Some((base, _)) = parse_generic_type(ty_part) {
                             payload_size = self.size_of_type(&base);
@@ -482,9 +499,9 @@ impl CodegenEngine {
                         }
                         return 4 + payload_size;
                     }
-                } else if struct_name.starts_with("Result_") {
+                } else if struct_no_module.starts_with("Result_") {
                     let mut total = 4;
-                    let parts: Vec<&str> = struct_name.split('_').collect();
+                    let parts: Vec<&str> = struct_no_module.split('_').collect();
                     if parts.len() >= 3 {
                         let t_part = parts[1];
                         let e_part = parts[2];
@@ -495,7 +512,7 @@ impl CodegenEngine {
                     }
                     return total;
                 }
-                if let Some(fields) = self.struct_fields.get(struct_name) {
+                if let Some(fields) = self.struct_fields.get(&struct_no_module) {
                     let mut total = 0;
                     for (_, fty) in fields {
                         total += self.size_of_type(fty);

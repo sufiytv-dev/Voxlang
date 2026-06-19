@@ -6,7 +6,7 @@
 //
 // NEW: Kernel attribute `@kernel(block=(x,y,z))` and kernel launch syntax `launch name(...)(...)`.
 
-use crate::diagnostic::{Diagnostic, emit_diagnostic, global_debug};
+use crate::diagnostic::{Diagnostic, debug_log, emit_diagnostic};
 use crate::frontend::span::Span;
 use crate::frontend::token::{CompilerDirective, Token, TokenKind};
 use std::mem::discriminant;
@@ -80,9 +80,7 @@ pub struct KernelAttr {
 
 impl Default for KernelAttr {
     fn default() -> Self {
-        Self {
-            block: (256, 1, 1),
-        }
+        Self { block: (256, 1, 1) }
     }
 }
 
@@ -139,14 +137,14 @@ pub enum ASTNode {
         params: Vec<Param>,
         body: Vec<ASTNode>,
         device_triple: String,
-        attr: KernelAttr,      // NEW: store block dimensions
+        attr: KernelAttr, // NEW: store block dimensions
         span: Span,
     },
 
     KernelLaunch {
-        kernel: Box<ASTNode>,                      // identifier of kernel
+        kernel: Box<ASTNode>,                             // identifier of kernel
         grid: (Box<ASTNode>, Box<ASTNode>, Box<ASTNode>), // (x,y,z) expressions
-        args: Vec<ASTNode>,                       // actual arguments to kernel
+        args: Vec<ASTNode>,                               // actual arguments to kernel
         span: Span,
     },
 
@@ -337,7 +335,6 @@ pub struct Param {
 pub struct Parser<'a> {
     pub tokens: &'a [Token],
     pub pos: usize,
-    debug: bool,
     pub has_errors: bool,
     block_depth: usize,
 }
@@ -347,24 +344,18 @@ impl<'a> Parser<'a> {
         Self {
             tokens,
             pos: 0,
-            debug: global_debug(),
             has_errors: false,
             block_depth: 0,
         }
-    }
-
-    pub fn set_debug(&mut self, enabled: bool) {
-        self.debug = enabled;
     }
 
     pub fn has_errors(&self) -> bool {
         self.has_errors
     }
 
-    fn debug_log(&self, msg: &str) {
-        if self.debug {
-            crate::diagnostic::debug_log(format!("DEBUG PARSER: {}", msg));
-        }
+    #[inline(always)]
+    fn log(&self, msg: &str) {
+        debug_log(format!("[PARSE] {}", msg));
     }
 
     fn emit_error(&mut self, diag: &Diagnostic) {
@@ -415,7 +406,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse(&mut self) -> ASTNode {
-        self.debug_log("parse: start");
+        self.log("parse: start");
         let start_span = self.current_span();
         let mut nodes = Vec::new();
         while !self.is_at_end() {
@@ -432,7 +423,7 @@ impl<'a> Parser<'a> {
                 node => nodes.push(node),
             }
             if self.block_depth != 0 {
-                self.debug_log(&format!(
+                self.log(&format!(
                     "Resetting block_depth from {} to 0",
                     self.block_depth
                 ));
@@ -445,7 +436,7 @@ impl<'a> Parser<'a> {
             }
         }
         let end_span = self.current_span();
-        self.debug_log(&format!("parse: done, {} nodes", nodes.len()));
+        self.log(&format!("parse: done, {} nodes", nodes.len()));
         ASTNode::Program(
             nodes,
             self.span_until(
@@ -618,7 +609,7 @@ impl<'a> Parser<'a> {
             let is_if_let = self.match_token(TokenKind::Let);
             self.pos = saved_pos;
             if is_if_let {
-                self.debug_log("parsing if-let statement");
+                self.log("parsing if-let statement");
                 return self.parse_if_let_statement();
             }
         }
@@ -628,63 +619,63 @@ impl<'a> Parser<'a> {
             let is_while_let = self.match_token(TokenKind::Let);
             self.pos = saved_pos;
             if is_while_let {
-                self.debug_log("parsing while-let statement");
+                self.log("parsing while-let statement");
                 return self.parse_while_let_statement();
             }
         }
 
         if let Some(&TokenKind::For) = self.peek_kind() {
-            self.debug_log("parsing for loop");
+            self.log("parsing for loop");
             return self.parse_for_loop();
         }
 
         match self.peek_kind() {
             Some(&TokenKind::Import) => {
-                self.debug_log("parsing import");
+                self.log("parsing import");
                 self.parse_import_statement()
             }
             Some(&TokenKind::Struct) => {
-                self.debug_log("parsing struct");
+                self.log("parsing struct");
                 self.parse_struct_definition()
             }
             Some(&TokenKind::Enum) => {
-                self.debug_log("parsing enum");
+                self.log("parsing enum");
                 self.parse_enum_definition()
             }
             Some(&TokenKind::Type) => {
-                self.debug_log("parsing type alias");
+                self.log("parsing type alias");
                 self.parse_type_alias()
             }
             Some(&TokenKind::Use) => {
-                self.debug_log("parsing use");
+                self.log("parsing use");
                 self.parse_use_statement()
             }
             Some(&TokenKind::Fn) => {
-                self.debug_log("parsing function");
+                self.log("parsing function");
                 self.parse_function_definition()
             }
             Some(&TokenKind::If) => {
-                self.debug_log("parsing if");
+                self.log("parsing if");
                 self.parse_if_statement()
             }
             Some(&TokenKind::While) => {
-                self.debug_log("parsing while");
+                self.log("parsing while");
                 self.parse_while_statement()
             }
             Some(&TokenKind::Parallel) => {
-                self.debug_log("parsing parallel loop");
+                self.log("parsing parallel loop");
                 self.parse_parallel_loop()
             }
             Some(&TokenKind::Return) => {
-                self.debug_log("parsing return");
+                self.log("parsing return");
                 self.parse_return_statement()
             }
             Some(&TokenKind::Let) => {
-                self.debug_log("parsing let");
+                self.log("parsing let");
                 self.parse_let_declaration()
             }
             _ => {
-                self.debug_log("parsing expression or assignment");
+                self.log("parsing expression or assignment");
                 self.parse_expression_or_assignment()
             }
         }
@@ -762,7 +753,9 @@ impl<'a> Parser<'a> {
 
     fn skip_to_expression_end(&mut self) {
         // Skip until we hit a token that ends an expression or statement boundary
-        while !self.is_at_end() && !self.check(TokenKind::Newline) && !self.check(TokenKind::ScopeClose)
+        while !self.is_at_end()
+            && !self.check(TokenKind::Newline)
+            && !self.check(TokenKind::ScopeClose)
         {
             self.advance();
         }
@@ -1392,7 +1385,7 @@ impl<'a> Parser<'a> {
 
     fn parse_function_definition(&mut self) -> ASTNode {
         let start_span = self.current_span();
-        self.debug_log("parse_function_definition: enter");
+        self.log("parse_function_definition: enter");
         self.expect(TokenKind::Fn);
         let name_token = self.expect_identifier();
         let name = match &name_token.kind {
@@ -1405,7 +1398,7 @@ impl<'a> Parser<'a> {
                 );
             }
         };
-        self.debug_log(&format!("function name = {}", name));
+        self.log(&format!("function name = {}", name));
 
         let mut generic_params = Vec::new();
         if self.match_token(TokenKind::LessThan) {
@@ -1441,7 +1434,7 @@ impl<'a> Parser<'a> {
         self.consume_newlines();
         self.block_depth += 1;
         let body = self.parse_block_stmts();
-        self.debug_log(&format!("function body has {} statements", body.len()));
+        self.log(&format!("function body has {} statements", body.len()));
         let end_span = self.current_span();
         ASTNode::FunctionDef {
             name,
@@ -1816,7 +1809,7 @@ impl<'a> Parser<'a> {
 
     fn parse_block_stmts(&mut self) -> Vec<ASTNode> {
         let start_depth = self.block_depth;
-        self.debug_log(&format!("parse_block_stmts: enter, depth={}", start_depth));
+        self.log(&format!("parse_block_stmts: enter, depth={}", start_depth));
         let mut statements = Vec::new();
 
         while !self.is_at_end() {
@@ -1827,12 +1820,12 @@ impl<'a> Parser<'a> {
             if self.check(TokenKind::ScopeClose) {
                 self.advance();
                 self.block_depth -= 1;
-                self.debug_log(&format!(
+                self.log(&format!(
                     "parse_block_stmts: consumed '}}', new depth={}",
                     self.block_depth
                 ));
                 if self.block_depth == start_depth - 1 {
-                    self.debug_log("parse_block_stmts: closed current block, breaking");
+                    self.log("parse_block_stmts: closed current block, breaking");
                     break;
                 }
                 continue;
@@ -1844,7 +1837,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.debug_log(&format!(
+        self.log(&format!(
             "parse_block_stmts: exit, {} statements",
             statements.len()
         ));
@@ -2724,7 +2717,7 @@ impl<'a> Parser<'a> {
     fn advance(&mut self) -> Option<&'a Token> {
         if self.pos < self.tokens.len() {
             let t = &self.tokens[self.pos];
-            self.debug_log(&format!("advance: {:?}", t.kind));
+            self.log(&format!("advance: {:?}", t.kind));
             self.pos += 1;
             Some(t)
         } else {
@@ -2755,6 +2748,10 @@ impl<'a> Parser<'a> {
         )
     }
 }
+
+// =============================================================================
+// ASTNode extensions
+// =============================================================================
 
 impl ASTNode {
     pub fn span(&self) -> Span {
@@ -2801,6 +2798,53 @@ impl ASTNode {
             ASTNode::Lemma { span, .. } => *span,
             ASTNode::Block { span, .. } => *span,
             ASTNode::Error => Span::dummy(),
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ASTNode::Program(..) => "Program",
+            ASTNode::Import { .. } => "Import",
+            ASTNode::StructDef { .. } => "StructDef",
+            ASTNode::Block { .. } => "Block",
+            ASTNode::EnumDef { .. } => "EnumDef",
+            ASTNode::TypeAlias { .. } => "TypeAlias",
+            ASTNode::UseDecl { .. } => "UseDecl",
+            ASTNode::FunctionDef { .. } => "FunctionDef",
+            ASTNode::KernelFn { .. } => "KernelFn",
+            ASTNode::KernelLaunch { .. } => "KernelLaunch",
+            ASTNode::IfStatement { .. } => "IfStatement",
+            ASTNode::IfLetStatement { .. } => "IfLetStatement",
+            ASTNode::WhileLetStatement { .. } => "WhileLetStatement",
+            ASTNode::TryExpr { .. } => "TryExpr",
+            ASTNode::WhileStatement { .. } => "WhileStatement",
+            ASTNode::ForLoop { .. } => "ForLoop",
+            ASTNode::ParallelLoop { .. } => "ParallelLoop",
+            ASTNode::ComptimeBlock { .. } => "ComptimeBlock",
+            ASTNode::ReturnStatement(..) => "ReturnStatement",
+            ASTNode::VariableDecl { .. } => "VariableDecl",
+            ASTNode::DeviceVarDecl { .. } => "DeviceVarDecl",
+            ASTNode::Assignment { .. } => "Assignment",
+            ASTNode::BinaryExpr { .. } => "BinaryExpr",
+            ASTNode::UnaryExpr { .. } => "UnaryExpr",
+            ASTNode::CastExpr { .. } => "CastExpr",
+            ASTNode::CallExpr { .. } => "CallExpr",
+            ASTNode::StructLiteral { .. } => "StructLiteral",
+            ASTNode::BorrowExpr { .. } => "BorrowExpr",
+            ASTNode::DerefExpr(..) => "DerefExpr",
+            ASTNode::FieldAccess { .. } => "FieldAccess",
+            ASTNode::ArrayLiteral { .. } => "ArrayLiteral",
+            ASTNode::ArrayIndex { .. } => "ArrayIndex",
+            ASTNode::SliceExpr { .. } => "SliceExpr",
+            ASTNode::MatchExpr { .. } => "MatchExpr",
+            ASTNode::Identifier(..) => "Identifier",
+            ASTNode::IntegerLiteral(..) => "IntegerLiteral",
+            ASTNode::FloatLiteral(..) => "FloatLiteral",
+            ASTNode::CharLiteral(..) => "CharLiteral",
+            ASTNode::StringLiteral(..) => "StringLiteral",
+            ASTNode::RefinedType { .. } => "RefinedType",
+            ASTNode::Lemma { .. } => "Lemma",
+            ASTNode::Error => "Error",
         }
     }
 }

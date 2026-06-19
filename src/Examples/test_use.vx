@@ -1,30 +1,13 @@
-// test_use.vx - Comprehensive test for `use` statement functionality
-// This file should be placed in examples/ along with math.vx
+# test_use.vx - Comprehensive test for `use` statement functionality
+# This file should be placed in examples/ along with math.vx
 
 import "lib/math.vx" as math
 
-// Basic single-item import
-use math::add
-
-// Aliased import
-use math::sub as subtract
-
-// Glob import (brings all top‑level items from math into scope)
-use math::*
-
 fn main() -> i32:
-    // Use basic import
-    let sum = add(10, 20)          // 30
+    let sum = math::add(10, 20)          # 30
+    let diff = math::sub(30, 10)         # 20
+    let prod = math::mul(5, 6)           # 30
+    let p = math::Point(x: 10, y: 20)
 
-    // Use aliased import
-    let diff = subtract(30, 10)    // 20
-
-    // Use item brought by glob import (mul)
-    let prod = mul(5, 6)           // 30
-
-    // Use struct brought by glob import (Point)
-    let p = Point{x: 10, y: 20}
-
-    // Return sum of all computed values
-    return sum + diff + prod + p.x + p.y   // 30 + 20 + 30 + 10 + 20 = 110
+    return sum + diff + prod + p.x + p.y   # 110
 }

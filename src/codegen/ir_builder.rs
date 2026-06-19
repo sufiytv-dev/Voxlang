@@ -7,9 +7,9 @@
 use crate::codegen::CodegenEngine;
 
 impl CodegenEngine {
-    /// Log a message if debug mode is enabled.
+    /// Log a message if global debug mode is enabled.
     pub fn debug_log(&self, msg: &str) {
-        if self.debug {
+        if crate::diagnostic::global_debug() {
             crate::diagnostic::debug_log(format!("[CODEGEN] {}", msg));
         }
     }
@@ -27,22 +27,21 @@ impl CodegenEngine {
             .unwrap_or("<none>");
         let stack_depth = self.current_function_stack.len();
 
-        // Log every line with full context (extreme)
-        if self.debug {
+        // Log every line with full context if global debug is enabled
+        if crate::diagnostic::global_debug() {
             crate::diagnostic::debug_log(format!(
                 "[IR:{:04}] [depth:{}] [func:{:?}] [term:{}] emitting: {}",
                 line_num, stack_depth, func_stack, self.block_terminated, line
             ));
         }
 
-        // Special attention for closing braces
+        // Special attention for closing braces – always log, with [CODEGEN] prefix
         if line.trim() == "}" {
             let msg = format!(
-                ">>>> CLOSING BRACE for function '{}' at IR line: {} (stack depth: {}) <<<<",
+                "[CODEGEN] >>>> CLOSING BRACE for function '{}' at IR line: {} (stack depth: {}) <<<<",
                 func_stack, line_num, stack_depth
             );
             self.brace_emission_log.push(msg.clone());
-            // Always log this, even if debug is off
             crate::diagnostic::debug_log(msg);
         }
 
@@ -59,11 +58,11 @@ impl CodegenEngine {
         self.ir.push_str(line);
         self.ir.push('\n');
 
-        // Extreme: After appending, if we just closed a function, dump the last 3 lines of IR
-        if line.trim() == "}" && self.debug {
+        // After appending, if we just closed a function, dump the last 3 lines of IR
+        if line.trim() == "}" && crate::diagnostic::global_debug() {
             let last_lines: Vec<&str> = self.ir.lines().rev().take(3).collect();
             crate::diagnostic::debug_log(format!(
-                ">>> IR snapshot after closing brace:\n{}",
+                "[CODEGEN] >>> IR snapshot after closing brace:\n{}",
                 last_lines.join("\n")
             ));
         }
@@ -71,7 +70,7 @@ impl CodegenEngine {
 
     /// Emit a line to the device IR, with logging.
     pub fn debug_emit_device(&mut self, line: &str) {
-        if self.debug {
+        if crate::diagnostic::global_debug() {
             crate::diagnostic::debug_log(format!("[CODEGEN:device] {}", line));
         }
         self.device_ir.push_str(line);

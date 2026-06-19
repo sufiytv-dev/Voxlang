@@ -4,7 +4,7 @@
 // operators, and compiler directives. Uses indentation only for readability;
 // explicit '}' terminates blocks. Tabs are rejected.
 
-use crate::diagnostic::{Diagnostic, Suggestion, emit_diagnostic, global_debug};
+use crate::diagnostic::{Diagnostic, Suggestion, debug_log, emit_diagnostic};
 use crate::frontend::span::Span;
 use crate::frontend::token::{CompilerDirective, Token, TokenKind};
 use std::str;
@@ -15,7 +15,6 @@ pub struct Lexer<'a> {
     current_line: usize,
     current_col: usize,
     line_start_byte: usize,
-    debug: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -27,17 +26,6 @@ impl<'a> Lexer<'a> {
             current_line: 1,
             current_col: 1,
             line_start_byte: 0,
-            debug: global_debug(), // respect global debug flag by default
-        }
-    }
-
-    pub fn set_debug(&mut self, enabled: bool) {
-        self.debug = enabled;
-    }
-
-    fn debug_log(&self, msg: &str) {
-        if self.debug {
-            eprintln!("DEBUG LEXER: {}", msg);
         }
     }
 
@@ -53,7 +41,7 @@ impl<'a> Lexer<'a> {
         let c = self.peek_char()?;
         self.byte_index += c.len_utf8();
         self.current_col += 1;
-        self.debug_log(&format!("advance: consumed '{}'", c));
+        debug_log(format!("[LEX] advance: consumed '{}'", c.escape_default()));
         Some(c)
     }
 
@@ -122,7 +110,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn handle_newline(&mut self, tokens: &mut Vec<Token>) -> Result<(), ()> {
-        self.debug_log("handle_newline called");
+        debug_log("[LEX] handle_newline called");
         let start_pos = self.byte_index;
         let start_line = self.current_line;
         let start_col = self.current_col;
@@ -168,7 +156,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn tokenize_line(&mut self, tokens: &mut Vec<Token>) -> Result<(), ()> {
-        self.debug_log(&format!("tokenize_line line {}", self.current_line));
+        debug_log(format!("[LEX] tokenize_line line {}", self.current_line));
 
         while let Some(c) = self.current_char() {
             if c == '\r' {

@@ -5,8 +5,8 @@ Voxlang supports first‑class heterogeneous computing with `@kernel` functions.
 > **✅ Stable feature** – GPU kernels are fully supported on:
 > - **Windows** with **AMD ROCm/HIP** (tested on Radeon RX 9060 XT, ROCm 7.1+)
 > - **Linux** with **NVIDIA CUDA** (tested on CUDA 11.8/12.x)
-> 
-> Cross‑platform combinations (CUDA on Windows, HIP on Linux) are expected to work but not yet officially verified.
+> - **Mac** with **AIR** (coming soon)
+> - Cross‑platform combinations (CUDA on Windows, HIP on Linux) are expected to work but not yet officially verified.
 
 ---
 
@@ -31,6 +31,7 @@ Kernel functions support the same refinement type system as host functions. Prec
 ## Launching Kernels
 
 Kernels are launched using the launch keyword, followed by the grid size in parentheses, and then the arguments in parentheses:
+
 ```vox
 
 fn main():
@@ -54,13 +55,14 @@ If no GPU is available or the --gpu flag is omitted, kernels run on the CPU (slo
 
 ## Verification Guarantees
 
-    Preconditions and postconditions are checked by Z3 at compile time – same as host code.
+Preconditions and postconditions are checked by Z3 at compile time – same as host code.
 
-    Ownership rules apply: a &mut argument cannot be aliased.
+Ownership rules apply: a &mut argument cannot be aliased.
 
-    No runtime bounds checks are inserted for verified accesses.
+No runtime bounds checks are inserted for verified accesses.
 
-# Limitations (Current)
+## Limitations (Current)
+
 Kernel launch configuration (block dimensions) is hard‑coded in the @kernel attribute; grid dimensions are given at launch.
 
 No automatic device memory management – you must manually allocate GPU buffers using vox_gpu_malloc / vox_gpu_free.
@@ -69,7 +71,8 @@ The host‑side runtime (vox_rt) must be compiled with GPU support (enabled by d
 
 CUDA on Windows and HIP on Linux are not yet officially verified.
 
-# Example: Vector Addition
+## Example: Vector Addition
+
 ```vox
 
 @kernel(block=(256,1,1)) fn vec_add(a: &[i32], b: &[i32], result: &mut [i32]):
@@ -86,15 +89,16 @@ fn main():
     launch vec_add(1, 1, 1)(a, b, &mut out)
     # out == [5, 7, 9]
 }
-
-    Note: get_global_id(0) is a built‑in function that returns the global thread index in the first dimension.
 ```
 
+Note: get_global_id(0) is a built‑in function that returns the global thread index in the first dimension.
+
 ## Future Work (Roadmap)
-0.5 – Apple Metal backend (macOS), launch‑time grid/block configuration, better error propagation.
 
-0.6 – Automatic device memory management (RAII), texture and shared memory support.
+- 0.5 – Apple Metal backend (macOS), launch‑time grid/block configuration, better error propagation.
 
-1.0 – All three backends (CUDA, HIP, Metal) fully tested across all major OS combinations.
+- 0.6 – Automatic device memory management (RAII), texture and shared memory support.
+
+- 1.0 – All three backends (CUDA, HIP, Metal) fully tested across all major OS combinations.
 
 For now, use the verified backends and report issues via GitHub.

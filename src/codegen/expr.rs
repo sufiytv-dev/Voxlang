@@ -281,12 +281,14 @@ impl<'a> ExprEmitter<'a> {
 
                 let stripped_ty = ty;
                 let base_name = CodegenEngine::strip_generic_args(stripped_ty);
+                // Strip module prefix for struct lookup
+                let base_name_no_module = CodegenEngine::strip_module_prefix(&base_name);
                 self.engine.debug_log(&format!(
-                    "FieldAccess after reference stripping: stripped_ty='{}', base_name='{}', ptr_reg={}",
-                    stripped_ty, base_name, ptr_reg
+                    "FieldAccess after reference stripping: stripped_ty='{}', base_name='{}', base_name_no_module='{}', ptr_reg={}",
+                    stripped_ty, base_name, base_name_no_module, ptr_reg
                 ));
 
-                if base_name == "Vec" {
+                if base_name_no_module == "Vec" {
                     self.engine
                         .debug_log("FieldAccess on Vec<T> – emitting runtime call");
                     // Load the opaque handle (i8*) from the pointer
@@ -324,13 +326,13 @@ impl<'a> ExprEmitter<'a> {
                     }
                 }
 
-                let fields = match self.engine.struct_fields.get(&base_name) {
+                let fields = match self.engine.struct_fields.get(&base_name_no_module) {
                     Some(f) => f.clone(),
                     None => {
                         emit_diagnostic(
                             &Diagnostic::error(&format!(
                                 "Struct '{}' not found for field access",
-                                base_name
+                                base_name_no_module
                             ))
                             .with_code("VX0427"),
                         );
@@ -346,7 +348,7 @@ impl<'a> ExprEmitter<'a> {
                         emit_diagnostic(
                             &Diagnostic::error(&format!(
                                 "Struct '{}' has no field '{}'",
-                                base_name, field
+                                base_name_no_module, field
                             ))
                             .with_code("VX0428"),
                         );
@@ -368,7 +370,7 @@ impl<'a> ExprEmitter<'a> {
                     gep_reg
                 } else {
                     let field_llvm_ty = if let Some(fty) = self.engine.get_concrete_field_llvm_type(
-                        &base_name,
+                        &base_name_no_module,
                         stripped_ty,
                         field,
                         self.target == CodegenTarget::Device,
@@ -527,7 +529,13 @@ impl<'a> ExprEmitter<'a> {
             ASTNode::StructLiteral { name, fields, span } => {
                 self.engine
                     .debug_log(&format!("compile StructLiteral {}", name));
-                if name == "Vec" {
+                // Strip module prefix to get base struct name
+                let base_name = if let Some(last) = name.rsplit("::").next() {
+                    last.to_string()
+                } else {
+                    name.clone()
+                };
+                if base_name == "Vec" {
                     let elem_vox_ty = if let Some(expected) = &self.expected_type {
                         if let Some((base_name, type_args)) = parse_generic_type(expected) {
                             if base_name == "Vec" && type_args.len() == 1 {
@@ -562,7 +570,7 @@ impl<'a> ExprEmitter<'a> {
                     return handle;
                 }
 
-                let base_fields = match self.engine.struct_fields.get(name) {
+                let base_fields = match self.engine.struct_fields.get(&base_name) {
                     Some(f) => f.clone(),
                     None => {
                         emit_diagnostic(
@@ -577,13 +585,14 @@ impl<'a> ExprEmitter<'a> {
                 let generic_params = self
                     .engine
                     .struct_generic_params
-                    .get(name)
+                    .get(&base_name)
                     .cloned()
                     .unwrap_or_default();
 
                 let field_order = if let Some(expected) = &self.expected_type {
-                    if let Some((base_name, args)) = parse_generic_type(expected) {
-                        if base_name == *name
+                    if let Some((exp_base_name, args)) = parse_generic_type(expected) {
+                        let exp_base_no_module = CodegenEngine::strip_module_prefix(&exp_base_name);
+                        if exp_base_no_module == base_name
                             && !generic_params.is_empty()
                             && args.len() == generic_params.len()
                         {
@@ -654,8 +663,9 @@ impl<'a> ExprEmitter<'a> {
                 }
 
                 let concrete_type_name = if let Some(expected) = &self.expected_type {
-                    if let Some((base_name, _)) = parse_generic_type(expected) {
-                        if base_name == *name {
+                    if let Some((exp_base_name, _)) = parse_generic_type(expected) {
+                        let exp_base_no_module = CodegenEngine::strip_module_prefix(&exp_base_name);
+                        if exp_base_no_module == base_name {
                             expected.clone()
                         } else {
                             name.clone()
@@ -1197,25 +1207,21 @@ impl<'a> ExprEmitter<'a> {
                 }
             },
 
-            // ****************************************************************
-            // FIXED DerefExpr – distinguishes between lvalue and rvalue contexts
-            // ****************************************************************
+            // DerefExpr – distinguishes between lvalue and rvalue contexts
             ASTNode::DerefExpr(inner, _) => {
                 self.engine.debug_log("compile DerefExpr");
                 // Save original lvalue flag
                 let saved_lvalue = self.lvalue;
                 // Compile inner as an lvalue to get the address of the pointer variable
                 self.lvalue = true;
-                let ptr_var_addr = self.compile(inner); // e.g., %y.addr_1 (i32**)
+                let ptr_var_addr = self.compile(inner);
                 self.lvalue = saved_lvalue;
 
                 // Determine the LLVM type of the pointer variable (the stored pointer)
                 let ptr_llvm_ty = if let ASTNode::Identifier(name, _) = &**inner {
                     if let Some((ty, _, _, _)) = self.engine.variable_symbols.get(name) {
-                        // ty is the LLVM type of the variable, e.g., "ptr addrspace(1)" for &mut i32
                         ty.clone()
                     } else {
-                        // Fallback: guess from inner Vox type
                         let inner_vox = self.engine.infer_vox_type(inner);
                         let pointee = inner_vox
                             .strip_prefix("&mut ")
@@ -1227,7 +1233,6 @@ impl<'a> ExprEmitter<'a> {
                         format!("{}*", pointee_llvm)
                     }
                 } else {
-                    // For non-identifier inner (e.g., dereference of a call result), fallback
                     let inner_vox = self.engine.infer_vox_type(inner);
                     let pointee = inner_vox
                         .strip_prefix("&mut ")
@@ -1242,9 +1247,9 @@ impl<'a> ExprEmitter<'a> {
                 // Load the actual pointer from the pointer variable's address
                 let ptr_reg = self.engine.next_register();
                 let ptr_addr_ty = if self.target == CodegenTarget::Device {
-                    self.engine.device_ptr_type(&ptr_llvm_ty) // e.g., "ptr addrspace(5)"
+                    self.engine.device_ptr_type(&ptr_llvm_ty)
                 } else {
-                    format!("{}*", ptr_llvm_ty) // e.g., "i32**"
+                    format!("{}*", ptr_llvm_ty)
                 };
                 self.emit(&format!(
                     "    {} = load {}, {} {}",
@@ -1252,23 +1257,18 @@ impl<'a> ExprEmitter<'a> {
                 ));
 
                 if saved_lvalue {
-                    // lvalue: return the pointer to the pointee
                     ptr_reg
                 } else {
-                    // rvalue: load the final value from that pointer
                     let result_reg = self.engine.next_register();
                     let pointee_llvm = if let Some(inner_ty) = ptr_llvm_ty.strip_suffix('*') {
                         inner_ty.to_string()
                     } else if ptr_llvm_ty == "ptr addrspace(1)" {
-                        // For an opaque pointer, we need to know the pointee type from Vox.
                         let inner_vox = self.expr_type(inner).unwrap_or_default();
                         let pointee_vox = inner_vox.strip_prefix("&mut ").unwrap_or(&inner_vox);
                         self.engine.map_type(pointee_vox, true)
                     } else {
                         "i32".to_string()
                     };
-                    // The pointer type to use for the load is exactly the type of the pointer variable.
-                    // That type is stored in self.engine.variable_symbols for identifiers.
                     let ptr_ty = if let ASTNode::Identifier(name, _) = &**inner {
                         if let Some((ty, _, _, _)) = self.engine.variable_symbols.get(name) {
                             ty.clone()
@@ -3165,10 +3165,22 @@ impl<'a> ExprEmitter<'a> {
                             let right_stripped = CodegenEngine::strip_references(&right_vox);
                             let left_base = CodegenEngine::strip_generic_args(left_stripped);
                             let right_base = CodegenEngine::strip_generic_args(right_stripped);
-                            let is_enum = self.engine.enum_variants.contains_key(&left_base)
-                                && self.engine.enum_variants.contains_key(&right_base);
-                            let is_struct = self.engine.struct_fields.contains_key(&left_base)
-                                && self.engine.struct_fields.contains_key(&right_base);
+                            let left_base_no_module =
+                                CodegenEngine::strip_module_prefix(&left_base);
+                            let right_base_no_module =
+                                CodegenEngine::strip_module_prefix(&right_base);
+                            let is_enum =
+                                self.engine.enum_variants.contains_key(&left_base_no_module)
+                                    && self
+                                        .engine
+                                        .enum_variants
+                                        .contains_key(&right_base_no_module);
+                            let is_struct =
+                                self.engine.struct_fields.contains_key(&left_base_no_module)
+                                    && self
+                                        .engine
+                                        .struct_fields
+                                        .contains_key(&right_base_no_module);
                             self.engine.debug_log(&format!(
                                 "BinaryExpr: left_base='{}', right_base='{}', is_enum={}, is_struct={}, types_equal={}",
                                 left_base, right_base, is_enum, is_struct, left_vox == right_vox

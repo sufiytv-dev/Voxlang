@@ -18,7 +18,7 @@ fn log_stmt(msg: &str) {
 
 impl CodegenEngine {
     pub fn dbg(&self, msg: &str) {
-        if self.debug {
+        if crate::diagnostic::global_debug() {
             crate::diagnostic::debug_log(format!("[CODEGEN] {}", msg));
         }
     }
@@ -27,7 +27,13 @@ impl CodegenEngine {
         if self.has_error {
             return;
         }
-        log_stmt(&format!("compile_statement: {:?}", node));
+        let span = node.span();
+        log_stmt(&format!(
+            "compile_statement: {} at {}:{}",
+            node.kind_name(),
+            span.line,
+            span.col
+        ));
 
         match node {
             ASTNode::StructDef {
@@ -109,7 +115,8 @@ impl CodegenEngine {
                         .iter()
                         .map(|p| format!("{} %{}", self.map_type(&p.ty, false), p.name))
                         .collect();
-                    let param_names: Vec<String> = params.iter().map(|p| format!("%{}", p.name)).collect();
+                    let param_names: Vec<String> =
+                        params.iter().map(|p| format!("%{}", p.name)).collect();
 
                     let (block_x, block_y, block_z) = match self.kernel_attrs.get(name) {
                         Some(attr) => (attr.block.0, attr.block.1, attr.block.2),
@@ -131,7 +138,8 @@ impl CodegenEngine {
                         params.len()
                     ));
 
-                    for (i, (param, name_reg)) in params.iter().zip(param_names.iter()).enumerate() {
+                    for (i, (param, name_reg)) in params.iter().zip(param_names.iter()).enumerate()
+                    {
                         let param_llvm = self.map_type(&param.ty, false);
                         let tmp = self.next_register();
                         stub_ir.push_str(&format!("    {} = alloca {}\n", tmp, param_llvm));
@@ -166,7 +174,10 @@ impl CodegenEngine {
                     ));
 
                     let success_i1 = self.next_register();
-                    stub_ir.push_str(&format!("    {} = icmp eq i32 {}, 0\n", success_i1, launch_ret));
+                    stub_ir.push_str(&format!(
+                        "    {} = icmp eq i32 {}, 0\n",
+                        success_i1, launch_ret
+                    ));
                     let fail_label = self.next_block();
                     let cont_label = self.next_block();
                     stub_ir.push_str(&format!(
@@ -180,7 +191,8 @@ impl CodegenEngine {
                     stub_ir.push_str("    ret void\n");
                     stub_ir.push_str("}\n\n");
 
-                    self.function_return_types.insert(stub_name, "void".to_string());
+                    self.function_return_types
+                        .insert(stub_name, "void".to_string());
                     self.ir.push_str(&stub_ir);
 
                     self.current_kernel_name = saved_kernel_name;
@@ -209,7 +221,11 @@ impl CodegenEngine {
                         .collect();
 
                     let mut stub_ir = String::new();
-                    stub_ir.push_str(&format!("define void @{}({}) {{\n", stub_name, param_decls.join(", ")));
+                    stub_ir.push_str(&format!(
+                        "define void @{}({}) {{\n",
+                        stub_name,
+                        param_decls.join(", ")
+                    ));
                     stub_ir.push_str("entry:\n");
                     stub_ir.push_str(&format!(
                         "    call void @{}({})\n",
@@ -219,7 +235,8 @@ impl CodegenEngine {
                     stub_ir.push_str("    ret void\n");
                     stub_ir.push_str("}\n\n");
 
-                    self.function_return_types.insert(stub_name, "void".to_string());
+                    self.function_return_types
+                        .insert(stub_name, "void".to_string());
                     self.ir.push_str(&stub_ir);
                 }
             }
@@ -345,7 +362,11 @@ impl CodegenEngine {
                         let binary_const_owned = binary_const.clone(); // owned String
                         let (binary_ptr, ptr_inst) = self.get_binary_ptr(&binary_const_owned);
                         self.debug_emit(&ptr_inst);
-                        let binary_size = self.string_len.get(&binary_const_owned).copied().unwrap_or(0);
+                        let binary_size = self
+                            .string_len
+                            .get(&binary_const_owned)
+                            .copied()
+                            .unwrap_or(0);
                         let data_len = binary_size.saturating_sub(1);
                         self.debug_emit(&format!(
                             "    call void @vox_load_device_module(i8* {}, i64 {})",
@@ -402,7 +423,7 @@ impl CodegenEngine {
                 ));
                 self.debug_emit("}");
                 self.debug_emit("");
-                if self.debug {
+                if crate::diagnostic::global_debug() {
                     crate::diagnostic::debug_log(format!(
                         "=== Finished emitting function '{}', current IR length: {} characters ===",
                         actual_name,
@@ -1241,7 +1262,13 @@ impl CodegenEngine {
                         log_stmt("Block terminated, skipping remaining statements");
                         break;
                     }
-                    log_stmt(&format!("  Block child: {:?}", stmt));
+                    let stmt_span = stmt.span();
+                    log_stmt(&format!(
+                        "  Block child: {} at {}:{}",
+                        stmt.kind_name(),
+                        stmt_span.line,
+                        stmt_span.col
+                    ));
                     self.compile_statement(stmt);
                     if self.has_error {
                         break;
@@ -1251,7 +1278,12 @@ impl CodegenEngine {
             }
 
             _ => {
-                log_stmt(&format!("default: compiling as expression: {:?}", node));
+                log_stmt(&format!(
+                    "default: compiling as expression: {} at {}:{}",
+                    node.kind_name(),
+                    span.line,
+                    span.col
+                ));
                 let _ = self.compile_expression(node, None);
             }
         }

@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::std::walkdir::WalkDir;
 
@@ -100,6 +101,9 @@ enum Commands {
     Shell,
 }
 
+// Global flag to indicate if the program was launched with no arguments.
+static NO_ARGS: AtomicBool = AtomicBool::new(false);
+
 fn host_triple() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
@@ -134,8 +138,8 @@ Options (may appear before or after the command):
   --debug                 Enable debug output (lexer, parser, codegen)
   --target <TRIPLE>       Target triple (default: host triple)
   --output-format <FORMAT> Specify terminal formatting ("pretty", "json", "auto")
-  --gpu <BACKEND>         GPU backend: "cuda" or "hip"
-  --gpu-arch <ARCH>       GPU architecture (e.g., sm_70, sm_75, gfx1200)
+  --gpu <BACKEND>         GPU backend: "cuda" or "hip" (auto-detected if omitted)
+  --gpu-arch <ARCH>       GPU architecture (e.g., sm_70, sm_75, gfx1200) (auto-detected if omitted)
   --no-cache              Ignore all caches
   --reuse-proofs [true|false] Reuse cached Z3 proofs (default: true)
   --reuse-bitcode [true|false] Reuse cached LLVM bitcode (default: true)
@@ -256,10 +260,22 @@ fn parse_args() -> Cli {
         }
     }
 
+    // If no command is provided, launch the shell (GUI) with debug enabled.
     if non_flag_tokens.is_empty() {
-        eprintln!("Error: No command specified");
-        print_usage();
-        std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
+        NO_ARGS.store(true, Ordering::Relaxed);
+        return Cli {
+            debug: true,
+            target: host_triple(),
+            output_format: diagnostic::OutputFormat::Auto,
+            gpu: None,
+            gpu_arch: None,
+            no_cache: false,
+            reuse_proofs: true,
+            reuse_bitcode: true,
+            offline: false,
+            trust_modules: false,
+            command: Commands::Shell,
+        };
     }
 
     let command_str = non_flag_tokens[0].clone();
@@ -384,6 +400,9 @@ pub struct CompilationResult {
     pub llvm_ir: String,
     pub has_gpu: bool,
     pub _device_triple: Option<String>,
+    // Auto-detected GPU backend and architecture (if any)
+    pub gpu_backend: Option<String>,
+    pub gpu_arch: Option<String>,
 }
 
 pub fn compile_source(
@@ -393,6 +412,8 @@ pub fn compile_source(
     gpu_backend: Option<&str>,
     gpu_arch: Option<&str>,
     config: &CacheConfig,
+    profile: &str,    // "debug" or "release"
+    check_only: bool, // if true, stop after semantic analysis (no IR generation)
 ) -> Result<CompilationResult, String> {
     let path = Path::new(file_path);
     if !path.exists() {
@@ -415,14 +436,12 @@ pub fn compile_source(
 
     emit_phase_update("Lexical analysis", 10);
     let mut lexer = Lexer::new(&full_source);
-    lexer.set_debug(debug);
     let tokens = lexer
         .tokenize()
         .map_err(|_| "Lexical analysis failed".to_string())?;
 
     emit_phase_update("Syntactic parsing", 25);
     let mut parser = Parser::new(&tokens);
-    parser.set_debug(debug);
     let ast = parser.parse();
     if parser.has_errors() {
         return Err("Parsing failed due to syntax errors".to_string());
@@ -500,9 +519,27 @@ pub fn compile_source(
             llvm_ir: String::new(),
             has_gpu: false,
             _device_triple: None,
+            gpu_backend: None,
+            gpu_arch: None,
         });
     }
 
+    // If check_only, we stop here and return success.
+    if check_only {
+        let mut device_triple = None;
+        let has_gpu = has_kernel(&desugared_ast, &mut device_triple);
+        return Ok(CompilationResult {
+            _ast: desugared_ast,
+            semantic_ok: true,
+            llvm_ir: String::new(),
+            has_gpu,
+            _device_triple: device_triple,
+            gpu_backend: None,
+            gpu_arch: None,
+        });
+    }
+
+    // Otherwise, continue to IR generation.
     let resolved_types = semantic.resolved_variable_types.clone();
     let type_aliases = semantic.symbols.type_aliases.clone();
     let imported_modules = semantic.take_imported_modules();
@@ -511,26 +548,70 @@ pub fn compile_source(
     let mut device_triple = None;
     let has_gpu = has_kernel(&desugared_ast, &mut device_triple);
 
+    // -------------------------------------------------------------------------
+    // Auto-detect GPU backend and architecture (prioritise installed SDK)
+    // -------------------------------------------------------------------------
+    let (final_backend, final_arch): (Option<String>, Option<String>);
+
+    // 1. User override via --gpu / --gpu-arch
+    if let Some(backend) = gpu_backend {
+        final_backend = Some(backend.to_string());
+        final_arch = gpu_arch.map(|s| s.to_string());
+    } else if let Some(sdk) = discovery::find_gpu_sdk() {
+        // 2. If a GPU SDK is installed, use that
+        final_backend = Some(sdk.backend.clone());
+        let default_arch = match sdk.backend.as_str() {
+            "cuda" => "sm_75",
+            "hip" => "gfx1200",
+            _ => "sm_75",
+        };
+        final_arch = gpu_arch
+            .map(|s| s.to_string())
+            .or(Some(default_arch.to_string()));
+        eprintln!(
+            "[INFO] Using installed GPU backend: {} (version {})",
+            sdk.backend, sdk.version
+        );
+    } else if let Some(triple) = &device_triple {
+        // 3. Fallback to kernel device triple (if no SDK is installed)
+        if triple.contains("cuda") {
+            final_backend = Some("cuda".to_string());
+            final_arch = gpu_arch
+                .map(|s| s.to_string())
+                .or(Some("sm_75".to_string()));
+        } else if triple.contains("amdhsa") || triple.contains("hip") {
+            final_backend = Some("hip".to_string());
+            final_arch = gpu_arch
+                .map(|s| s.to_string())
+                .or(Some("gfx1200".to_string()));
+        } else {
+            final_backend = None;
+            final_arch = None;
+        }
+    } else {
+        final_backend = None;
+        final_arch = None;
+    }
+
     emit_phase_update("IR generation", 70);
 
     // Determine GPU architecture default (sm_75 for RTX 2070 Super)
-    let default_gpu_arch = match gpu_backend {
+    let default_gpu_arch = match final_backend.as_deref() {
         Some("cuda") => "sm_75",
         Some("hip") => "gfx1200",
         _ => "sm_75",
     };
-    let effective_gpu_arch = gpu_arch.unwrap_or(default_gpu_arch);
+    let effective_gpu_arch = final_arch.as_deref().unwrap_or(default_gpu_arch);
 
     // Standard device triples WITHOUT architecture suffix (architecture passed via -mcpu to llc)
-    let forced_device_triple = gpu_backend.map(|backend| match backend {
+    let forced_device_triple = final_backend.as_deref().map(|backend| match backend {
         "cuda" => "nvptx64-nvidia-cuda".to_string(),
         "hip" => "amdgcn-amd-amdhsa".to_string(),
         _ => unreachable!(),
     });
 
     let mut codegen = CodegenEngine::new(target);
-    codegen.set_debug(debug);
-    codegen.set_gpu_mode(gpu_backend);
+    codegen.set_gpu_mode(final_backend.as_deref());
     if let Some(triple) = forced_device_triple {
         codegen.set_device_triple_override(triple);
     }
@@ -567,12 +648,14 @@ pub fn compile_source(
         llvm_ir,
         has_gpu,
         _device_triple: device_triple,
+        gpu_backend: final_backend,
+        gpu_arch: final_arch,
     })
 }
 
-// Public function used by watch.rs
+// Public function used by watch.rs and GUI
 pub fn check_file(file_path: &str, debug: bool, target: &str, config: &CacheConfig) -> bool {
-    match compile_source(file_path, debug, target, None, None, config) {
+    match compile_source(file_path, debug, target, None, None, config, "debug", true) {
         Ok(result) => result.semantic_ok,
         Err(e) => {
             eprintln!("Fatal error: {}", e);
@@ -585,12 +668,28 @@ pub fn check_file(file_path: &str, debug: bool, target: &str, config: &CacheConf
 // LLVM tool fallback (search many common paths)
 // -----------------------------------------------------------------------------
 fn find_llvm_fallback() -> Option<discovery::LlvmPaths> {
-    let mut clang_paths = vec![
-        "/usr/bin/clang".to_string(),
-        "/usr/local/bin/clang".to_string(),
-    ];
-    let mut llc_paths = vec!["/usr/bin/llc".to_string(), "/usr/local/bin/llc".to_string()];
+    let mut clang_paths = Vec::new();
+    let mut llc_paths = Vec::new();
 
+    // 1. Inject Windows Scoop paths dynamically if the environment matches
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let local_scoop_clang = format!(r"{}\scoop\apps\llvm\current\bin\clang.exe", user_profile);
+        let local_scoop_llc = format!(r"{}\scoop\apps\llvm\current\bin\llc.exe", user_profile);
+        clang_paths.push(local_scoop_clang);
+        llc_paths.push(local_scoop_llc);
+    }
+
+    // Global Scoop location fallback
+    clang_paths.push(r"C:\ProgramData\scoop\apps\llvm\current\bin\clang.exe".to_string());
+    llc_paths.push(r"C:\ProgramData\scoop\apps\llvm\current\bin\llc.exe".to_string());
+
+    // 2. Base Linux / Unix standard paths
+    clang_paths.push("/usr/bin/clang".to_string());
+    clang_paths.push("/usr/local/bin/clang".to_string());
+    llc_paths.push("/usr/bin/llc".to_string());
+    llc_paths.push("/usr/local/bin/llc".to_string());
+
+    // 3. Versioned Linux paths (10..=19)
     for v in 10..=19 {
         clang_paths.push(format!("/usr/lib/llvm-{}/bin/clang", v));
         clang_paths.push(format!("/usr/bin/clang-{}", v));
@@ -598,6 +697,7 @@ fn find_llvm_fallback() -> Option<discovery::LlvmPaths> {
         llc_paths.push(format!("/usr/bin/llc-{}", v));
     }
 
+    // 4. Resolve exact binaries from the path matrix
     let mut clang = None;
     for p in &clang_paths {
         let path = PathBuf::from(p);
@@ -606,6 +706,7 @@ fn find_llvm_fallback() -> Option<discovery::LlvmPaths> {
             break;
         }
     }
+
     let mut llc = None;
     for p in &llc_paths {
         let path = PathBuf::from(p);
@@ -615,11 +716,13 @@ fn find_llvm_fallback() -> Option<discovery::LlvmPaths> {
         }
     }
 
+    // 5. Package verified paths back into the toolchain asset locator
     match (clang, llc) {
         (Some(c), Some(l)) => Some(discovery::LlvmPaths {
             clang: c.clone(),
             llc: l,
-            lld: Some(c),
+            lld: Some(c), // Preserves your original assignment logic mapping lld to the clang path
+            system_libs: Vec::new(),
         }),
         _ => None,
     }
@@ -638,7 +741,7 @@ fn cmd_check(
     config: &CacheConfig,
 ) -> i32 {
     emit_phase_update("Checking program", 0);
-    match compile_source(file, debug, target, gpu, gpu_arch, config) {
+    match compile_source(file, debug, target, gpu, gpu_arch, config, "debug", true) {
         Ok(result) if result.semantic_ok => {
             println!("Check passed.");
             diagnostic::exit_code::SUCCESS
@@ -651,22 +754,52 @@ fn cmd_check(
     }
 }
 
+/// Find the Vox installation root by searching upward from the executable path.
+/// Looks for `src/Examples` or `examples` as a marker.
+pub fn find_vox_root() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let mut dir = exe.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+
+    loop {
+        if dir.join("src/Examples").exists() {
+            return dir;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    // Fallback: current working directory
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
-    let examples_dir = if Path::new(path_str).exists() {
-        Path::new(path_str)
-    } else if Path::new("src/Examples").exists() {
-        Path::new("src/Examples")
-    } else if Path::new("examples").exists() {
-        Path::new("examples")
+    // If user provided an explicit path, use it; otherwise auto-discover
+    let user_path = Path::new(path_str);
+    let test_dir = if user_path.exists() {
+        user_path.to_path_buf()
     } else {
-        eprintln!("Error: Examples directory '{}' not found.", path_str);
-        return diagnostic::exit_code::IO_ERROR;
+        let root = find_vox_root();
+        let default = root.join("src/Examples");
+        if default.exists() {
+            default
+        } else {
+            root.join("examples")
+        }
     };
+
+    if !test_dir.exists() {
+        eprintln!(
+            "Error: Examples directory not found at '{}'",
+            test_dir.display()
+        );
+        return diagnostic::exit_code::IO_ERROR;
+    }
 
     let current_exe =
         std::env::current_exe().expect("Failed to locate current compiler executable");
     let mut test_files = Vec::new();
-    for entry in WalkDir::new(examples_dir)
+    for entry in WalkDir::new(&test_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -679,7 +812,7 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
     }
 
     if test_files.is_empty() {
-        println!("No .vx files found in {}", examples_dir.display());
+        println!("No .vx files found in {}", test_dir.display());
         return diagnostic::exit_code::SUCCESS;
     }
 
@@ -695,7 +828,7 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
             continue;
         }
         total += 1;
-        let rel_path = path.strip_prefix(examples_dir).unwrap_or(&path);
+        let rel_path = path.strip_prefix(&test_dir).unwrap_or(&path);
         print!("test {:<30} ... ", rel_path.display());
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
 
@@ -729,6 +862,9 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
     }
 }
 
+// ============================================================================
+// UPDATED cmd_build
+// ============================================================================
 fn cmd_build(
     file: &str,
     debug: bool,
@@ -737,7 +873,18 @@ fn cmd_build(
     gpu_arch: Option<&str>,
     config: &CacheConfig,
 ) -> i32 {
-    let compile_result = match compile_source(file, debug, target, gpu_backend, gpu_arch, config) {
+    let profile = "debug";
+
+    let compile_result = match compile_source(
+        file,
+        debug,
+        target,
+        gpu_backend,
+        gpu_arch,
+        config,
+        profile,
+        false,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}", e);
@@ -752,7 +899,7 @@ fn cmd_build(
 
     let path = Path::new(file);
     let file_name = path.file_stem().unwrap().to_str().unwrap();
-    let out_dir = get_output_dir("debug");
+    let out_dir = get_output_dir(profile);
     let debug_ir_path = out_dir.join(format!("{}.ll", file_name));
     if let Err(e) = fs::write(&debug_ir_path, compile_result.llvm_ir.as_bytes()) {
         eprintln!("Warning: failed to write .ll file: {}", e);
@@ -769,7 +916,24 @@ fn cmd_build(
         target
     );
 
-    let has_gpu = compile_result.has_gpu;
+    let mut detected_backend = compile_result.gpu_backend.as_deref();
+
+    // -------------------------------------------------------------------------
+    // Check if the required SDK is available; if not, fall back to CPU.
+    // -------------------------------------------------------------------------
+    let sdk_available = match detected_backend {
+        Some("cuda") => discovery::find_cuda_sdk().is_some(),
+        Some("hip") => discovery::find_hip_sdk().is_some(),
+        _ => true,
+    };
+    if !sdk_available {
+        eprintln!(
+            "Warning: {} SDK not found, kernels will run on CPU.",
+            detected_backend.unwrap_or("GPU")
+        );
+        detected_backend = None; // Fall back to CPU mode
+    }
+
     let llvm_tools = match discovery::find_llvm_tools() {
         Ok(tools) => tools,
         Err(e) => {
@@ -781,34 +945,63 @@ fn cmd_build(
         }
     };
 
-    // Determine the linker command
-    let (linker, linker_is_hip) = if has_gpu && gpu_backend == Some("hip") {
-        // For HIP, we prefer hipcc (which handles both compilation and linking)
-        let hipcc = discovery::find_gpu_backend("hip")
-            .and_then(|gpu| {
-                gpu.hip_path.map(|p| {
-                    p.join("bin")
-                        .join("hipcc")
-                        .with_extension(env::consts::EXE_EXTENSION)
-                })
-            })
-            .filter(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from("hipcc"));
-        // Check if the hipcc executable actually exists
-        if !hipcc.exists() {
-            eprintln!(
-                "Error: hipcc not found. Ensure HIP is installed and {} is in PATH.",
-                hipcc.display()
-            );
-            return diagnostic::exit_code::LINKER_ERROR;
+    // -------------------------------------------------------------------------
+    // Compile .ll to object file using llc (only if the binary is actually llc)
+    // -------------------------------------------------------------------------
+    let obj_path = out_dir.join(format!("{}.o", file_name));
+    let mut use_obj = false;
+    if let Some(llc_name) = llvm_tools.llc.file_name().and_then(|s| s.to_str()) {
+        if llc_name == "llc" || llc_name == "llc.exe" {
+            let mut llc_cmd = Command::new(&llvm_tools.llc);
+            llc_cmd
+                .arg(&debug_ir_path)
+                .arg("-filetype=obj")
+                .arg("-o")
+                .arg(&obj_path);
+            if !target.is_empty() {
+                llc_cmd.arg("-mtriple").arg(target);
+            }
+            if llc_cmd.status().map(|s| s.success()).unwrap_or(false) {
+                use_obj = true;
+            } else {
+                eprintln!("Warning: llc failed, falling back to linking .ll directly.");
+                let _ = fs::remove_file(&obj_path);
+            }
+        } else {
+            eprintln!("Warning: llc not found, linking .ll directly.");
         }
-        (hipcc, true)
     } else {
-        (llvm_tools.clang, false)
+        eprintln!("Warning: llc not found, linking .ll directly.");
+    }
+
+    let input_for_link = if use_obj {
+        obj_path.clone()
+    } else {
+        debug_ir_path.clone()
+    };
+
+    // -------------------------------------------------------------------------
+    // Determine the linker based on the detected backend (after SDK check)
+    // -------------------------------------------------------------------------
+    let (linker, linker_is_hip) = match detected_backend {
+        Some("hip") => {
+            let sdk = discovery::find_hip_sdk().unwrap();
+            let hipcc = sdk
+                .bin_path
+                .join("hipcc")
+                .with_extension(env::consts::EXE_EXTENSION);
+            if !hipcc.exists() {
+                eprintln!("Error: hipcc not found in HIP SDK.");
+                return diagnostic::exit_code::LINKER_ERROR;
+            }
+            (hipcc, true)
+        }
+        Some("cuda") => (llvm_tools.clang, false),
+        _ => (llvm_tools.clang, false),
     };
 
     let mut link_cmd = Command::new(&linker);
-    link_cmd.arg(&debug_ir_path).arg("-o").arg(&exe_path);
+    link_cmd.arg(&input_for_link).arg("-o").arg(&exe_path);
     let mut link_args = Vec::new();
 
     let target_triple = if target.contains("windows") && target.contains("msvc") {
@@ -819,7 +1012,7 @@ fn cmd_build(
         target
     };
 
-    let cache_dir = get_output_dir("debug").join(".vox_rt_cache");
+    let cache_dir = get_output_dir(profile).join(".vox_rt_cache");
     std::fs::create_dir_all(&cache_dir).expect("Failed to create runtime cache dir");
 
     let lib_name = "vox_rt";
@@ -830,6 +1023,9 @@ fn cmd_build(
     };
     let static_lib = cache_dir.join(format!("{}{}", lib_name, lib_extension));
 
+    // -------------------------------------------------------------------------
+    // Rebuild vox_rt with the appropriate feature flags (or none if CPU fallback)
+    // -------------------------------------------------------------------------
     let need_rebuild = !static_lib.exists()
         || fs::metadata("src/vox_rt.rs")
             .and_then(|m| m.modified())
@@ -860,10 +1056,13 @@ fn cmd_build(
         if target_triple.contains("msvc") {
             rustc_cmd.arg("-C").arg("target-feature=+crt-static");
         }
-        if let Some("cuda") = gpu_backend {
-            rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_cuda\"");
-        } else if let Some("hip") = gpu_backend {
-            rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_enabled\"");
+        // Only add feature flag if SDK is available and we have a valid backend
+        if let Some(backend) = detected_backend {
+            if backend == "cuda" {
+                rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_cuda\"");
+            } else if backend == "hip" {
+                rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_enabled\"");
+            }
         }
         let status = rustc_cmd.status().expect("failed to run rustc");
         if !status.success() {
@@ -889,7 +1088,7 @@ fn cmd_build(
         }
     }
 
-    // Linker arguments – careful with GNU target detection
+    // Standard system libraries
     if target_triple.contains("msvc") {
         link_args.extend(vec![
             "-lmsvcrt".to_string(),
@@ -904,7 +1103,6 @@ fn cmd_build(
             "-liphlpapi".to_string(),
         ]);
     } else if target_triple.contains("windows") && target_triple.contains("gnu") {
-        // Windows GNU (MinGW)
         link_args.extend(vec![
             "-lstdc++".to_string(),
             "-lpthread".to_string(),
@@ -913,7 +1111,6 @@ fn cmd_build(
             "-lgcc".to_string(),
         ]);
     } else {
-        // Linux, macOS, etc.
         link_args.extend(vec![
             "-lstdc++".to_string(),
             "-lpthread".to_string(),
@@ -925,16 +1122,23 @@ fn cmd_build(
         link_cmd.arg("-Wl,/NODEFAULTLIB:libcmt");
     }
 
-    // GPU‑specific library flags
-    if gpu_backend == Some("hip") {
-        // For HIP, we only need to link amdhip64.
-        // hipcc automatically adds the correct include/library paths.
-        link_args.push("-lamdhip64".to_string());
-        // Do NOT add -I or -L flags here – hipcc already knows where HIP is.
-        // Adding them causes "unused command-line argument" warnings.
-    } else if gpu_backend == Some("cuda") {
-        link_args.push("-lcuda".to_string());
-        // CUDA may need extra flags; for now keep it simple.
+    // -------------------------------------------------------------------------
+    // Add GPU SDK library paths and libraries only if SDK is available
+    // -------------------------------------------------------------------------
+    if let Some(backend) = detected_backend {
+        match backend {
+            "cuda" => {
+                if let Some(sdk) = discovery::find_cuda_sdk() {
+                    link_cmd.arg("-L").arg(&sdk.lib_path);
+                    link_args.push("-lcuda".to_string());
+                    link_args.push("-lcudart".to_string());
+                }
+            }
+            "hip" => {
+                // hipcc adds its own flags; nothing extra needed.
+            }
+            _ => {}
+        }
     }
 
     for arg in link_args {
@@ -947,7 +1151,8 @@ fn cmd_build(
         link_cmd.arg("-lm");
     }
 
-    if has_gpu && gpu_backend == Some("hip") && !linker_is_hip {
+    // Ensure HIP uses hipcc
+    if compile_result.has_gpu && detected_backend == Some("hip") && !linker_is_hip {
         eprintln!("Error: HIP backend requires hipcc linker.");
         return diagnostic::exit_code::LINKER_ERROR;
     }
@@ -955,6 +1160,10 @@ fn cmd_build(
     match link_cmd.status() {
         Ok(status) if status.success() => {
             println!("SUCCESS: Native binary compiled -> {}", exe_path.display());
+            let _ = fs::remove_file(&debug_ir_path);
+            if use_obj {
+                let _ = fs::remove_file(&obj_path);
+            }
             diagnostic::exit_code::SUCCESS
         }
         Ok(status) => {
@@ -970,6 +1179,10 @@ fn cmd_build(
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// The rest of the commands (unchanged)
+// -----------------------------------------------------------------------------
 
 fn cmd_run(
     file: &str,
@@ -1117,7 +1330,8 @@ fn cmd_lsp() -> i32 {
 }
 
 fn cmd_shell() -> i32 {
-    match shell::run() {
+    let hide_console = NO_ARGS.load(Ordering::Relaxed);
+    match shell::run(hide_console) {
         Ok(()) => diagnostic::exit_code::SUCCESS,
         Err(e) => {
             eprintln!("Shell error: {}", e);

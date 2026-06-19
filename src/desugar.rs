@@ -171,7 +171,7 @@ pub fn desugar(node: ASTNode) -> ASTNode {
             else_branch,
             span,
         } => {
-            debug_log("Desugaring IfLetStatement into MatchExpr");
+            debug_log("[DESUGAR] Desugaring IfLetStatement into MatchExpr");
             let scrutinee = Box::new(desugar(*expr));
             let then_body = then_branch.into_iter().map(desugar).collect();
             let mut arms = vec![MatchArm {
@@ -214,7 +214,7 @@ pub fn desugar(node: ASTNode) -> ASTNode {
             body,
             span,
         } => {
-            debug_log("Desugaring WhileLetStatement into while + match");
+            debug_log("[DESUGAR] Desugaring WhileLetStatement into while + match");
             let scrutinee = desugar(*expr);
             let loop_body = body.into_iter().map(desugar).collect();
             let break_var = fresh_tmp_var();
@@ -275,7 +275,7 @@ pub fn desugar(node: ASTNode) -> ASTNode {
             body,
             span,
         } => {
-            debug_log("Desugaring ForLoop into while loop with counter");
+            debug_log("[DESUGAR] Desugaring ForLoop into while loop with counter");
             let start_expr = desugar(*start);
             let end_expr = desugar(*end);
             let counter_var = fresh_tmp_var();

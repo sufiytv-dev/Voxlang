@@ -268,3 +268,18 @@ pub(crate) fn split_type_args(s: &str) -> Vec<String> {
     }
     result
 }
+
+// -----------------------------------------------------------------------------
+// NEW: Parse generic type string into base name and arguments
+// -----------------------------------------------------------------------------
+/// Parse a generic type string (e.g., `Vec<i32>`) into base name and concrete arguments.
+pub(crate) fn parse_generic_type(ty: &str) -> Option<(String, Vec<String>)> {
+    if let Some(angle_start) = ty.find('<') {
+        let base = ty[..angle_start].to_string();
+        let args_str = &ty[angle_start + 1..ty.len() - 1];
+        let args: Vec<String> = args_str.split(',').map(|s| s.trim().to_string()).collect();
+        Some((base, args))
+    } else {
+        None
+    }
+}

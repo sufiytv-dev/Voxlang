@@ -35,6 +35,8 @@ fn main():
     # The imported function is available after generation
     mylib_function()
 }
+```
+
 When you run vox build, the compiler will:
 
 Locate mylib.h (using the system include path or relative paths).
@@ -52,21 +54,26 @@ c
 int add(int a, int b);
 The bridge generates:
 
-vox
+```vox
 # Automatically generated
 fn add(a: i32, b: i32) -> i32:
     return C_add(a, b)   # Foreign function interface
 }
+```
+
 No safety annotations are needed for this trivial case. More complex APIs will require where clauses (future).
 
-Contributing
+## Contributing
+
 The C Bridge is the highest priority area for contributions. If you are interested in C parsing, type inference, or compiler plugin systems, please reach out via GitHub issues.
 
-Future Roadmap
-Version	Feature
-v0.2	Basic header parsing + simple wrappers
-v0.3	Macro expansion + constant propagation
-v0.4	Ownership inference for pointers
-v0.5	Full system header support (POSIX, WinAPI)
-v1.0	Production‑ready C interop
+## Future Roadmap
+
+### Version	Feature
+
+- v0.2	Basic header parsing + simple wrappers
+- v0.3	Macro expansion + constant propagation
+- v0.4	Ownership inference for pointers
+- v0.5	Full system header support (POSIX, WinAPI)
+- v1.0	Production‑ready C interop
 For now, use the bridge only for experimentation. The rest of the language is stable, but the C bridge will evolve significantly.

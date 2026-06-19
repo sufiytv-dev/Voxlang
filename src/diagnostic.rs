@@ -1,7 +1,12 @@
 // diagnostic.rs - Structured diagnostics with event buffering, UI thread support,
 // and hybrid output (pretty/JSON). Tracks exit codes and global debug flag.
+// Updated: Added VT enablement for Windows using raw FFI (no winapi dependency).
+// Now includes debugging traces for GUI forwarding and a placeholder for source-context
+// diagnostic formatting.
+// Added test_run_active flag to suppress per-file phase updates during test runs.
 
 use crate::frontend::span::Span;
+use crate::shell::terminal::TerminalBuffer;
 use std::fs;
 use std::io::IsTerminal;
 use std::io::Write;
@@ -10,6 +15,154 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+
+// -----------------------------------------------------------------------------
+// Diagnostic trace flag – set to true to enable internal trace prints (to stdout).
+// This is independent of global_debug() – it controls only the [TRACE] prints.
+// -----------------------------------------------------------------------------
+const DIAG_TRACE: bool = false; // <-- Set to true for debugging, then false when done.
+
+// -----------------------------------------------------------------------------
+// Windows virtual terminal enablement (zero‑dependency, using raw FFI)
+// -----------------------------------------------------------------------------
+#[cfg(windows)]
+mod vt {
+    use std::os::windows::io::AsRawHandle;
+
+    type DWORD = u32;
+    type HANDLE = *mut std::ffi::c_void;
+    type BOOL = i32;
+
+    const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5;
+    const STD_ERROR_HANDLE: DWORD = 0xFFFFFFF4;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+
+    unsafe extern "system" {
+        fn GetStdHandle(nStdHandle: DWORD) -> HANDLE;
+        fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut DWORD) -> BOOL;
+        fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) -> BOOL;
+    }
+
+    pub fn enable() {
+        unsafe {
+            for &handle_id in &[STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let handle = GetStdHandle(handle_id);
+                if handle.is_null() {
+                    continue;
+                }
+                let mut mode: DWORD = 0;
+                if GetConsoleMode(handle, &mut mode) != 0 {
+                    SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod vt {
+    pub fn enable() {
+        // No‑op on non‑Windows.
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Win32 constants and types (minimal for message posting)
+// -----------------------------------------------------------------------------
+
+type HWND = *mut std::ffi::c_void;
+type WPARAM = usize;
+type LPARAM = isize;
+type UINT = u32;
+type BOOL = i32;
+
+const WM_USER: UINT = 0x0400;
+
+/// Custom message sent to the GUI with a heap‑allocated `Box<String>` as lParam.
+/// Used to update the status bar with the current phase.
+pub const WM_USER_PHASE_UPDATE: UINT = WM_USER + 3;
+
+/// Custom message used to trigger a refresh of the GUI terminal listbox.
+pub const WM_USER_REFRESH: UINT = WM_USER + 1;
+
+unsafe extern "system" {
+    fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> BOOL;
+}
+
+// -----------------------------------------------------------------------------
+// ANSI color constants
+// -----------------------------------------------------------------------------
+
+const COLOR_RESET: &str = "\x1b[0m";
+const COLOR_LEX: &str = "\x1b[94m"; // Bright Blue
+const COLOR_PARSE: &str = "\x1b[95m"; // Bright Magenta
+const COLOR_SEM: &str = "\x1b[96m"; // Bright Cyan
+const COLOR_CODEGEN: &str = "\x1b[90m"; // Gray
+const COLOR_DISCOVERY: &str = "\x1b[92m"; // Bright Green
+const COLOR_IMPORT: &str = "\x1b[93m"; // Bright Yellow
+const COLOR_GUI: &str = "\x1b[97m"; // Bright White
+const COLOR_IR: &str = "\x1b[90m"; // Gray
+const COLOR_PHASE: &str = "\x1b[93m"; // Bright Yellow
+const COLOR_DEFAULT: &str = "\x1b[37m"; // White
+const COLOR_DESUGAR: &str = "\x1b[93m";
+
+/// Colorize every `[TAG]` occurrence in the message using character indexing (UTF‑8 safe).
+fn colorize_prefix(msg: &str) -> String {
+    let raw = msg;
+    let chars: Vec<char> = raw.chars().collect();
+    let mut result = String::with_capacity(raw.len() + 32);
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '[' {
+            let start = i;
+            let mut end = i + 1;
+            while end < chars.len() && chars[end] != ']' {
+                end += 1;
+            }
+            if end < chars.len() {
+                // Found a complete tag
+                let tag: String = chars[start..=end].iter().collect();
+                let color = match tag.as_str() {
+                    "[LEX]" => COLOR_LEX,
+                    "[PARSE]" => COLOR_PARSE,
+                    "[SEM]" => COLOR_SEM,
+                    "[CODEGEN]" => COLOR_CODEGEN,
+                    "[CODEGEN:STMT]" => COLOR_CODEGEN,
+                    "[CODEGEN:device]" => COLOR_CODEGEN,
+                    "[CODEGEN:TYPE_MAP]" => COLOR_CODEGEN,
+                    "[DISCOVERY]" => COLOR_DISCOVERY,
+                    "[IMPORT]" => COLOR_IMPORT,
+                    "[GUI]" => COLOR_GUI,
+                    p if p.starts_with("[IR:") => COLOR_IR,
+                    "[PHASE]" => COLOR_PHASE,
+                    "[LINK]" => COLOR_PARSE,
+                    "[RUSTC]" => COLOR_LEX,
+                    "[DESUGAR]" => COLOR_DESUGAR,
+                    "[DIAG]" => COLOR_DEFAULT,
+                    _ => COLOR_DEFAULT,
+                };
+                let colored = format!("{}{}{}", color, tag, COLOR_RESET);
+                result.push_str(&colored);
+                i = end + 1;
+            } else {
+                // No closing bracket – push the rest as plain text
+                result.push_str(&chars[i..].iter().collect::<String>());
+                break;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    if DIAG_TRACE {
+        println!("[TRACE] colorize_prefix raw: {:?}", raw);
+        println!("[TRACE] colorize_prefix result: {:?}", result);
+    }
+
+    result
+}
 
 // -----------------------------------------------------------------------------
 // Exit code definitions
@@ -42,6 +195,25 @@ pub enum Level {
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+impl Range {
+    pub fn new(start_line: u32, start_col: u32, end_line: u32, end_col: u32) -> Self {
+        Self {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suggestion {
     pub message: String,
@@ -53,7 +225,8 @@ pub struct Diagnostic {
     pub level: Level,
     pub message: String,
     pub code: Option<String>,
-    pub span: Option<Span>,
+    pub span: Option<Span>,   // kept for backward compatibility
+    pub range: Option<Range>, // for LSP diagnostics
     pub suggestions: Vec<Suggestion>,
 }
 
@@ -64,6 +237,7 @@ impl Diagnostic {
             message: message.into(),
             code: None,
             span: None,
+            range: None,
             suggestions: Vec::new(),
         }
     }
@@ -73,6 +247,7 @@ impl Diagnostic {
             message: message.into(),
             code: None,
             span: None,
+            range: None,
             suggestions: Vec::new(),
         }
     }
@@ -82,6 +257,7 @@ impl Diagnostic {
             message: message.into(),
             code: None,
             span: None,
+            range: None,
             suggestions: Vec::new(),
         }
     }
@@ -91,6 +267,7 @@ impl Diagnostic {
             message: message.into(),
             code: None,
             span: None,
+            range: None,
             suggestions: Vec::new(),
         }
     }
@@ -100,6 +277,10 @@ impl Diagnostic {
     }
     pub fn with_span(mut self, span: Span) -> Self {
         self.span = Some(span);
+        self
+    }
+    pub fn with_range(mut self, range: Range) -> Self {
+        self.range = Some(range);
         self
     }
     pub fn with_suggestion(mut self, suggestion: Suggestion) -> Self {
@@ -276,11 +457,102 @@ fn get_manager() -> &'static DiagnosticManager {
 static GLOBAL_DEBUG: AtomicBool = AtomicBool::new(false);
 
 pub fn set_global_debug(enabled: bool) {
+    // Enable virtual terminal processing on Windows (if available)
+    vt::enable();
+
     GLOBAL_DEBUG.store(enabled, Ordering::Relaxed);
 }
 
 pub fn global_debug() -> bool {
     GLOBAL_DEBUG.load(Ordering::Relaxed)
+}
+
+// -----------------------------------------------------------------------------
+// Test run active flag – suppresses per‑file phase updates during test runs.
+// -----------------------------------------------------------------------------
+
+static TEST_RUN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_test_run_active(active: bool) {
+    TEST_RUN_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+pub fn test_run_active() -> bool {
+    TEST_RUN_ACTIVE.load(Ordering::Relaxed)
+}
+
+// -----------------------------------------------------------------------------
+// GUI terminal and HWND forwarding
+// -----------------------------------------------------------------------------
+
+/// The GUI's terminal buffer to which all phase updates and logs are forwarded.
+static GUI_TERMINAL: OnceLock<Arc<Mutex<TerminalBuffer>>> = OnceLock::new();
+
+/// The GUI's main window HWND (stored as usize to be Sync) to post status bar updates.
+static GUI_HWND: OnceLock<usize> = OnceLock::new();
+
+/// Set the GUI's terminal buffer to receive all diagnostic output.
+pub fn set_gui_terminal(buffer: Arc<Mutex<TerminalBuffer>>) {
+    let _ = GUI_TERMINAL.set(buffer);
+    eprintln!("[DIAG] GUI_TERMINAL set");
+}
+
+/// Set the GUI's main window HWND to receive phase update messages.
+pub fn set_gui_hwnd(hwnd: HWND) {
+    let _ = GUI_HWND.set(hwnd as usize);
+    eprintln!("[DIAG] GUI_HWND set: {:?}", hwnd);
+}
+
+// A flag to prevent recursion when debug logging calls emit_log.
+static INSIDE_PUSH: AtomicBool = AtomicBool::new(false);
+
+/// Push a line to the GUI terminal (if set) and request a UI refresh.
+fn push_to_gui_terminal(line: String) {
+    // Avoid recursion if debug_log tries to call us again.
+    if INSIDE_PUSH.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if DIAG_TRACE {
+        println!(
+            "[TRACE] push_to_gui_terminal: line.len={}, line={:?}",
+            line.len(),
+            line
+        );
+    }
+
+    if let Some(term) = GUI_TERMINAL.get() {
+        if let Ok(mut guard) = term.lock() {
+            guard.push(line.clone());
+            if DIAG_TRACE {
+                println!("[TRACE] Pushed to buffer, total lines: {}", guard.len());
+            }
+        } else {
+            if DIAG_TRACE {
+                println!("[TRACE] Failed to lock terminal buffer");
+            }
+        }
+    } else {
+        if DIAG_TRACE {
+            println!("[TRACE] GUI_TERMINAL not set, cannot push");
+        }
+    }
+
+    // Request a UI refresh so the listbox updates
+    if let Some(hwnd) = GUI_HWND.get() {
+        unsafe {
+            let result = PostMessageW(*hwnd as HWND, WM_USER_REFRESH, 0, 0);
+            if DIAG_TRACE {
+                println!("[TRACE] Posted WM_USER_REFRESH, result: {}", result);
+            }
+        }
+    } else {
+        if DIAG_TRACE {
+            println!("[TRACE] GUI_HWND not set, cannot post refresh");
+        }
+    }
+
+    INSIDE_PUSH.store(false, Ordering::Relaxed);
 }
 
 // -----------------------------------------------------------------------------
@@ -327,12 +599,13 @@ fn diagnostic_to_exit_code(diag: &Diagnostic) -> i32 {
 }
 
 // -----------------------------------------------------------------------------
-// Pretty printing
+// Pretty diagnostic formatting (returns colored string)
 // -----------------------------------------------------------------------------
 
-fn render_pretty_diagnostic(diag: &Diagnostic) {
-    use std::io::Write;
-
+/// Format a diagnostic as a pretty, color‑coded string (with ANSI escapes).
+/// This mirrors the stderr output but returns a String.
+/// TODO: Add source context (file content, caret, underline) using the Span.
+fn format_pretty_diagnostic(diag: &Diagnostic) -> String {
     let (level_str, colour) = match diag.level {
         Level::Error => ("error", "\x1b[31m"),
         Level::Warning => ("warning", "\x1b[33m"),
@@ -340,32 +613,54 @@ fn render_pretty_diagnostic(diag: &Diagnostic) {
         Level::Help => ("help", "\x1b[32m"),
     };
 
-    let mut stderr = std::io::stderr().lock();
-
-    write!(&mut stderr, "{}", colour).unwrap();
-    write!(&mut stderr, "{}", level_str).unwrap();
-    write!(&mut stderr, "\x1b[0m").unwrap();
+    let mut out = String::new();
+    out.push_str(colour);
+    out.push_str(level_str);
+    out.push_str("\x1b[0m");
 
     if let Some(code) = &diag.code {
-        write!(&mut stderr, "[{}]", code).unwrap();
+        out.push('[');
+        out.push_str(code);
+        out.push(']');
     }
 
-    write!(&mut stderr, ": ").unwrap();
-    writeln!(&mut stderr, "{}", diag.message).unwrap();
+    out.push_str(": ");
+    out.push_str(&diag.message);
+    out.push('\n');
 
     if let Some(span) = &diag.span {
-        writeln!(&mut stderr, "  --> {}:{}", span.line, span.col).unwrap();
+        out.push_str(&format!("  --> {}:{}\n", span.line, span.col));
+        // TODO: read source file and include the line with a caret
+        // This will be implemented when we have a source cache.
     }
 
     for sug in &diag.suggestions {
-        write!(&mut stderr, "  \x1b[32mhelp:\x1b[0m ").unwrap();
-        writeln!(&mut stderr, "{}", sug.message).unwrap();
+        out.push_str("  \x1b[32mhelp:\x1b[0m ");
+        out.push_str(&sug.message);
+        out.push('\n');
         if let Some(span) = &sug.span {
-            writeln!(&mut stderr, "       at {}:{}", span.line, span.col).unwrap();
+            out.push_str(&format!("       at {}:{}\n", span.line, span.col));
         }
     }
 
-    writeln!(&mut stderr).unwrap();
+    out.push('\n');
+    out
+}
+
+// -----------------------------------------------------------------------------
+// Pretty printing (stdout)
+// -----------------------------------------------------------------------------
+
+fn render_pretty_diagnostic(diag: &Diagnostic) {
+    let formatted = format_pretty_diagnostic(diag);
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(formatted.as_bytes()).unwrap();
+    if DIAG_TRACE {
+        println!(
+            "[TRACE] render_pretty_diagnostic wrote {} bytes to stdout",
+            formatted.len()
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -376,17 +671,30 @@ pub fn emit_diagnostic(diag: &Diagnostic) {
     let manager = get_manager();
     manager.emit(CompilerEvent::Diagnostic(diag.clone()));
 
+    // Output to stdout if not collecting
     if !manager.is_collecting() {
         match determine_current_format() {
             OutputFormat::Json => {
                 let json = diagnostic_to_json(diag);
-                eprintln!("{}", json);
+                println!("{}", json);
             }
             OutputFormat::Pretty => {
                 render_pretty_diagnostic(diag);
             }
             OutputFormat::Auto => unreachable!(),
         }
+    }
+
+    // Always push the pretty (colored) version to the GUI terminal if active.
+    // This ensures that errors/warnings appear in the GUI during compilation.
+    if GUI_TERMINAL.get().is_some() {
+        let pretty = format_pretty_diagnostic(diag);
+        if DIAG_TRACE {
+            println!("[TRACE] emit_diagnostic pushing to GUI: {:?}", pretty);
+        }
+        push_to_gui_terminal(pretty);
+    } else if DIAG_TRACE {
+        println!("[TRACE] emit_diagnostic: GUI_TERMINAL not set, skipping GUI push");
     }
 }
 
@@ -410,16 +718,81 @@ pub fn stop_collecting() -> Vec<Diagnostic> {
     diags
 }
 
+/// Emit a phase update with a percentage.
+/// This will both log to the internal buffer and forward to the GUI terminal and status bar.
+/// If `test_run_active()` is true, we suppress GUI updates (except for "Test complete").
 pub fn emit_phase_update(phase: &'static str, percent: usize) {
     let percent = percent.min(100);
     get_manager().emit(CompilerEvent::PhaseUpdate { phase, percent });
+
+    // Log line for terminal / listbox (always record internally)
+    let log_line = format!("[PHASE] {} at {}%", phase, percent);
+    if global_debug() {
+        println!("[DIAG] emit_phase_update: {}", log_line);
+    }
+
+    // Suppress GUI updates during a test run (unless it's the final "Test complete" phase)
+    let should_update_gui = !test_run_active() || phase == "Test complete";
+
+    if should_update_gui {
+        push_to_gui_terminal(log_line);
+
+        // Update status bar via custom message to GUI
+        if let Some(hwnd) = GUI_HWND.get() {
+            let hwnd = *hwnd as HWND;
+            let msg = format!("{}  ({}%)", phase, percent);
+            let boxed = Box::new(msg);
+            let ptr = Box::into_raw(boxed);
+            unsafe {
+                PostMessageW(hwnd, WM_USER_PHASE_UPDATE, 0, ptr as isize);
+                if DIAG_TRACE {
+                    println!("[TRACE] Posted WM_USER_PHASE_UPDATE for phase: {}", phase);
+                }
+            }
+        } else {
+            if DIAG_TRACE {
+                println!("[TRACE] GUI_HWND not set, cannot post phase update");
+            }
+        }
+    } else {
+        if DIAG_TRACE {
+            println!(
+                "[TRACE] Suppressing phase update during test run: {}",
+                phase
+            );
+        }
+    }
 }
 
+/// Emit a log message.
+/// This will both log to the internal buffer and forward to the GUI terminal.
+/// If the GUI is active, the line is colorized before pushing.
+/// Also, if `global_debug()` is true, the (colorized) line is printed to stdout.
 pub fn emit_log(msg: String) {
+    // Log to internal buffer
+    get_manager().emit(CompilerEvent::Log(msg.clone()));
+
+    // Colorize for GUI if active
+    let gui_line = if GUI_TERMINAL.get().is_some() {
+        let colored = colorize_prefix(&msg);
+        if DIAG_TRACE {
+            println!("[TRACE] emit_log: raw msg: {:?}", msg);
+            println!("[TRACE] emit_log: colored msg: {:?}", colored);
+        }
+        colored
+    } else {
+        if DIAG_TRACE {
+            println!("[TRACE] emit_log: GUI_TERMINAL not set, using raw msg");
+        }
+        msg.clone()
+    };
+    push_to_gui_terminal(gui_line);
+
+    // If debug is enabled, also print to stdout (colorized)
     if global_debug() {
-        eprintln!("{}", msg);
+        let colored = colorize_prefix(&msg);
+        println!("{}", colored);
     }
-    get_manager().emit(CompilerEvent::Log(msg));
 }
 
 pub fn flush_logs(file_path: Option<PathBuf>) -> std::io::Result<()> {
@@ -510,37 +883,58 @@ fn diagnostic_to_json(diag: &Diagnostic) -> String {
     s
 }
 
-fn parse_diagnostic_from_json(line: &str) -> Option<Diagnostic> {
-    if !line.starts_with('{') || !line.ends_with('}') {
+/// Parse a diagnostic from a JSON string (expected to be a single JSON object).
+/// Used for both compiler diagnostics and LSP diagnostics.
+pub fn parse_diagnostic_from_json(json: &str) -> Option<Diagnostic> {
+    if !json.starts_with('{') || !json.ends_with('}') {
         return None;
     }
-    let level = if line.contains("\"level\":\"error\"") {
+    let level = if json.contains("\"level\":\"error\"") || json.contains("\"severity\":1") {
         Level::Error
-    } else if line.contains("\"level\":\"warning\"") {
+    } else if json.contains("\"level\":\"warning\"") || json.contains("\"severity\":2") {
         Level::Warning
-    } else if line.contains("\"level\":\"note\"") {
+    } else if json.contains("\"level\":\"note\"") || json.contains("\"severity\":3") {
         Level::Note
-    } else if line.contains("\"level\":\"help\"") {
+    } else if json.contains("\"level\":\"help\"") || json.contains("\"severity\":4") {
         Level::Help
     } else {
         return None;
     };
-    let message = extract_json_string(line, "message")?;
-    let code = extract_json_string(line, "code");
+    let message = extract_json_string(json, "message")?;
+    let code = extract_json_string(json, "code");
+
+    // Try to parse range (LSP format: range -> start/end with line/character)
+    let range = if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) = (
+        extract_json_number_from_object(json, "range", "start", "line"),
+        extract_json_number_from_object(json, "range", "start", "character"),
+        extract_json_number_from_object(json, "range", "end", "line"),
+        extract_json_number_from_object(json, "range", "end", "character"),
+    ) {
+        Some(Range {
+            start_line: start_line as u32,
+            start_col: start_col as u32,
+            end_line: end_line as u32,
+            end_col: end_col as u32,
+        })
+    } else {
+        None
+    };
+
     Some(Diagnostic {
         level,
         message,
         code,
-        span: None,
+        span: None, // we don't convert for LSP
+        range,
         suggestions: Vec::new(),
     })
 }
 
-fn extract_json_string(line: &str, key: &str) -> Option<String> {
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let pattern = format!("\"{}\":\"", key);
-    let start = line.find(&pattern)? + pattern.len();
+    let start = json.find(&pattern)? + pattern.len();
     let mut end = start;
-    let bytes = line.as_bytes();
+    let bytes = json.as_bytes();
     while end < bytes.len() && bytes[end] != b'"' {
         if bytes[end] == b'\\' {
             end += 1;
@@ -550,9 +944,30 @@ fn extract_json_string(line: &str, key: &str) -> Option<String> {
     if end >= bytes.len() {
         return None;
     }
-    let raw = &line[start..end];
-    let unescaped = raw.replace("\\\\", "\\").replace("\\\"", "\"");
-    Some(unescaped)
+    let raw = &json[start..end];
+    Some(raw.replace("\\\\", "\\").replace("\\\"", "\""))
+}
+
+fn extract_json_number_from_object(
+    json: &str,
+    outer: &str,
+    inner: &str,
+    key: &str,
+) -> Option<usize> {
+    let outer_pattern = format!("\"{}\":", outer);
+    let outer_start = json.find(&outer_pattern)? + outer_pattern.len();
+    // find the inner object
+    let rest = &json[outer_start..];
+    let inner_pattern = format!("\"{}\":", inner);
+    let inner_start = rest.find(&inner_pattern)? + inner_pattern.len();
+    let after_inner = &rest[inner_start..];
+    let key_pattern = format!("\"{}\":", key);
+    let key_start = after_inner.find(&key_pattern)? + key_pattern.len();
+    let value_rest = &after_inner[key_start..];
+    let end = value_rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value_rest.len());
+    value_rest[..end].parse().ok()
 }
 
 // -----------------------------------------------------------------------------
@@ -588,11 +1003,23 @@ mod ui {
     }
 }
 
-/// Log a debug message. If global debug is enabled, prints to stderr immediately.
+/// Log a debug message. If global debug is enabled, prints to stdout immediately.
+/// Also forwards a **colored** version to the GUI terminal (always).
 pub fn debug_log(msg: impl Into<String>) {
     let msg = msg.into();
     if global_debug() {
-        eprintln!("{}", msg);
+        // Push plain version to internal buffer (for file logs)
+        get_manager().emit(CompilerEvent::Log(msg.clone()));
+
+        // Always generate colored version for GUI
+        let colored = colorize_prefix(&msg);
+        if DIAG_TRACE {
+            println!("[TRACE] debug_log: raw: {:?}", msg);
+            println!("[TRACE] debug_log: colored: {:?}", colored);
+        }
+        push_to_gui_terminal(colored.clone());
+
+        // Print the colored version to stdout (so colors appear in VS2022 and other consoles)
+        println!("{}", colored);
     }
-    emit_log(msg);
 }

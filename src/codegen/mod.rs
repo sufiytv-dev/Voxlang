@@ -42,7 +42,6 @@ pub struct CodegenEngine {
     pub string_len: HashMap<String, usize>,
     pub pending_strings: Vec<(String, String, usize)>,
     pub pending_workers: Vec<String>,
-    pub debug: bool,
     pub block_counter: usize,
     pub worker_counter: usize,
     pub function_return_types: HashMap<String, String>,
@@ -90,7 +89,7 @@ pub struct CodegenEngine {
     // Kernel parameter types (Vox types) for each kernel – used during launch codegen
     pub kernel_param_types: HashMap<String, Vec<String>>,
 
-    // NEW: Buffer for forward declarations of monomorphised functions
+    // Buffer for forward declarations of monomorphised functions
     pub pending_declarations: Vec<String>,
 }
 
@@ -118,7 +117,6 @@ impl CodegenEngine {
             string_len: HashMap::new(),
             pending_strings: Vec::new(),
             pending_workers: Vec::new(),
-            debug: false,
             block_counter: 0,
             worker_counter: 0,
             function_return_types: HashMap::new(),
@@ -174,10 +172,6 @@ impl CodegenEngine {
         self.clang_path = clang;
         self.llc_path = llc;
         self.lld_path = lld;
-    }
-
-    pub fn set_debug(&mut self, enabled: bool) {
-        self.debug = enabled;
     }
 
     pub fn set_device_triple_override(&mut self, triple: String) {
@@ -475,7 +469,9 @@ impl CodegenEngine {
 
         // [FIX] Now compile main (if it exists) – it will see kernel_binary_const and emit the load call
         if let Some(main_node) = main_ast {
-            self.debug_log("[CODEGEN] Compiling deferred 'main' function (after device binary generation)");
+            self.debug_log(
+                "[CODEGEN] Compiling deferred 'main' function (after device binary generation)",
+            );
             // Ensure that the main function is emitted after all other declarations (including the device binary constant)
             self.compile_statement(&main_node);
             if self.has_error {
@@ -616,7 +612,7 @@ impl CodegenEngine {
         // =================================================================
         // REGISTER NUMBERING VALIDATION - catch gaps before returning
         // =================================================================
-        if self.debug {
+        if crate::diagnostic::global_debug() {
             self.debug_log("=== REGISTER NUMBERING VALIDATION ===");
             let ir_lines: Vec<&str> = self.ir.lines().collect();
             let mut expected_reg = 0;
@@ -749,8 +745,11 @@ impl CodegenEngine {
             self.debug_log("=========================================");
         }
 
-        if self.debug {
-            debug_log(&format!("=== FINAL IR (after repair) ===\n{}", self.ir));
+        if crate::diagnostic::global_debug() {
+            debug_log(&format!(
+                "[CODEGEN] === FINAL IR (after repair) ===\n{}",
+                self.ir
+            ));
         }
 
         self.debug_log("========== [CODEGEN] generate() END ==========\n");

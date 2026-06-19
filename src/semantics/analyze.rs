@@ -6,11 +6,12 @@ use crate::comptime::ComptimeEvaluator;
 use crate::diagnostic::{Diagnostic, Suggestion, emit_diagnostic};
 use crate::frontend::span::Span;
 use crate::frontend::token::TokenKind;
-use crate::parser::{ASTNode, KernelAttr, MatchArm, MatchPattern};
+use crate::parser::{ASTNode, KernelAttr, MatchArm, MatchPattern, StructField};
 use crate::refinement;
 use crate::semantics::SemanticAnalyzer;
 use crate::semantics::symbol::SymbolTable;
-use crate::semantics::types::Type;
+use crate::semantics::types::{Type, parse_generic_type};
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 // -----------------------------------------------------------------------------
@@ -74,6 +75,23 @@ impl MatchPattern {
             MatchPattern::Binding { span, .. } => *span,
         }
     }
+}
+
+// =============================================================================
+// ResolvedSymbol – result of resolving a qualified name
+// =============================================================================
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedSymbol {
+    Function {
+        param_types: Vec<Type>,
+        return_type: Type,
+    },
+    Struct {
+        fields: Vec<StructField>,
+    },
+    Enum {
+        variants: Vec<crate::parser::EnumVariant>,
+    },
 }
 
 // -----------------------------------------------------------------------------
@@ -312,31 +330,41 @@ impl SemanticAnalyzer<'_> {
                     None => return None,
                 };
                 let base_ty_stripped = base_ty.strip_references();
-                let field_ty = match base_ty_stripped {
-                    Type::Struct(_, _) | Type::Concrete(_) => {
-                        // Resolve concrete struct fields
-                        let base_resolved = self.resolve_type(base_ty_stripped.clone(), *span);
-                        if let Some(fields) =
-                            self.symbols.resolve_concrete_struct(&base_resolved, *span)
-                        {
-                            fields
-                                .iter()
-                                .find(|(fname, _)| fname == field)
-                                .map(|(_, ty)| ty.clone())
+
+                // Determine struct name and type arguments
+                let (struct_name, args) = match base_ty_stripped {
+                    Type::Struct(name, args) => (name.clone(), args.clone()),
+                    Type::Concrete(name) => {
+                        if let Some((struct_name, args_str)) = parse_generic_type(name) {
+                            let args = args_str.iter().map(|s| Type::Concrete(s.clone())).collect();
+                            (struct_name, args)
                         } else {
-                            None
+                            (name.clone(), vec![])
                         }
                     }
-                    _ => None,
+                    _ => {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Cannot access field of non‑struct type '{}'",
+                                base_ty_stripped.to_string()
+                            ))
+                            .with_code("VX0261")
+                            .with_span(*span),
+                        );
+                        self.error_occurred = true;
+                        return None;
+                    }
                 };
+
+                // Resolve the field type with substitution
+                let field_ty = self.resolve_field_type(&struct_name, &args, field, *span);
                 match field_ty {
                     Some(ty) => Some((ty, base_mutable)),
                     None => {
                         emit_diagnostic(
                             &Diagnostic::error(&format!(
                                 "Struct '{}' has no field named '{}'",
-                                base_ty_stripped.to_string(),
-                                field
+                                struct_name, field
                             ))
                             .with_code("VX0261")
                             .with_span(*span),
@@ -484,10 +512,12 @@ impl SemanticAnalyzer<'_> {
     // Statement analysis (top‑level entry point for checking)
     // -------------------------------------------------------------------------
     pub(crate) fn analyze_statement(&mut self, node: &ASTNode) {
+        let span = node_span(node);
         self.dbg(&format!(
-            "analyze_statement: {:?} at {:?}",
-            node,
-            node_span(node)
+            "analyze_statement: {} at {}:{}",
+            node.kind_name(),
+            span.line,
+            span.col
         ));
         match node {
             ASTNode::Program(statements, _) => {
@@ -1277,9 +1307,12 @@ impl SemanticAnalyzer<'_> {
         node: &ASTNode,
         expected: Option<&Type>,
     ) -> Option<Type> {
+        let span = node_span(node);
         self.dbg(&format!(
-            "analyze_expression: {:?}, expected={:?}",
-            node,
+            "analyze_expression: {} at {}:{} (expected={:?})",
+            node.kind_name(),
+            span.line,
+            span.col,
             expected.map(|t| t.to_string())
         ));
         // Helper to resolve imported identifier names
@@ -1681,22 +1714,34 @@ impl SemanticAnalyzer<'_> {
                     "FieldAccess: expr type = '{:?}', resolved = '{:?}', stripped = '{}', field = '{}'",
                     base_ty, resolved_base_ty, base_ty_stripped.to_string(), field
                 ));
-                let field_ty = match base_ty_stripped {
-                    Type::Struct(_, _) | Type::Concrete(_) => {
-                        let base_resolved = self.resolve_type(base_ty_stripped.clone(), *span);
-                        if let Some(fields) =
-                            self.symbols.resolve_concrete_struct(&base_resolved, *span)
-                        {
-                            fields
-                                .iter()
-                                .find(|(fname, _)| fname == field)
-                                .map(|(_, ty)| ty.clone())
+
+                // Determine struct name and type arguments
+                let (struct_name, args) = match base_ty_stripped {
+                    Type::Struct(name, args) => (name.clone(), args.clone()),
+                    Type::Concrete(name) => {
+                        if let Some((struct_name, args_str)) = parse_generic_type(name) {
+                            let args = args_str.iter().map(|s| Type::Concrete(s.clone())).collect();
+                            (struct_name, args)
                         } else {
-                            None
+                            (name.clone(), vec![])
                         }
                     }
-                    _ => None,
+                    _ => {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Cannot access field of non‑struct type '{}'",
+                                base_ty_stripped.to_string()
+                            ))
+                            .with_code("VX0261")
+                            .with_span(*span),
+                        );
+                        self.error_occurred = true;
+                        return None;
+                    }
                 };
+
+                // Resolve the field type with substitution
+                let field_ty = self.resolve_field_type(&struct_name, &args, field, *span);
                 match field_ty {
                     Some(ty) => {
                         self.dbg(&format!("Field '{}' resolved to type '{:?}'", field, ty));
@@ -1712,8 +1757,7 @@ impl SemanticAnalyzer<'_> {
                         emit_diagnostic(
                             &Diagnostic::error(&format!(
                                 "Struct '{}' has no field named '{}'",
-                                base_ty_stripped.to_string(),
-                                field
+                                struct_name, field
                             ))
                             .with_code("VX0261")
                             .with_span(*span),
@@ -1852,91 +1896,177 @@ impl SemanticAnalyzer<'_> {
                 }
             }
             ASTNode::StructLiteral { name, fields, span } => {
-                let struct_info = match self.symbols.lookup_struct_info(name) {
-                    Some(info) => info,
-                    None => {
-                        emit_diagnostic(
-                            &Diagnostic::error(&format!("Unknown struct '{}' in literal", name))
-                                .with_code("VX0273")
-                                .with_span(*span),
-                        );
-                        self.error_occurred = true;
-                        return None;
-                    }
-                };
-                let generic_params = struct_info.generic_params.clone();
-                let type_name = if generic_params.is_empty() {
-                    Type::Struct(name.clone(), vec![])
-                } else {
-                    let mut args = Vec::new();
-                    for _ in &generic_params {
-                        args.push(self.fresh_infer_var());
-                    }
-                    Type::Struct(name.clone(), args)
-                };
-                let resolved_type_name = self.unify.resolve(&type_name);
-                let field_map = match self
-                    .symbols
-                    .resolve_concrete_struct(&resolved_type_name, *span)
-                {
-                    Some(map) => map,
-                    None => {
-                        emit_diagnostic(
-                            &Diagnostic::error(&format!(
-                                "Failed to resolve struct '{}' fields",
-                                resolved_type_name.to_string()
-                            ))
-                            .with_code("VX0273")
-                            .with_span(*span),
-                        );
-                        self.error_occurred = true;
-                        return None;
-                    }
-                };
-                let mut provided_fields = std::collections::HashSet::new();
-                for (field_name, expr) in fields {
-                    provided_fields.insert(field_name.clone());
-                    let expected_ty = match field_map.iter().find(|(fname, _)| fname == field_name)
-                    {
-                        Some((_, ty)) => ty.clone(),
-                        None => {
+                // Resolve the struct name (possibly qualified)
+                let resolved = self.resolve_qualified_name(name, *span);
+                match resolved {
+                    Ok(ResolvedSymbol::Struct { fields: field_defs }) => {
+                        // Build a map of field names to expected types
+                        let mut field_map = std::collections::HashMap::new();
+                        for f in &field_defs {
+                            field_map.insert(f.name.clone(), f.ty.clone());
+                        }
+
+                        // Check each provided field
+                        let mut provided_fields = std::collections::HashSet::new();
+                        for (field_name, expr) in fields {
+                            provided_fields.insert(field_name.clone());
+                            let expected_ty_str = match field_map.get(field_name) {
+                                Some(ty_str) => ty_str,
+                                None => {
+                                    emit_diagnostic(
+                                        &Diagnostic::error(&format!(
+                                            "Struct '{}' has no field named '{}'",
+                                            name, field_name
+                                        ))
+                                        .with_code("VX0274")
+                                        .with_span(node_span(expr)),
+                                    );
+                                    self.error_occurred = true;
+                                    return None;
+                                }
+                            };
+                            // Parse the expected type string (may contain generics)
+                            let gp_set = self
+                                .current_generic_params
+                                .as_ref()
+                                .map(|v| v.iter().cloned().collect())
+                                .unwrap_or(HashSet::new());
+                            let expected_ty =
+                                self.parse_type_str_with_imports(expected_ty_str, &gp_set);
+                            let actual_ty = match self.analyze_expression(expr, Some(&expected_ty))
+                            {
+                                Some(ty) => ty,
+                                None => return None,
+                            };
+                            if !self.unify.unify(&expected_ty, &actual_ty, node_span(expr)) {
+                                self.error_occurred = true;
+                                return None;
+                            }
+                        }
+
+                        // Ensure all fields are provided
+                        if provided_fields.len() != field_map.len() {
                             emit_diagnostic(
                                 &Diagnostic::error(&format!(
-                                    "Struct '{}' has no field named '{}'",
-                                    resolved_type_name.to_string(),
-                                    field_name
+                                    "Struct literal for '{}' must specify all {} fields (got {})",
+                                    name,
+                                    field_map.len(),
+                                    fields.len()
                                 ))
-                                .with_code("VX0274")
-                                .with_span(node_span(expr)),
+                                .with_code("VX0276")
+                                .with_span(*span),
                             );
                             self.error_occurred = true;
                             return None;
                         }
-                    };
-                    let actual_ty = match self.analyze_expression(expr, Some(&expected_ty)) {
-                        Some(ty) => ty,
-                        None => return None,
-                    };
-                    if !self.unify.unify(&expected_ty, &actual_ty, node_span(expr)) {
+
+                        // The type of the struct literal is the struct name (possibly qualified)
+                        // For simplicity, we treat it as a concrete type with no generic args.
+                        // Generic inference will be handled later by the expected type.
+                        Some(Type::Concrete(name.clone()))
+                    }
+                    Ok(_) => {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!("'{}' is not a struct", name))
+                                .with_code("VX0273")
+                                .with_span(*span),
+                        );
                         self.error_occurred = true;
-                        return None;
+                        None
+                    }
+                    Err(()) => {
+                        // Fallback to local lookup (existing logic)
+                        let struct_info = match self.symbols.lookup_struct_info(name) {
+                            Some(info) => info,
+                            None => {
+                                emit_diagnostic(
+                                    &Diagnostic::error(&format!(
+                                        "Unknown struct '{}' in literal",
+                                        name
+                                    ))
+                                    .with_code("VX0273")
+                                    .with_span(*span),
+                                );
+                                self.error_occurred = true;
+                                return None;
+                            }
+                        };
+                        let generic_params = struct_info.generic_params.clone();
+                        let type_name = if generic_params.is_empty() {
+                            Type::Struct(name.clone(), vec![])
+                        } else {
+                            let mut args = Vec::new();
+                            for _ in &generic_params {
+                                args.push(self.fresh_infer_var());
+                            }
+                            Type::Struct(name.clone(), args)
+                        };
+                        let resolved_type_name = self.unify.resolve(&type_name);
+                        let field_map = match self
+                            .symbols
+                            .resolve_concrete_struct(&resolved_type_name, *span)
+                        {
+                            Some(map) => map,
+                            None => {
+                                emit_diagnostic(
+                                    &Diagnostic::error(&format!(
+                                        "Failed to resolve struct '{}' fields",
+                                        resolved_type_name.to_string()
+                                    ))
+                                    .with_code("VX0273")
+                                    .with_span(*span),
+                                );
+                                self.error_occurred = true;
+                                return None;
+                            }
+                        };
+                        let mut provided_fields = std::collections::HashSet::new();
+                        for (field_name, expr) in fields {
+                            provided_fields.insert(field_name.clone());
+                            let expected_ty =
+                                match field_map.iter().find(|(fname, _)| fname == field_name) {
+                                    Some((_, ty)) => ty.clone(),
+                                    None => {
+                                        emit_diagnostic(
+                                            &Diagnostic::error(&format!(
+                                                "Struct '{}' has no field named '{}'",
+                                                resolved_type_name.to_string(),
+                                                field_name
+                                            ))
+                                            .with_code("VX0274")
+                                            .with_span(node_span(expr)),
+                                        );
+                                        self.error_occurred = true;
+                                        return None;
+                                    }
+                                };
+                            let actual_ty = match self.analyze_expression(expr, Some(&expected_ty))
+                            {
+                                Some(ty) => ty,
+                                None => return None,
+                            };
+                            if !self.unify.unify(&expected_ty, &actual_ty, node_span(expr)) {
+                                self.error_occurred = true;
+                                return None;
+                            }
+                        }
+                        if provided_fields.len() != field_map.len() {
+                            emit_diagnostic(
+                                &Diagnostic::error(&format!(
+                                    "Struct literal for '{}' must specify all {} fields (got {})",
+                                    resolved_type_name.to_string(),
+                                    field_map.len(),
+                                    fields.len()
+                                ))
+                                .with_code("VX0276")
+                                .with_span(*span),
+                            );
+                            self.error_occurred = true;
+                            return None;
+                        }
+                        Some(type_name)
                     }
                 }
-                if provided_fields.len() != field_map.len() {
-                    emit_diagnostic(
-                        &Diagnostic::error(&format!(
-                            "Struct literal for '{}' must specify all {} fields (got {})",
-                            resolved_type_name.to_string(),
-                            field_map.len(),
-                            fields.len()
-                        ))
-                        .with_code("VX0276")
-                        .with_span(*span),
-                    );
-                    self.error_occurred = true;
-                    return None;
-                }
-                Some(type_name)
             }
             ASTNode::CastExpr {
                 expr,
@@ -3249,7 +3379,12 @@ impl SemanticAnalyzer<'_> {
                     Some(return_type)
                 }
             }
-            ASTNode::KernelLaunch { kernel, grid, args, span } => {
+            ASTNode::KernelLaunch {
+                kernel,
+                grid,
+                args,
+                span,
+            } => {
                 // Resolve kernel name
                 let kernel_name = match kernel.as_ref() {
                     ASTNode::Identifier(name, _) => name,
@@ -3269,9 +3404,12 @@ impl SemanticAnalyzer<'_> {
                         Some(info) => info,
                         None => {
                             emit_diagnostic(
-                                &Diagnostic::error(&format!("Unknown function '{}' used as kernel", kernel_name))
-                                    .with_code("VX0297")
-                                    .with_span(*span),
+                                &Diagnostic::error(&format!(
+                                    "Unknown function '{}' used as kernel",
+                                    kernel_name
+                                ))
+                                .with_code("VX0297")
+                                .with_span(*span),
                             );
                             self.error_occurred = true;
                             return None;
@@ -3279,9 +3417,12 @@ impl SemanticAnalyzer<'_> {
                     };
                 if !is_kernel {
                     emit_diagnostic(
-                        &Diagnostic::error(&format!("'{}' is not a kernel (missing @kernel)", kernel_name))
-                            .with_code("VX0298")
-                            .with_span(*span),
+                        &Diagnostic::error(&format!(
+                            "'{}' is not a kernel (missing @kernel)",
+                            kernel_name
+                        ))
+                        .with_code("VX0298")
+                        .with_span(*span),
                     );
                     self.error_occurred = true;
                     return None;
@@ -3325,7 +3466,9 @@ impl SemanticAnalyzer<'_> {
                 // Type-check grid expressions (must be i32)
                 let (gx, gy, gz) = grid;
                 let mut check_grid = |expr: &ASTNode, dim: &str| -> bool {
-                    let ty = match self.analyze_expression(expr, Some(&Type::Concrete("i32".to_string()))) {
+                    let ty = match self
+                        .analyze_expression(expr, Some(&Type::Concrete("i32".to_string())))
+                    {
                         Some(t) => t,
                         None => return false,
                     };
@@ -3345,7 +3488,10 @@ impl SemanticAnalyzer<'_> {
                         true
                     }
                 };
-                if !check_grid(gx, "grid_x") || !check_grid(gy, "grid_y") || !check_grid(gz, "grid_z") {
+                if !check_grid(gx, "grid_x")
+                    || !check_grid(gy, "grid_y")
+                    || !check_grid(gz, "grid_z")
+                {
                     return None;
                 }
 
@@ -3783,5 +3929,158 @@ impl SemanticAnalyzer<'_> {
 
     pub(crate) fn is_arithmetic_type(ty: &str) -> bool {
         Self::is_integer_type(ty) || matches!(ty, "f32" | "f64")
+    }
+
+    // =========================================================================
+    // Qualified name resolution
+    // =========================================================================
+    /// Resolve a qualified name (e.g., "math::Point") into a struct, enum, or function.
+    /// If the name is unqualified, returns Err(()).
+    pub(crate) fn resolve_qualified_name(
+        &mut self,
+        name: &str,
+        span: Span,
+    ) -> Result<ResolvedSymbol, ()> {
+        if !name.contains("::") {
+            return Err(());
+        }
+        let parts: Vec<&str> = name.split("::").collect();
+        if parts.len() != 2 {
+            emit_diagnostic(
+                &Diagnostic::error(&format!("Invalid qualified name '{}'", name))
+                    .with_code("VX0317")
+                    .with_span(span),
+            );
+            self.error_occurred = true;
+            return Err(());
+        }
+        let module_name = parts[0];
+        let item_name = parts[1];
+
+        // Look up the module's symbol table
+        let module_symbols = match self.symbols.lookup_module(module_name) {
+            Some(sym) => sym,
+            None => {
+                emit_diagnostic(
+                    &Diagnostic::error(&format!("Module '{}' not imported", module_name))
+                        .with_code("VX0306")
+                        .with_span(span),
+                );
+                self.error_occurred = true;
+                return Err(());
+            }
+        };
+
+        // Check for struct
+        if let Some(fields) = module_symbols.structs.get(item_name) {
+            return Ok(ResolvedSymbol::Struct {
+                fields: fields.clone(),
+            });
+        }
+
+        // Check for enum
+        if let Some(variants) = module_symbols.enums.get(item_name) {
+            return Ok(ResolvedSymbol::Enum {
+                variants: variants.clone(),
+            });
+        }
+
+        // Check for function
+        if let Some((param_types, _, return_type, ..)) = module_symbols.functions.get(item_name) {
+            let param_ty: Vec<Type> = param_types
+                .iter()
+                .map(|s| Type::Concrete(s.clone()))
+                .collect();
+            let ret_ty = Type::Concrete(return_type.clone());
+            return Ok(ResolvedSymbol::Function {
+                param_types: param_ty,
+                return_type: ret_ty,
+            });
+        }
+
+        emit_diagnostic(
+            &Diagnostic::error(&format!(
+                "Item '{}' not found in module '{}'",
+                item_name, module_name
+            ))
+            .with_code("VX0307")
+            .with_span(span),
+        );
+        self.error_occurred = true;
+        Err(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper to resolve a field type with substitution of generic parameters
+    // -------------------------------------------------------------------------
+    fn resolve_field_type(
+        &mut self,
+        struct_name: &str,
+        args: &[Type],
+        field: &str,
+        span: Span,
+    ) -> Option<Type> {
+        let base_name = Self::strip_generic_args(struct_name);
+
+        // Check if it's a qualified struct name (e.g., "math::Point")
+        if base_name.contains("::") {
+            if let Ok(ResolvedSymbol::Struct { fields }) =
+                self.resolve_qualified_name(&base_name, span)
+            {
+                let gp_set = self
+                    .current_generic_params
+                    .as_ref()
+                    .map(|v| v.iter().cloned().collect())
+                    .unwrap_or_default();
+
+                for f in &fields {
+                    if f.name == field {
+                        // Parse and resolve the field type correctly pulling from module specs
+                        let parsed_ty = self.parse_type_str_with_imports(&f.ty, &gp_set);
+                        return Some(self.resolve_type(parsed_ty, span));
+                    }
+                }
+            }
+        } else {
+            // Local struct lookup
+            if let Some(struct_info) = self.symbols.lookup_struct_info(&base_name) {
+                let mut subst = std::collections::HashMap::new();
+                for (i, gp) in struct_info.generic_params.iter().enumerate() {
+                    if i < args.len() {
+                        subst.insert(gp.clone(), args[i].clone());
+                    }
+                }
+                for (fname, fty) in &struct_info.fields {
+                    if fname == field {
+                        let resolved_fty = self.resolve_type(fty.clone(), span);
+                        let substituted = resolved_fty.substitute(&subst);
+                        return Some(substituted);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper to strip module prefix from a name (e.g., "math::Point" -> "Point")
+    // -------------------------------------------------------------------------
+    fn strip_module_prefix(name: &str) -> String {
+        if let Some(last) = name.rsplit("::").next() {
+            last.to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper to strip generic arguments from a type name (e.g., "Vec<i32>" -> "Vec")
+    // -------------------------------------------------------------------------
+    fn strip_generic_args(name: &str) -> String {
+        if let Some(angle_pos) = name.find('<') {
+            name[..angle_pos].to_string()
+        } else {
+            name.to_string()
+        }
     }
 }

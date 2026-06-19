@@ -16,7 +16,7 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
             for stmt in stmts {
                 match stmt {
                     ASTNode::Import { .. } => {
-                        debug_log(format!("Resolving import: {:?}", stmt));
+                        debug_log(format!("[IMPORT] Resolving import: {:?}", stmt));
                         if let Some(imported_ast) = resolver.resolve_import(stmt, node_span(stmt)) {
                             let (resolved_import, import_err) =
                                 resolve_imports(&imported_ast, resolver);
@@ -29,7 +29,7 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
                                 new_stmts.push(resolved_import);
                             }
                         } else {
-                            debug_log("Failed to resolve import");
+                            debug_log("[IMPORT] Failed to resolve import");
                             errors = true;
                         }
                     }
@@ -46,7 +46,7 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
         }
 
         ASTNode::Import { span, .. } => {
-            debug_log("Resolving top-level import");
+            debug_log("[IMPORT] Resolving top-level import");
             if let Some(imported_ast) = resolver.resolve_import(node, *span) {
                 resolve_imports(&imported_ast, resolver)
             } else {
@@ -399,7 +399,12 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
             )
         }
 
-        ASTNode::KernelLaunch { kernel, grid, args, span } => {
+        ASTNode::KernelLaunch {
+            kernel,
+            grid,
+            args,
+            span,
+        } => {
             let (new_kernel, err1) = resolve_imports(kernel, resolver);
             let (new_grid_x, err2) = resolve_imports(&*grid.0, resolver);
             let (new_grid_y, err3) = resolve_imports(&*grid.1, resolver);
@@ -416,7 +421,11 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
             (
                 ASTNode::KernelLaunch {
                     kernel: Box::new(new_kernel),
-                    grid: (Box::new(new_grid_x), Box::new(new_grid_y), Box::new(new_grid_z)),
+                    grid: (
+                        Box::new(new_grid_x),
+                        Box::new(new_grid_y),
+                        Box::new(new_grid_z),
+                    ),
                     args: new_args,
                     span: *span,
                 },
