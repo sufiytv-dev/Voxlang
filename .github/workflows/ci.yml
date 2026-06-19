@@ -42,6 +42,11 @@ jobs:
           sudo apt update
           sudo apt install -y clang lld z3
 
+      - name: Install LLVM (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install llvm --version=18.1.8
+
       - name: Compile VXM Orchestrator
         run: cargo build -p vxm --release
 
@@ -81,6 +86,17 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y clang lld z3
+
+      - name: Install LLVM (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install llvm --version=18.1.8
+
+      - name: Debug Windows environment
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "LIB=$env:LIB"
+          echo "Path=$env:Path"
 
       - name: Build Vox Compiler
         run: cargo build --release

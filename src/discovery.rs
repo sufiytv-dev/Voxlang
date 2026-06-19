@@ -234,6 +234,20 @@ fn find_windows_system_libs() -> Vec<PathBuf> {
         }
     }
 
+    // FINAL FALLBACK: If still no paths found, attempt to parse the LIB environment variable
+    // This is common in CI environments where the VS Developer Command Prompt has set LIB.
+    if paths.is_empty() {
+        if let Ok(lib_var) = env::var("LIB") {
+            debug_log("[DISCOVERY] No system libs found; using LIB environment variable paths.");
+            for entry in lib_var.split(';') {
+                let p = PathBuf::from(entry);
+                if p.exists() && p.is_dir() {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+
     paths
 }
 
