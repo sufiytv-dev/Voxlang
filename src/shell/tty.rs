@@ -24,7 +24,7 @@ mod unix {
     const ICANON: u32 = 0x0002;
     const ECHO: u32 = 0x0008;
 
-    extern "C" {
+    unsafe extern "C" {
         fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
         fn tcsetattr(fd: c_int, optional_actions: c_int, termios: *const Termios) -> c_int;
     }
