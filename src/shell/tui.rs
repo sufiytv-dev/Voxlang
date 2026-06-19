@@ -37,8 +37,11 @@ impl WorkspaceState {
         }
     }
 
+    // On non‑Windows, LSP is not supported because we lack a GUI window handle.
+    // We simply do not start LSP.
+    #[cfg(target_os = "windows")]
     fn start_lsp(&mut self) -> io::Result<()> {
-        let mut lsp = LspClient::start()?;
+        let mut lsp = LspClient::start(std::ptr::null_mut())?;
         lsp.send_initialize("file://")?;
         if let Some(path) = self.editor.file_path() {
             let uri = super::lsp::path_to_uri(path);
@@ -46,6 +49,12 @@ impl WorkspaceState {
             lsp.send_open(&uri, &content)?;
         }
         self.lsp = Some(lsp);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn start_lsp(&mut self) -> io::Result<()> {
+        // LSP is not supported on non‑Windows TUI.
         Ok(())
     }
 
@@ -83,7 +92,8 @@ impl WorkspaceState {
         };
         let comp_in_progress = self.compilation_in_progress.clone();
         thread::spawn(move || {
-            let res = compile_and_run_file(&path, &target, &config);
+            // Pass None, None for GPU backend and arch (CPU fallback)
+            let res = compile_and_run_file(&path, &target, &config, None, None);
             let mut term = terminal.lock().unwrap();
             match res {
                 Ok(output) => {
@@ -224,7 +234,7 @@ pub fn run(_hide_console: bool) -> Result<(), String> {
             b'\t' => state.editor.insert_char(' '),
             c if c >= 32 && c < 127 => {
                 state.editor.insert_char(c as char);
-                // Notify LSP of change
+                // Notify LSP of change (if available)
                 if let Some(lsp) = &mut state.lsp {
                     if let Some(path) = state.editor.file_path() {
                         let uri = super::lsp::path_to_uri(path);
