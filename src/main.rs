@@ -1004,6 +1004,12 @@ fn cmd_build(
     link_cmd.arg(&input_for_link).arg("-o").arg(&exe_path);
     let mut link_args = Vec::new();
 
+    // Add discovered system library paths (Windows SDK, MSVC, etc.) as -L flags.
+    // This is critical for Windows linking where the LIB environment variable might be incomplete.
+    for lib_path in &llvm_tools.system_libs {
+        link_cmd.arg("-L").arg(lib_path);
+    }
+
     let target_triple = if target.contains("windows") && target.contains("msvc") {
         "x86_64-pc-windows-msvc"
     } else if target.contains("windows") && target.contains("gnu") {
