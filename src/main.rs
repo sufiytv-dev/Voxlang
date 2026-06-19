@@ -863,7 +863,8 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
 }
 
 // ============================================================================
-// UPDATED cmd_build
+// UPDATED cmd_build – now links the .ll directly (no separate llc step)
+// and includes system library paths discovered by find_llvm_tools().
 // ============================================================================
 fn cmd_build(
     file: &str,
@@ -946,41 +947,6 @@ fn cmd_build(
     };
 
     // -------------------------------------------------------------------------
-    // Compile .ll to object file using llc (only if the binary is actually llc)
-    // -------------------------------------------------------------------------
-    let obj_path = out_dir.join(format!("{}.o", file_name));
-    let mut use_obj = false;
-    if let Some(llc_name) = llvm_tools.llc.file_name().and_then(|s| s.to_str()) {
-        if llc_name == "llc" || llc_name == "llc.exe" {
-            let mut llc_cmd = Command::new(&llvm_tools.llc);
-            llc_cmd
-                .arg(&debug_ir_path)
-                .arg("-filetype=obj")
-                .arg("-o")
-                .arg(&obj_path);
-            if !target.is_empty() {
-                llc_cmd.arg("-mtriple").arg(target);
-            }
-            if llc_cmd.status().map(|s| s.success()).unwrap_or(false) {
-                use_obj = true;
-            } else {
-                eprintln!("Warning: llc failed, falling back to linking .ll directly.");
-                let _ = fs::remove_file(&obj_path);
-            }
-        } else {
-            eprintln!("Warning: llc not found, linking .ll directly.");
-        }
-    } else {
-        eprintln!("Warning: llc not found, linking .ll directly.");
-    }
-
-    let input_for_link = if use_obj {
-        obj_path.clone()
-    } else {
-        debug_ir_path.clone()
-    };
-
-    // -------------------------------------------------------------------------
     // Determine the linker based on the detected backend (after SDK check)
     // -------------------------------------------------------------------------
     let (linker, linker_is_hip) = match detected_backend {
@@ -1001,12 +967,36 @@ fn cmd_build(
     };
 
     let mut link_cmd = Command::new(&linker);
-    link_cmd.arg(&input_for_link).arg("-o").arg(&exe_path);
+
+    // ---- Link directly from .ll (as in 0.4) ----
+    link_cmd.arg(&debug_ir_path).arg("-o").arg(&exe_path);
+
     let mut link_args = Vec::new();
 
     // Add discovered system library paths (Windows SDK, MSVC, etc.) as -L flags.
-    // This is critical for Windows linking where the LIB environment variable might be incomplete.
-    for lib_path in &llvm_tools.system_libs {
+    // If discovery returns empty, fall back to common paths.
+    let mut system_libs = llvm_tools.system_libs.clone();
+    if system_libs.is_empty() {
+        // Fallback: try to add typical Windows SDK paths
+        #[cfg(target_os = "windows")]
+        {
+            let candidates = [
+                r"C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\um\x64",
+                r"C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0\um\x64",
+                r"C:\Program Files (x86)\Windows Kits\10\Lib\10.0.17763.0\um\x64",
+                r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.39.33519\lib\x64",
+            ];
+            for c in candidates {
+                let p = PathBuf::from(c);
+                if p.exists() {
+                    system_libs.push(p);
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {}
+    }
+    for lib_path in &system_libs {
         link_cmd.arg("-L").arg(lib_path);
     }
 
@@ -1094,7 +1084,7 @@ fn cmd_build(
         }
     }
 
-    // Standard system libraries
+    // Standard system libraries – exactly as in 0.4
     if target_triple.contains("msvc") {
         link_args.extend(vec![
             "-lmsvcrt".to_string(),
@@ -1141,7 +1131,10 @@ fn cmd_build(
                 }
             }
             "hip" => {
-                // hipcc adds its own flags; nothing extra needed.
+                // hipcc adds its own flags; but we still need to link the HIP runtime
+                link_args.push("-lamdhip64".to_string());
+                // Do NOT add -I or -L flags here – hipcc already knows where HIP is.
+                // Adding them causes "unused command-line argument" warnings.
             }
             _ => {}
         }
@@ -1167,9 +1160,6 @@ fn cmd_build(
         Ok(status) if status.success() => {
             println!("SUCCESS: Native binary compiled -> {}", exe_path.display());
             let _ = fs::remove_file(&debug_ir_path);
-            if use_obj {
-                let _ = fs::remove_file(&obj_path);
-            }
             diagnostic::exit_code::SUCCESS
         }
         Ok(status) => {
