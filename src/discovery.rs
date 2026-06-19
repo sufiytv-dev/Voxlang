@@ -3,6 +3,7 @@
 use crate::diagnostic::debug_log;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct LlvmPaths {
@@ -28,12 +29,153 @@ pub struct GpuSdk {
     pub version: String,
 }
 
+// ============================================================================
+// Windows system library discovery (MSVC + Windows SDK)
+// ============================================================================
+
+/// Try to locate Visual Studio and Windows SDK library paths using `vswhere`.
+#[cfg(target_os = "windows")]
+fn find_vs_paths_via_vswhere() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    // Try to find vswhere in common locations
+    let vswhere_candidates = [
+        r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\vswhere.exe",
+        r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\vswhere.exe",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\Tools\vswhere.exe",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\vswhere.exe",
+    ];
+
+    let vswhere_path = vswhere_candidates
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(PathBuf::from);
+
+    let vswhere = match vswhere_path {
+        Some(p) => p,
+        None => {
+            debug_log("[DISCOVERY] vswhere not found, falling back to static paths.");
+            return paths;
+        }
+    };
+
+    // Get the installation path of the latest VS
+    let output = Command::new(&vswhere)
+        .args(&[
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output();
+
+    let install_path = match output {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() {
+                return paths;
+            }
+            PathBuf::from(s)
+        }
+        _ => return paths,
+    };
+
+    // Find MSVC toolchain version directory
+    let vc_tools_root = install_path.join("VC").join("Tools").join("MSVC");
+    if let Ok(entries) = std::fs::read_dir(&vc_tools_root) {
+        let mut versions: Vec<(String, PathBuf)> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Version directories are like "14.39.33519"
+                if name.chars().any(|c| c.is_ascii_digit()) {
+                    Some((name, e.path()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by version descending (semver-like)
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some((_, version_dir)) = versions.first() {
+            let lib_x64 = version_dir.join("lib").join("x64");
+            if lib_x64.exists() {
+                debug_log(&format!(
+                    "[DISCOVERY] Found MSVC libs in {}",
+                    lib_x64.display()
+                ));
+                paths.push(lib_x64);
+            }
+        }
+    }
+
+    // Find Windows SDK paths
+    let kits_root = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Lib");
+    if let Ok(entries) = std::fs::read_dir(&kits_root) {
+        let mut versions: Vec<(String, PathBuf)> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Version directories like "10.0.22621.0"
+                if name.starts_with("10.") && name.contains('.') {
+                    Some((name, e.path()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by version descending (version tuple comparison)
+        versions.sort_by(|a, b| {
+            let a_parts: Vec<u32> = a.0.split('.').filter_map(|s| s.parse().ok()).collect();
+            let b_parts: Vec<u32> = b.0.split('.').filter_map(|s| s.parse().ok()).collect();
+            b_parts.cmp(&a_parts)
+        });
+
+        if let Some((_, version_dir)) = versions.first() {
+            let ucrt_x64 = version_dir.join("ucrt").join("x64");
+            let um_x64 = version_dir.join("um").join("x64");
+            if ucrt_x64.exists() {
+                debug_log(&format!(
+                    "[DISCOVERY] Found UCRT libs in {}",
+                    ucrt_x64.display()
+                ));
+                paths.push(ucrt_x64);
+            }
+            if um_x64.exists() {
+                debug_log(&format!(
+                    "[DISCOVERY] Found Windows SDK um libs in {}",
+                    um_x64.display()
+                ));
+                paths.push(um_x64);
+            }
+        }
+    }
+
+    paths
+}
+
 /// Dynamic discovery for Windows MSVC and Windows SDK lib targets.
 #[cfg(target_os = "windows")]
 fn find_windows_system_libs() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    // First attempt with vswhere
+    let mut paths = find_vs_paths_via_vswhere();
 
-    // 1. Probe for MSVC Toolchain Libs (VS 2022 Editions)
+    // If we found some paths, return them (they should be sufficient)
+    if !paths.is_empty() {
+        return paths;
+    }
+
+    // Fallback: static hardcoded paths for common VS 2022 editions and Windows SDK
+    debug_log("[DISCOVERY] vswhere failed or no paths found, falling back to static paths.");
+
+    // MSVC Toolchain Libs (VS 2022 Editions)
     let vs_editions = ["Community", "BuildTools", "Professional", "Enterprise"];
     for edition in &vs_editions {
         let base_msvc = format!(
@@ -47,10 +189,14 @@ fn find_windows_system_libs() -> Vec<PathBuf> {
                 .filter(|p| p.is_dir())
                 .collect();
 
-            versions.sort(); // Sorts alphabetically to grab highest version folder
+            versions.sort(); // alphabetical, but version numbers are lexicographically similar
             if let Some(highest_version) = versions.last() {
                 let lib_x64 = highest_version.join(r"lib\x64");
                 if lib_x64.exists() {
+                    debug_log(&format!(
+                        "[DISCOVERY] Found MSVC libs in {}",
+                        lib_x64.display()
+                    ));
                     paths.push(lib_x64);
                     break;
                 }
@@ -58,7 +204,7 @@ fn find_windows_system_libs() -> Vec<PathBuf> {
         }
     }
 
-    // 2. Probe for Windows SDK Libs (User Mode and Universal CRT)
+    // Windows SDK Libs (User Mode and Universal CRT)
     let sdk_base = r"C:\Program Files (x86)\Windows Kits\10\Lib";
     if let Ok(entries) = std::fs::read_dir(sdk_base) {
         let mut versions: Vec<PathBuf> = entries
@@ -72,9 +218,17 @@ fn find_windows_system_libs() -> Vec<PathBuf> {
             let ucrt_x64 = highest_version.join(r"ucrt\x64");
             let um_x64 = highest_version.join(r"um\x64");
             if ucrt_x64.exists() {
+                debug_log(&format!(
+                    "[DISCOVERY] Found UCRT libs in {}",
+                    ucrt_x64.display()
+                ));
                 paths.push(ucrt_x64);
             }
             if um_x64.exists() {
+                debug_log(&format!(
+                    "[DISCOVERY] Found Windows SDK um libs in {}",
+                    um_x64.display()
+                ));
                 paths.push(um_x64);
             }
         }
@@ -82,6 +236,10 @@ fn find_windows_system_libs() -> Vec<PathBuf> {
 
     paths
 }
+
+// ============================================================================
+// LLVM tool detection
+// ============================================================================
 
 /// Auto‑detect LLVM tools (clang, llc, lld).
 pub fn find_llvm_tools() -> Result<LlvmPaths, String> {

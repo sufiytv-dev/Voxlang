@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::diagnostic::debug_log;
 use crate::std::walkdir::WalkDir;
 
 pub mod frontend {
@@ -863,8 +864,7 @@ fn cmd_test(path_str: &str, config: &CacheConfig) -> i32 {
 }
 
 // ============================================================================
-// UPDATED cmd_build – now links the .ll directly (no separate llc step)
-// and includes system library paths discovered by find_llvm_tools().
+// UPDATED cmd_build with robust library generation and absolute paths
 // ============================================================================
 fn cmd_build(
     file: &str,
@@ -966,40 +966,6 @@ fn cmd_build(
         _ => (llvm_tools.clang, false),
     };
 
-    let mut link_cmd = Command::new(&linker);
-
-    // ---- Link directly from .ll (as in 0.4) ----
-    link_cmd.arg(&debug_ir_path).arg("-o").arg(&exe_path);
-
-    let mut link_args = Vec::new();
-
-    // Add discovered system library paths (Windows SDK, MSVC, etc.) as -L flags.
-    // If discovery returns empty, fall back to common paths.
-    let mut system_libs = llvm_tools.system_libs.clone();
-    if system_libs.is_empty() {
-        // Fallback: try to add typical Windows SDK paths
-        #[cfg(target_os = "windows")]
-        {
-            let candidates = [
-                r"C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\um\x64",
-                r"C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0\um\x64",
-                r"C:\Program Files (x86)\Windows Kits\10\Lib\10.0.17763.0\um\x64",
-                r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.39.33519\lib\x64",
-            ];
-            for c in candidates {
-                let p = PathBuf::from(c);
-                if p.exists() {
-                    system_libs.push(p);
-                }
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {}
-    }
-    for lib_path in &system_libs {
-        link_cmd.arg("-L").arg(lib_path);
-    }
-
     let target_triple = if target.contains("windows") && target.contains("msvc") {
         "x86_64-pc-windows-msvc"
     } else if target.contains("windows") && target.contains("gnu") {
@@ -1067,9 +1033,53 @@ fn cmd_build(
         }
     }
 
-    link_args.push(format!("-L{}", cache_dir.to_string_lossy()));
-    link_args.push(format!("-l{}", lib_name));
+    // -------------------------------------------------------------------------
+    // Verify that the library exists; if not, abort with clear error.
+    // -------------------------------------------------------------------------
+    if !static_lib.exists() {
+        eprintln!(
+            "Error: Static library '{}' was not generated.",
+            static_lib.display()
+        );
+        return diagnostic::exit_code::LINKER_ERROR;
+    }
 
+    // -------------------------------------------------------------------------
+    // Build the linker command
+    // -------------------------------------------------------------------------
+    let mut link_cmd = Command::new(&linker);
+
+    // Link directly from .ll (as in 0.4)
+    link_cmd.arg(&debug_ir_path).arg("-o").arg(&exe_path);
+
+    // Set the target triple explicitly (important for Windows)
+    link_cmd.arg("-target").arg(target);
+
+    // Use absolute paths for -L to avoid path resolution issues
+    let cache_dir_abs = cache_dir.canonicalize().unwrap_or(cache_dir);
+    link_cmd.arg(&format!("-L{}", cache_dir_abs.display()));
+
+    // Add system library paths to LIB environment variable instead of -L (to avoid quoting issues)
+    let mut lib_paths = Vec::new();
+    if let Ok(current_lib) = env::var("LIB") {
+        if !current_lib.is_empty() {
+            lib_paths.push(current_lib);
+        }
+    }
+
+    // Add discovered system library paths
+    for p in &llvm_tools.system_libs {
+        if let Some(s) = p.to_str() {
+            lib_paths.push(s.to_string());
+        }
+    }
+
+    // Add cache dir absolute path to LIB
+    if let Some(s) = cache_dir_abs.to_str() {
+        lib_paths.push(s.to_string());
+    }
+
+    // Add rustlib path if available
     if let Some(sysroot) = std::process::Command::new("rustc")
         .arg("--print")
         .arg("sysroot")
@@ -1078,44 +1088,48 @@ fn cmd_build(
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_string())
     {
-        let lib_path = format!("{}/lib/rustlib/{}/lib", sysroot, target_triple);
-        if Path::new(&lib_path).exists() {
-            link_args.push(format!("-L{}", lib_path));
+        let lib_path = format!("{}/lib/rustlib/{}/lib", sysroot, target);
+        let lib_path_abs = Path::new(&lib_path);
+        if lib_path_abs.exists() {
+            if let Some(s) = lib_path_abs.to_str() {
+                lib_paths.push(s.to_string());
+            }
+            link_cmd.arg(&format!("-L{}", lib_path_abs.display()));
         }
     }
 
+    // Set LIB environment variable for the linker
+    unsafe {
+        env::set_var("LIB", lib_paths.join(";"));
+    }
+    debug_log("[DISCOVERY] Set LIB environment variable for linking.");
+
+    // Link against vox_rt
+    link_cmd.arg("-lvox_rt");
+
     // Standard system libraries – exactly as in 0.4
     if target_triple.contains("msvc") {
-        link_args.extend(vec![
-            "-lmsvcrt".to_string(),
-            "-loldnames".to_string(),
-            "-lkernel32".to_string(),
-            "-lntdll".to_string(),
-            "-lucrt".to_string(),
-            "-lbcrypt".to_string(),
-            "-lws2_32".to_string(),
-            "-luserenv".to_string(),
-            "-lsecur32".to_string(),
-            "-liphlpapi".to_string(),
-        ]);
-    } else if target_triple.contains("windows") && target_triple.contains("gnu") {
-        link_args.extend(vec![
-            "-lstdc++".to_string(),
-            "-lpthread".to_string(),
-            "-lmingw32".to_string(),
-            "-lgcc_s".to_string(),
-            "-lgcc".to_string(),
-        ]);
-    } else {
-        link_args.extend(vec![
-            "-lstdc++".to_string(),
-            "-lpthread".to_string(),
-            "-lm".to_string(),
-        ]);
-    }
-
-    if target_triple.contains("msvc") {
         link_cmd.arg("-Wl,/NODEFAULTLIB:libcmt");
+        link_cmd.arg("-lmsvcrt");
+        link_cmd.arg("-loldnames");
+        link_cmd.arg("-lkernel32");
+        link_cmd.arg("-lntdll");
+        link_cmd.arg("-lucrt");
+        link_cmd.arg("-lbcrypt");
+        link_cmd.arg("-lws2_32");
+        link_cmd.arg("-luserenv");
+        link_cmd.arg("-lsecur32");
+        link_cmd.arg("-liphlpapi");
+    } else if target_triple.contains("windows") && target_triple.contains("gnu") {
+        link_cmd.arg("-lstdc++");
+        link_cmd.arg("-lpthread");
+        link_cmd.arg("-lmingw32");
+        link_cmd.arg("-lgcc_s");
+        link_cmd.arg("-lgcc");
+    } else {
+        link_cmd.arg("-lstdc++");
+        link_cmd.arg("-lpthread");
+        link_cmd.arg("-lm");
     }
 
     // -------------------------------------------------------------------------
@@ -1125,27 +1139,29 @@ fn cmd_build(
         match backend {
             "cuda" => {
                 if let Some(sdk) = discovery::find_cuda_sdk() {
-                    link_cmd.arg("-L").arg(&sdk.lib_path);
-                    link_args.push("-lcuda".to_string());
-                    link_args.push("-lcudart".to_string());
+                    // Add CUDA lib to LIB and -L
+                    if let Some(s) = sdk.lib_path.to_str() {
+                        unsafe {
+                            let current = env::var("LIB").unwrap_or_default();
+                            env::set_var("LIB", format!("{};{}", current, s));
+                        }
+                        link_cmd.arg(&format!("-L{}", sdk.lib_path.display()));
+                    }
+                    link_cmd.arg("-lcuda");
+                    link_cmd.arg("-lcudart");
                 }
             }
             "hip" => {
-                // hipcc adds its own flags; but we still need to link the HIP runtime
-                link_args.push("-lamdhip64".to_string());
-                // Do NOT add -I or -L flags here – hipcc already knows where HIP is.
-                // Adding them causes "unused command-line argument" warnings.
+                // hipcc adds its own flags; we just need to link the HIP runtime
+                link_cmd.arg("-lamdhip64");
             }
             _ => {}
         }
     }
 
-    for arg in link_args {
-        link_cmd.arg(arg);
-    }
-
     if target.contains("windows") {
-        link_cmd.arg("-luser32").arg("-Wl,-subsystem:console");
+        link_cmd.arg("-luser32");
+        link_cmd.arg("-Wl,-subsystem:console");
     } else if target.contains("linux") || target.contains("darwin") {
         link_cmd.arg("-lm");
     }
