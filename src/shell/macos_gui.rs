@@ -1,5 +1,6 @@
 // src/shell/macos_gui.rs – Native macOS GUI
 // FINAL: Polished layout, throttle debounce, fixed null_mut type inference.
+// FIX: Replaced objc_msgSend_stret with objc_msgSend for arm64 compatibility.
 
 #![allow(
     non_snake_case,
@@ -48,7 +49,8 @@ macro_rules! debug_log {
 #[allow(clashing_extern_declarations)]
 unsafe extern "C" {
     fn objc_msgSend(obj: id, sel: SEL, ...) -> id;
-    fn objc_msgSend_stret(ret: *mut c_void, obj: id, sel: SEL, ...) -> id;
+    // NOTE: objc_msgSend_stret is removed – on arm64 it does not exist.
+    // We use objc_msgSend directly with a cast for rect-returning selectors.
     fn objc_msgSendSuper(obj: *mut objc_super, sel: SEL, ...) -> id;
 
     // Explicit f64 binding for setMinValue:, setMaxValue:, setDoubleValue:
@@ -93,18 +95,19 @@ type NSModalResponse = NSInteger;
 mod objc_sys {
     use super::*;
     #[repr(C)]
-    #[derive(Debug)]
+    #[derive(Debug, Copy, Clone)]
     pub struct NSPoint {
         pub x: CGFloat,
         pub y: CGFloat,
     }
     #[repr(C)]
-    #[derive(Debug)]
+    #[derive(Debug, Copy, Clone)]
     pub struct NSSize {
         pub width: CGFloat,
         pub height: CGFloat,
     }
     #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
     pub struct NSRect {
         pub origin: NSPoint,
         pub size: NSSize,
@@ -119,16 +122,17 @@ struct objc_super {
 }
 
 // ============================================================================
-// Helper: call objc_msgSend_stret for selectors returning NSRect
+// Helper: call objc_msgSend for selectors returning NSRect
 // ============================================================================
 
-unsafe fn rect_for_selector_stret(obj: id, sel: SEL) -> NSRect {
+unsafe fn msg_send_rect(obj: id, sel: SEL) -> NSRect {
     if obj == ptr::null_mut() {
-        panic!("rect_for_selector_stret: obj is null");
+        panic!("msg_send_rect: obj is null");
     }
-    let mut rect: NSRect = std::mem::zeroed();
-    objc_msgSend_stret(&mut rect as *mut NSRect as *mut c_void, obj, sel);
-    rect
+    // Cast objc_msgSend to the correct function pointer type that returns NSRect.
+    type ObjCMsgSendRect = unsafe extern "C" fn(id, SEL) -> NSRect;
+    let f: ObjCMsgSendRect = std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel)
 }
 
 // ============================================================================
@@ -204,7 +208,7 @@ macro_rules! msg_send_rect {
         if $obj == ptr::null_mut() {
             panic!("msg_send_rect: object is null");
         }
-        rect_for_selector_stret($obj, $sel)
+        msg_send_rect($obj, $sel)
     }};
 }
 macro_rules! msg_send_id {
