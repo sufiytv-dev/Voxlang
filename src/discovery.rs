@@ -19,13 +19,21 @@ pub struct GpuPaths {
     pub cuda_path: Option<PathBuf>,
 }
 
-/// SDK information for GPU backends (CUDA or HIP/ROCm).
+/// SDK information for GPU backends (CUDA, HIP, or Metal).
 #[derive(Debug, Clone)]
 pub struct GpuSdk {
-    pub backend: String, // "cuda" or "hip"
+    pub backend: String, // "cuda", "hip", or "metal"
     pub bin_path: PathBuf,
     pub lib_path: PathBuf,
     pub include_path: Option<PathBuf>,
+    pub version: String,
+}
+
+/// Metal-specific SDK information.
+#[derive(Debug, Clone)]
+pub struct MetalSdk {
+    pub metal_path: PathBuf,
+    pub metallib_path: PathBuf,
     pub version: String,
 }
 
@@ -385,7 +393,7 @@ pub fn find_llvm_tools() -> Result<LlvmPaths, String> {
 // GPU SDK Detection (dynamic version scanning with environment priority)
 // -----------------------------------------------------------------------------
 
-/// Detect the installed GPU SDK (CUDA or ROCm) by scanning common paths.
+/// Detect the installed GPU SDK (CUDA, HIP, or Metal) by scanning common paths.
 /// Returns `Some(GpuSdk)` with the highest version found, or `None` if none installed.
 pub fn find_gpu_sdk() -> Option<GpuSdk> {
     // 1. Check environment variables first (user override)
@@ -402,6 +410,20 @@ pub fn find_gpu_sdk() -> Option<GpuSdk> {
             hip.bin_path.display()
         ));
         return Some(hip);
+    }
+    // Check for Metal via environment (optional)
+    if let Some(metal) = find_metal_sdk_from_env() {
+        debug_log(format!(
+            "[DISCOVERY] Using Metal from METAL_PATH: {}",
+            metal.metal_path.display()
+        ));
+        return Some(GpuSdk {
+            backend: "metal".to_string(),
+            bin_path: metal.metal_path.parent().unwrap().to_path_buf(),
+            lib_path: PathBuf::new(), // not used for Metal
+            include_path: None,
+            version: metal.version,
+        });
     }
 
     // 2. Fallback to scanning common directories
@@ -420,6 +442,21 @@ pub fn find_gpu_sdk() -> Option<GpuSdk> {
             hip.bin_path.display()
         ));
         return Some(hip);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(metal) = find_metal_sdk() {
+        debug_log(format!(
+            "[DISCOVERY] Found Metal version {} at {}",
+            metal.version,
+            metal.metal_path.display()
+        ));
+        return Some(GpuSdk {
+            backend: "metal".to_string(),
+            bin_path: metal.metal_path.parent().unwrap().to_path_buf(),
+            lib_path: PathBuf::new(),
+            include_path: None,
+            version: metal.version,
+        });
     }
 
     debug_log("[DISCOVERY] No GPU SDK detected.");
@@ -660,7 +697,147 @@ fn scan_hip_versions(base: &Path) -> Option<GpuSdk> {
 }
 
 // -----------------------------------------------------------------------------
-// Legacy GPU backend finder (now uses the new detection)
+// Metal SDK Detection (macOS only)
+// -----------------------------------------------------------------------------
+
+/// Find Metal SDK (macOS only). Checks environment variable METAL_PATH, then uses xcrun, then PATH.
+pub fn find_metal_sdk() -> Option<MetalSdk> {
+    #[cfg(target_os = "macos")]
+    {
+        // 1. Environment variable override
+        if let Some(sdk) = find_metal_sdk_from_env() {
+            return Some(sdk);
+        }
+        // 2. Use xcrun to locate metal and metallib
+        if let Some(metal_path) = find_tool_via_xcrun("metal") {
+            if let Some(metallib_path) = find_tool_via_xcrun("metallib") {
+                // Get version directly from metal -version output
+                let version = if let Ok(output) = Command::new(&metal_path).arg("-version").output()
+                {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .next()
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let version = version.unwrap_or_else(|| "unknown".to_string());
+                debug_log(&format!(
+                    "[DISCOVERY] Found Metal via xcrun: metal={}, metallib={}, version={}",
+                    metal_path.display(),
+                    metallib_path.display(),
+                    version
+                ));
+                return Some(MetalSdk {
+                    metal_path,
+                    metallib_path,
+                    version,
+                });
+            }
+        }
+        // 3. Fallback to PATH
+        if let Some(metal_path) = which_in_path("metal") {
+            if let Some(metallib_path) = which_in_path("metallib") {
+                let version = if let Ok(output) = Command::new(&metal_path).arg("-version").output()
+                {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .next()
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let version = version.unwrap_or_else(|| "unknown".to_string());
+                debug_log(&format!(
+                    "[DISCOVERY] Found Metal in PATH: metal={}, metallib={}, version={}",
+                    metal_path.display(),
+                    metallib_path.display(),
+                    version
+                ));
+                return Some(MetalSdk {
+                    metal_path,
+                    metallib_path,
+                    version,
+                });
+            }
+        }
+        debug_log("[DISCOVERY] Metal SDK not found.");
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        debug_log("[DISCOVERY] Metal SDK is only available on macOS.");
+        None
+    }
+}
+
+/// Check METAL_PATH environment variable for Metal SDK.
+fn find_metal_sdk_from_env() -> Option<MetalSdk> {
+    if let Ok(path) = env::var("METAL_PATH") {
+        let base = PathBuf::from(&path);
+        if base.exists() {
+            let metal_path = base
+                .join("metal")
+                .with_extension(env::consts::EXE_EXTENSION);
+            let metallib_path = base
+                .join("metallib")
+                .with_extension(env::consts::EXE_EXTENSION);
+            if metal_path.exists() && metallib_path.exists() {
+                let version = if let Ok(output) = Command::new(&metal_path).arg("-version").output()
+                {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .next()
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let version = version.unwrap_or_else(|| "unknown".to_string());
+                return Some(MetalSdk {
+                    metal_path,
+                    metallib_path,
+                    version,
+                });
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn find_tool_via_xcrun(tool: &str) -> Option<PathBuf> {
+    let output = Command::new("xcrun")
+        .args(&["-sdk", "macosx", "-find", tool])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path_str = stdout.trim();
+    if path_str.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(path_str);
+    if path.exists() { Some(path) } else { None }
+}
+
+/// Simple `which`-like function searching PATH.
+#[cfg(target_os = "macos")]
+fn which_in_path(name: &str) -> Option<PathBuf> {
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let candidate = dir.join(name).with_extension(env::consts::EXE_EXTENSION);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+// -----------------------------------------------------------------------------
+// Legacy GPU backend finder (kept for compatibility)
 // -----------------------------------------------------------------------------
 
 /// Auto‑detect GPU backends (legacy wrapper, kept for compatibility).

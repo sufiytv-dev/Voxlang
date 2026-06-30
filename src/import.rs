@@ -54,18 +54,9 @@ pub fn resolve_imports(node: &ASTNode, resolver: &mut ModuleResolver) -> (ASTNod
             }
         }
 
-        ASTNode::StructDef {
-            name,
-            fields,
-            span,
-            generic_params,
-        } => (node.clone(), false),
-        ASTNode::EnumDef {
-            name,
-            variants,
-            span,
-            params,
-        } => (node.clone(), false),
+        // These types are not transformed; we just keep them as-is.
+        ASTNode::StructDef { .. } => (node.clone(), false),
+        ASTNode::EnumDef { .. } => (node.clone(), false),
         ASTNode::TypeAlias { .. } => (node.clone(), false),
         ASTNode::UseDecl { .. } => (node.clone(), false),
 

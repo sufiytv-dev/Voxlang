@@ -1,29 +1,36 @@
 // device.rs - GPU‑specific IR assembly and binary finalization.
 //
 // Contains methods for emitting the device module header, compiling device IR
-// to PTX (NVIDIA) or HSACO (AMD), and detecting kernel functions in the AST.
+// to PTX (NVIDIA), HSACO (AMD), or embedding MSL source (Apple Metal), and detecting
+// kernel functions in the AST.
 //
-// UPDATED (2026-06-14):
-// - Dynamically generates kernel metadata with correct function types.
-// - Captures stderr from llc for detailed error reporting.
-// - Added extensive debug logging.
-// - POST‑PROCESSING: converts explicit pointer types to opaque `ptr` with address spaces.
-// - FIXED NVVM: use function attribute "kernel" placed correctly before '{'.
-// - FIXED NVVM: emit !nvvm.annotations metadata with correct syntax (!0 = !{...}).
-// - IMPROVED: Linker path resolution – searches known locations if self.lld_path is None.
-// - BETTER: Error messages when llc or ld.lld fail.
+// UPDATED (2026-06-29):
+// - Metal backend: now returns the MSL source as a byte string (instead of compiling
+//   to AIR/metallib). The runtime will compile the source on-device using
+//   newLibraryWithSource:options:error: for maximum compatibility.
+// - Added extreme debug logging for MSL generation and source preview.
+// - Removed all invocations of `metal` and `metallib` – no longer needed.
 
-use crate::codegen::CodegenEngine;
+use crate::CodegenEngine;
 use crate::codegen::helpers::create_temp_file;
+use crate::codegen::msl;
 use crate::diagnostic::{Diagnostic, debug_log, emit_diagnostic};
 use crate::parser::ASTNode;
-use std::fs;
+use std::fs::{self};
 use std::path::PathBuf;
 use std::process::Command;
 
 impl CodegenEngine {
     /// Emit the LLVM header for the device module (target triple and datalayout).
+    /// For Metal, this is a no‑op because we generate MSL directly.
     pub(crate) fn emit_global_device_header(&mut self, triple: &str) {
+        if let Some(ref mode) = self.gpu_mode {
+            if mode == "metal" {
+                debug_log("[DEVICE] Skipping LLVM header for Metal backend");
+                return;
+            }
+        }
+
         self.device_ir
             .push_str(&format!("; Device module for {}\n", triple));
         self.device_ir
@@ -45,22 +52,25 @@ impl CodegenEngine {
 
     // ------------------------------------------------------------------------
     // Helper: add "kernel" attribute AND NVVM annotations to each kernel function
+    // (Only used for NVPTX; for Metal we generate MSL directly)
     // ------------------------------------------------------------------------
     fn add_kernel_attributes(&mut self) {
+        if let Some(ref mode) = self.gpu_mode {
+            if mode == "metal" {
+                return;
+            }
+        }
+
         let mut ir = std::mem::take(&mut self.device_ir);
         let mut metadata_nodes = Vec::new();
         let mut idx = 0;
 
         for kernel_name in &self.kernel_names {
-            // Find the function definition line: define void @kernel_name(
             let pattern = format!("define void @{}(", kernel_name);
             if let Some(pos) = ir.find(&pattern) {
-                // Find the end of the line (newline)
                 let line_end = ir[pos..].find('\n').unwrap_or(0) + pos;
                 let line = &ir[pos..line_end];
-                // If the line doesn't already have an attribute group
                 if !line.contains('#') {
-                    // Replace the opening brace with " #0 {"
                     if let Some(brace_pos) = line.find('{') {
                         let new_line = format!("{} #0 {{", &line[..brace_pos]);
                         ir.replace_range(pos..line_end, &new_line);
@@ -68,8 +78,6 @@ impl CodegenEngine {
                 }
             }
 
-            // Extract the function type from the IR to build correct metadata.
-            // Find the function definition line again to parse argument types.
             let def_start = if let Some(p) = ir.find(&pattern) {
                 p
             } else {
@@ -80,8 +88,6 @@ impl CodegenEngine {
                 .map(|p| def_start + p)
                 .unwrap_or(def_start);
             let def_line = &ir[def_start..def_end];
-            // def_line example: "define void @add_kernel(i32 %a, i32 %b, ptr addrspace(1) %result)"
-            // Extract argument types.
             let args_start = def_line.find('(').unwrap() + 1;
             let args_end = def_line.rfind(')').unwrap();
             let args_part = &def_line[args_start..args_end];
@@ -91,7 +97,6 @@ impl CodegenEngine {
                 .collect();
             let type_str = format!("void ({})", arg_tys.join(", "));
 
-            // Correct metadata syntax: !0 = !{ void (i32, i32, ptr addrspace(1))* @add_kernel, !"kernel", i32 1 }
             let metadata = format!(
                 "!{} = !{{ {}* @{}, !\"kernel\", i32 1 }}",
                 idx, type_str, kernel_name
@@ -100,11 +105,8 @@ impl CodegenEngine {
             idx += 1;
         }
 
-        // Append the attribute declaration at the end of the module
         if !self.kernel_names.is_empty() {
             ir.push_str("\nattributes #0 = { \"kernel\" }\n");
-
-            // Emit NVVM annotations metadata
             ir.push_str("\n!nvvm.annotations = !{");
             for i in 0..metadata_nodes.len() {
                 if i > 0 {
@@ -125,7 +127,6 @@ impl CodegenEngine {
 
     /// Helper to locate `ld.lld` if `self.lld_path` is not usable.
     fn find_lld(&self) -> PathBuf {
-        // If we already have a path and it exists, use it.
         if let Some(ref path) = self.lld_path {
             if path.exists() {
                 return path.clone();
@@ -136,16 +137,11 @@ impl CodegenEngine {
             ));
         }
 
-        // Common locations to search for ld.lld on Windows.
         let candidates = vec![
-            // ROCm bin directory (most important for HIP)
             PathBuf::from("C:\\Program Files\\AMD\\ROCm\\7.1\\bin\\ld.lld.exe"),
             PathBuf::from("C:\\Program Files\\AMD\\ROCm\\7.0\\bin\\ld.lld.exe"),
-            // LLVM from scoop
             PathBuf::from("C:\\Users\\Sufiy\\scoop\\apps\\llvm\\current\\bin\\ld.lld.exe"),
-            // Standard LLVM installation
             PathBuf::from("C:\\Program Files\\LLVM\\bin\\ld.lld.exe"),
-            // Just the name (relies on PATH)
             PathBuf::from("ld.lld"),
             PathBuf::from("ld.lld.exe"),
         ];
@@ -157,28 +153,92 @@ impl CodegenEngine {
             }
         }
 
-        // Final fallback – we will try to run "ld.lld" and let the OS search PATH.
         debug_log("[DEVICE] No explicit ld.lld found, will rely on PATH");
         PathBuf::from("ld.lld")
     }
 
     /// Finalize device code by compiling the accumulated device IR to a binary
-    /// (PTX for NVIDIA, HSACO for AMD) and return the binary bytes.
-    pub(crate) fn finalize_device_code(&mut self, triple: &str) -> Option<Vec<u8>> {
+    /// (PTX for NVIDIA, HSACO for AMD) OR returning the MSL source as bytes (Metal).
+    ///
+    /// # Parameters
+    /// - `triple`: device target triple (e.g., "nvptx64-nvidia-cuda", "amdgcn-amd-amdhsa", "metal-apple-macos")
+    /// - `ast`: optional AST node (required for Metal backend to generate MSL).
+    pub(crate) fn finalize_device_code(
+        &mut self,
+        triple: &str,
+        ast: Option<&ASTNode>,
+    ) -> Option<Vec<u8>> {
+        // ----------------------------------------------
+        // Metal backend: generate MSL source and return it as bytes.
+        // The runtime will compile it on-device using newLibraryWithSource:options:error:.
+        // ----------------------------------------------
+        if self.gpu_mode.as_deref() == Some("metal") || triple.contains("metal") {
+            debug_log("[DEVICE] ========== METAL BACKEND ==========");
+            debug_log("[DEVICE] Generating MSL source (will be JIT‑compiled at runtime)");
+
+            let program_ast = match ast {
+                Some(a) => a,
+                None => {
+                    emit_diagnostic(
+                        &Diagnostic::error("No program AST provided for Metal code generation")
+                            .with_code("VX9002"),
+                    );
+                    return None;
+                }
+            };
+
+            let msl_source = msl::generate_msl(self, program_ast);
+            if msl_source.is_empty() {
+                emit_diagnostic(
+                    &Diagnostic::error("Generated MSL source is empty; no kernels found?")
+                        .with_code("VX9003"),
+                );
+                return None;
+            }
+
+            // Log the first 256 chars of MSL for debugging
+            let msl_preview = if msl_source.len() > 256 {
+                format!("{}...", &msl_source[..256])
+            } else {
+                msl_source.clone()
+            };
+            debug_log(&format!("[DEVICE] MSL source preview: {}", msl_preview));
+            debug_log(&format!(
+                "[DEVICE] MSL source length: {} bytes",
+                msl_source.len()
+            ));
+
+            // Save MSL source for debugging.
+            let debug_dir = PathBuf::from("target").join("debug");
+            let _ = std::fs::create_dir_all(&debug_dir);
+            let device_metal_path = debug_dir.join("device.metal");
+            if let Err(e) = fs::write(&device_metal_path, &msl_source) {
+                debug_log(&format!(
+                    "[DEVICE] Warning: could not write device.metal: {}",
+                    e
+                ));
+            } else {
+                debug_log(&format!(
+                    "[DEVICE] Saved MSL to {}",
+                    device_metal_path.display()
+                ));
+            }
+
+            // Return the MSL source as bytes – the runtime will compile it.
+            debug_log("[DEVICE] ========== METAL BACKEND SUCCESS (MSL source embedded) ==========");
+            return Some(msl_source.into_bytes());
+        }
+
+        // ----------------------------------------------
+        // Existing NVIDIA/AMD paths (unchanged below)
+        // ----------------------------------------------
         if self.device_ir.is_empty() {
             debug_log("[DEVICE] No device IR to finalize");
             return None;
         }
 
-        // -----------------------------------------------------------------
-        // Add "kernel" attributes to all kernel functions
-        // -----------------------------------------------------------------
         self.add_kernel_attributes();
 
-        // -----------------------------------------------------------------
-        // POST‑PROCESSING: Convert explicit pointer types to opaque `ptr` with address spaces
-        // This makes the IR compatible with the NVPTX backend.
-        // -----------------------------------------------------------------
         if triple.contains("nvptx") {
             debug_log("[DEVICE] Converting explicit pointer types to opaque pointers for NVPTX");
             let mut ir = std::mem::take(&mut self.device_ir);
@@ -186,20 +246,13 @@ impl CodegenEngine {
             ir = ir.replace("i32 addrspace(1)*", "ptr addrspace(1)");
             ir = ir.replace("i32*", "ptr addrspace(5)");
             ir = ir.replace("i32**", "ptr addrspace(5)");
-            // Also handle any remaining `i8*` that might appear (e.g., from runtime calls)
             ir = ir.replace("i8*", "ptr");
             self.device_ir = ir;
             debug_log("[DEVICE] Pointer conversion complete");
         }
 
         let debug_dir = PathBuf::from("target").join("debug");
-        if let Err(e) = std::fs::create_dir_all(&debug_dir) {
-            emit_diagnostic(
-                &Diagnostic::error(&format!("Failed to create target/debug directory: {}", e))
-                    .with_code("VX0423"),
-            );
-            return None;
-        }
+        let _ = std::fs::create_dir_all(&debug_dir);
 
         let device_ll_path = debug_dir.join("device.ll");
         if let Err(e) = fs::write(&device_ll_path, &self.device_ir) {
@@ -211,7 +264,6 @@ impl CodegenEngine {
             debug_log(format!("Saved device IR to {}", device_ll_path.display()));
         }
 
-        // Create a temporary file for the IR
         let (ir_path, _ir_file) = match create_temp_file("vox_ir", ".ll") {
             Ok(pair) => pair,
             Err(e) => {
@@ -290,8 +342,6 @@ impl CodegenEngine {
                 } else {
                     debug_log(format!("Saved PTX to {}", device_ptx_path.display()));
                 }
-            } else {
-                debug_log("[DEVICE] Could not read PTX binary for debugging");
             }
             let result = match fs::read(&out_path) {
                 Ok(b) => Some(b),
@@ -360,7 +410,6 @@ impl CodegenEngine {
                 return None;
             }
 
-            // Determine the linker executable
             let linker = self.find_lld();
             debug_log(&format!("[DEVICE] Using linker: {}", linker.display()));
 

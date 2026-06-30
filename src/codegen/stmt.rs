@@ -4,7 +4,7 @@
 use crate::codegen::CodegenEngine;
 use crate::comptime::ComptimeEvaluator;
 use crate::diagnostic::{Diagnostic, emit_diagnostic};
-use crate::parser::{ASTNode, KernelAttr, MatchArm, MatchPattern};
+use crate::parser::ASTNode;
 
 // --------------------------------------------------------------------------
 // Permanent debug logging (always enabled)
@@ -123,6 +123,9 @@ impl CodegenEngine {
                         None => (1, 1, 1),
                     };
 
+                    // Reset register counter for this new function
+                    self.reset_for_new_function();
+
                     let mut stub_ir = String::new();
                     stub_ir.push_str(&format!(
                         "define void @{}({}) {{\n",
@@ -131,13 +134,23 @@ impl CodegenEngine {
                     ));
                     stub_ir.push_str("entry:\n");
 
+                    // Allocate a fixed-size array of i8* and get a pointer to its first element
                     let arg_array = self.next_register();
+                    let param_count = params.len();
                     stub_ir.push_str(&format!(
-                        "    {} = alloca i8*, i32 {}, align 8\n",
-                        arg_array,
-                        params.len()
+                        "    {} = alloca [{} x i8*]\n",
+                        arg_array, param_count
+                    ));
+                    let arg_ptr = self.next_register();
+                    stub_ir.push_str(&format!(
+                        "    {} = getelementptr inbounds [{} x i8*], [{} x i8*]* {}, i64 0, i64 0\n",
+                        arg_ptr, param_count, param_count, arg_array
                     ));
 
+                    // ------------------------------------------------------------------
+                    // Store arguments into the array (using arg_ptr for indexing)
+                    // This uses %1 early, ensuring sequential register usage.
+                    // ------------------------------------------------------------------
                     for (i, (param, name_reg)) in params.iter().zip(param_names.iter()).enumerate()
                     {
                         let param_llvm = self.map_type(&param.ty, false);
@@ -155,22 +168,59 @@ impl CodegenEngine {
                         let gep = self.next_register();
                         stub_ir.push_str(&format!(
                             "    {} = getelementptr i8*, i8** {}, i32 {}\n",
-                            gep, arg_array, i
+                            gep, arg_ptr, i
                         ));
                         stub_ir.push_str(&format!("    store i8* {}, i8** {}\n", ptr_to_tmp, gep));
                     }
 
+                    // ------------------------------------------------------------------
+                    // Now allocate and fill the size array (registers continue from
+                    // the last argument store, so numbering remains sequential).
+                    // ------------------------------------------------------------------
+                    let size_array = self.next_register();
+                    stub_ir.push_str(&format!(
+                        "    {} = alloca [{} x i64]\n",
+                        size_array, param_count
+                    ));
+                    let size_ptr = self.next_register();
+                    stub_ir.push_str(&format!(
+                        "    {} = getelementptr inbounds [{} x i64], [{} x i64]* {}, i64 0, i64 0\n",
+                        size_ptr, param_count, param_count, size_array
+                    ));
+
+                    // Fill sizes
+                    for (i, param) in params.iter().enumerate() {
+                        // Strip references for &mut types to get the underlying type size
+                        let vox_ty = if param.ty.starts_with("&mut ") || param.ty.starts_with("& ")
+                        {
+                            &param.ty[param.ty.find(' ').unwrap_or(0) + 1..]
+                        } else {
+                            &param.ty
+                        };
+                        let size = self.size_of_type(vox_ty);
+                        let gep = self.next_register();
+                        stub_ir.push_str(&format!(
+                            "    {} = getelementptr i64, i64* {}, i32 {}\n",
+                            gep, size_ptr, i
+                        ));
+                        stub_ir.push_str(&format!("    store i64 {}, i64* {}\n", size, gep));
+                    }
+
+                    // ------------------------------------------------------------------
+                    // Launch kernel (call uses both arg_ptr and size_ptr)
+                    // ------------------------------------------------------------------
                     let (kernel_name_ptr, ptr_inst) = self.get_string_ptr(name);
                     stub_ir.push_str(&ptr_inst);
                     stub_ir.push('\n');
                     let launch_ret = self.next_register();
                     stub_ir.push_str(&format!(
-                        "    {} = call i32 @vox_launch_kernel_3d(i8* {}, i32 1, i32 1, i32 1, i32 {}, i32 {}, i32 {}, i8** {}, i32 {})\n",
+                        "    {} = call i32 @vox_launch_kernel_3d(i8* {}, i32 1, i32 1, i32 1, i32 {}, i32 {}, i32 {}, i8** {}, i32 {}, i64* {})\n",
                         launch_ret,
                         kernel_name_ptr,
                         block_x, block_y, block_z,
-                        arg_array,
-                        params.len()
+                        arg_ptr,
+                        param_count,
+                        size_ptr
                     ));
 
                     let success_i1 = self.next_register();
@@ -241,6 +291,8 @@ impl CodegenEngine {
                 }
             }
 
+            // ... rest of the file unchanged ...
+            // (All other statement handling remains exactly as before)
             ASTNode::DeviceVarDecl {
                 name, ty, value, ..
             } => {

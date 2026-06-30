@@ -14,34 +14,21 @@ impl CodegenEngine {
         }
     }
 
-    /// Emit a line to the host IR, with logging and block termination management.
+    /// Emit a line to the host IR, with clean logging.
     pub fn debug_emit(&mut self, line: &str) {
-        // Increment line counter for this emission (used for logging)
-        let line_num = self.ir.lines().count() + 1;
-
-        // Capture current function stack (for logging context)
-        let func_stack = self
-            .current_function_stack
-            .last()
-            .map(|s| s.as_str())
-            .unwrap_or("<none>");
-        let stack_depth = self.current_function_stack.len();
-
-        // Log every line with full context if global debug is enabled
+        // Log the IR line with a simple [IR] prefix
         if crate::diagnostic::global_debug() {
-            crate::diagnostic::debug_log(format!(
-                "[IR:{:04}] [depth:{}] [func:{:?}] [term:{}] emitting: {}",
-                line_num, stack_depth, func_stack, self.block_terminated, line
-            ));
+            crate::diagnostic::debug_log(format!("[IR] {}", line));
         }
 
-        // Special attention for closing braces – always log, with [CODEGEN] prefix
+        // Special handling for closing braces – log separately
         if line.trim() == "}" {
-            let msg = format!(
-                "[CODEGEN] >>>> CLOSING BRACE for function '{}' at IR line: {} (stack depth: {}) <<<<",
-                func_stack, line_num, stack_depth
-            );
-            self.brace_emission_log.push(msg.clone());
+            let func_stack = self
+                .current_function_stack
+                .last()
+                .map(|s| s.as_str())
+                .unwrap_or("<none>");
+            let msg = format!("[CODEGEN] Closing brace for function '{}'", func_stack);
             crate::diagnostic::debug_log(msg);
         }
 
@@ -50,28 +37,18 @@ impl CodegenEngine {
             self.block_terminated = false;
         }
         if line.trim() == "}" {
-            // When we close a function, the next block is not terminated yet
             self.block_terminated = false;
         }
 
         // Append the line to IR
         self.ir.push_str(line);
         self.ir.push('\n');
-
-        // After appending, if we just closed a function, dump the last 3 lines of IR
-        if line.trim() == "}" && crate::diagnostic::global_debug() {
-            let last_lines: Vec<&str> = self.ir.lines().rev().take(3).collect();
-            crate::diagnostic::debug_log(format!(
-                "[CODEGEN] >>> IR snapshot after closing brace:\n{}",
-                last_lines.join("\n")
-            ));
-        }
     }
 
-    /// Emit a line to the device IR, with logging.
+    /// Emit a line to the device IR, with clean logging.
     pub fn debug_emit_device(&mut self, line: &str) {
         if crate::diagnostic::global_debug() {
-            crate::diagnostic::debug_log(format!("[CODEGEN:device] {}", line));
+            crate::diagnostic::debug_log(format!("[IR:device] {}", line));
         }
         self.device_ir.push_str(line);
         self.device_ir.push('\n');

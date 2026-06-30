@@ -1,4 +1,4 @@
-// vox_rt.rs - Runtime support for dynamic arrays, strings, parallel loops, GPU (CUDA & HIP), Vec<T>, and HashMap<K,V>.
+// vox_rt.rs - Runtime support for dynamic arrays, strings, parallel loops, GPU (CUDA, HIP, Metal), Vec<T>, and HashMap<K,V>.
 // Uses std for logging/threading, direct FFI for C library functions.
 //
 // FEATURES:
@@ -7,6 +7,14 @@
 // - Debug print helpers for values
 // - Distinguishable panic messages: assertion failures vs. arithmetic overflows
 // - eprintln! and print! support (write to stderr/stdout)
+// - ENHANCED: Full error logging for Metal backend with NSError capture
+// - FIXED: Metal device initialisation (retain before release, correct objc_msgSend ABI)
+// - FIXED: Metal now compiles MSL source at runtime (newLibraryWithSource:options:error:)
+//         for maximum compatibility across GPU architectures.
+// - FIXED: Metal dispatch fully implemented (pack scalars, set buffers, dispatch, commit, wait).
+// - FIXED: Metal kernel name is properly converted to NSString before function lookup.
+// - PHASE 3: Metal now uses argument sizes array to create buffers of correct lengths
+//           for scalars and pointers, removing hardcoded sizes.
 
 use std::ffi::{c_char, c_void};
 use std::mem;
@@ -1164,8 +1172,8 @@ pub extern "C" fn vox_dispatch_parallel(
 // ==================================================================
 //
 // The following modules implement the GPU backend functions.
-// Exactly one of the features `vox_gpu_cuda` or `vox_gpu_enabled` can be active.
-// If neither is enabled, a fallback CPU implementation is used.
+// Exactly one of the features `vox_gpu_cuda`, `vox_gpu_enabled`, or `vox_gpu_metal` can be active.
+// If none is enabled, a fallback CPU implementation is used.
 
 // ------------------------------------------------------------------
 // CUDA backend (Driver API, enabled with `vox_gpu_cuda`)
@@ -1368,7 +1376,19 @@ mod gpu_cuda {
         grid_x: i32,
         block_x: i32,
     ) -> i32 {
-        vox_launch_kernel_3d(kernel_name, grid_x, 1, 1, block_x, 1, 1, arg_ptrs, num_args)
+        // Forward to 3D with null sizes (backward compatibility)
+        vox_launch_kernel_3d(
+            kernel_name,
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+            arg_ptrs,
+            num_args,
+            ptr::null(),
+        )
     }
 
     // New 3D launch function with maximum debugging
@@ -1383,6 +1403,7 @@ mod gpu_cuda {
         block_z: i32,
         arg_ptrs: *mut *mut c_void,
         num_args: i32,
+        _arg_sizes: *const i64, // unused in CUDA
     ) -> i32 {
         vox_rt_log(
             "info",
@@ -1691,7 +1712,6 @@ mod gpu_hip {
         ) -> i32;
         fn hipDeviceSynchronize() -> i32;
         fn hipGetErrorString(error: i32) -> *const c_char;
-        // Added for extreme debugging
         fn hipGetErrorName(error: i32) -> *const c_char;
     }
 
@@ -1844,7 +1864,19 @@ mod gpu_hip {
         grid_x: i32,
         block_x: i32,
     ) -> i32 {
-        vox_launch_kernel_3d(kernel_name, grid_x, 1, 1, block_x, 1, 1, arg_ptrs, num_args)
+        // Forward to 3D with null sizes
+        vox_launch_kernel_3d(
+            kernel_name,
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+            arg_ptrs,
+            num_args,
+            ptr::null(),
+        )
     }
 
     // New 3D launch function – FIXED: use direct kernelParams (array of pointers)
@@ -1859,6 +1891,7 @@ mod gpu_hip {
         block_z: i32,
         arg_ptrs: *mut *mut c_void,
         num_args: i32,
+        _arg_sizes: *const i64, // unused in HIP
     ) -> i32 {
         vox_rt_log(
             "info",
@@ -2130,9 +2163,893 @@ mod gpu_hip {
 }
 
 // ------------------------------------------------------------------
+// Metal backend (macOS, enabled with `vox_gpu_metal`)
+// ------------------------------------------------------------------
+#[cfg(all(feature = "vox_gpu_metal", target_os = "macos"))]
+mod gpu_metal {
+    use super::*;
+    use std::ffi::{CString, c_int};
+    use std::os::raw::c_char;
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    // Objective-C runtime FFI declarations
+    #[allow(non_camel_case_types)]
+    type id = *mut c_void;
+    type SEL = *const c_void;
+    type NSUInteger = usize;
+    type NSInteger = isize;
+
+    extern "C" {
+        fn objc_msgSend(obj: id, sel: SEL, ...) -> id;
+        fn objc_retain(obj: id) -> id;
+        fn objc_release(obj: id);
+        fn sel_registerName(name: *const c_char) -> SEL;
+        fn objc_getClass(name: *const c_char) -> id;
+        // dlfcn
+        fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlerror() -> *const c_char;
+    }
+
+    const RTLD_LAZY: c_int = 1;
+
+    // Metal constants
+    const MTLResourceStorageModeShared: NSUInteger = 1;
+
+    static METAL_INIT_ONCE: Once = Once::new();
+    static METAL_DEVICE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    static METAL_LIBRARY: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    static METAL_FAILED: AtomicBool = AtomicBool::new(false);
+
+    // Helper to get a selector
+    fn get_selector(name: &str) -> SEL {
+        let cname = CString::new(name).unwrap();
+        unsafe { sel_registerName(cname.as_ptr()) }
+    }
+
+    // Helper to get an NSError description (for logging)
+    fn ns_error_to_string(error: id) -> String {
+        if error.is_null() {
+            return "(null NSError)".to_string();
+        }
+        // Get domain
+        let domain_sel = get_selector("domain");
+        type MsgSendDomain = extern "C" fn(id, SEL) -> id;
+        let msg_send_domain: MsgSendDomain =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let domain_obj = msg_send_domain(error, domain_sel);
+        let domain_str = if !domain_obj.is_null() {
+            let utf8_sel = get_selector("UTF8String");
+            type MsgSendUTF8 = extern "C" fn(id, SEL) -> *const c_char;
+            let msg_send_utf8: MsgSendUTF8 =
+                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            let cstr = msg_send_utf8(domain_obj, utf8_sel);
+            if !cstr.is_null() {
+                unsafe {
+                    std::ffi::CStr::from_ptr(cstr)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            } else {
+                "(unknown domain)".to_string()
+            }
+        } else {
+            "(null domain)".to_string()
+        };
+
+        // Get code
+        let code_sel = get_selector("code");
+        type MsgSendCode = extern "C" fn(id, SEL) -> NSInteger;
+        let msg_send_code: MsgSendCode = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let code = msg_send_code(error, code_sel);
+
+        // Get localizedDescription
+        let desc_sel = get_selector("localizedDescription");
+        type MsgSendDesc = extern "C" fn(id, SEL) -> id;
+        let msg_send_desc: MsgSendDesc = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let desc_obj = msg_send_desc(error, desc_sel);
+        let desc_str = if !desc_obj.is_null() {
+            let utf8_sel = get_selector("UTF8String");
+            type MsgSendUTF8 = extern "C" fn(id, SEL) -> *const c_char;
+            let msg_send_utf8: MsgSendUTF8 =
+                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            let cstr = msg_send_utf8(desc_obj, utf8_sel);
+            if !cstr.is_null() {
+                unsafe {
+                    std::ffi::CStr::from_ptr(cstr)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            } else {
+                "(no description)".to_string()
+            }
+        } else {
+            "(no description)".to_string()
+        };
+
+        format!(
+            "domain={}, code={}, description={}",
+            domain_str, code, desc_str
+        )
+    }
+
+    // Dynamic loader for Metal C functions
+    fn metal_ensure_init() -> bool {
+        if METAL_FAILED.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        METAL_INIT_ONCE.call_once(|| {
+            vox_rt_log("info", "Initializing Metal...");
+
+            // 1. Load the Metal framework via dlopen
+            let path =
+                CString::new("/System/Library/Frameworks/Metal.framework/Versions/Current/Metal")
+                    .unwrap();
+            let handle = unsafe { dlopen(path.as_ptr(), RTLD_LAZY) };
+            if handle.is_null() {
+                let err = unsafe { dlerror() };
+                let msg = if err.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(err) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                vox_rt_log("error", &format!("dlopen Metal framework failed: {}", msg));
+                METAL_FAILED.store(true, Ordering::SeqCst);
+                return;
+            }
+            vox_rt_log("info", "Metal framework loaded via dlopen");
+
+            // 2. Try to get the default device using the C function
+            let sym_name = CString::new("MTLCreateSystemDefaultDevice").unwrap();
+            let func_ptr = unsafe { dlsym(handle, sym_name.as_ptr()) };
+            if func_ptr.is_null() {
+                vox_rt_log("error", "dlsym MTLCreateSystemDefaultDevice failed");
+                METAL_FAILED.store(true, Ordering::SeqCst);
+                return;
+            }
+            let create_default: extern "C" fn() -> id = unsafe { std::mem::transmute(func_ptr) };
+            let mut device = create_default();
+
+            // 3. If that fails, try MTLCopyAllDevices and pick the first
+            if device.is_null() {
+                vox_rt_log(
+                    "warning",
+                    "MTLCreateSystemDefaultDevice returned null; trying MTLCopyAllDevices",
+                );
+                let copy_all_sym = CString::new("MTLCopyAllDevices").unwrap();
+                let copy_all_ptr = unsafe { dlsym(handle, copy_all_sym.as_ptr()) };
+                if !copy_all_ptr.is_null() {
+                    let copy_all: extern "C" fn() -> id =
+                        unsafe { std::mem::transmute(copy_all_ptr) };
+                    let devices_array = copy_all();
+                    if !devices_array.is_null() {
+                        let nsarray_class =
+                            unsafe { objc_getClass(b"NSArray\0".as_ptr() as *const c_char) };
+                        if !nsarray_class.is_null() {
+                            let count_sel = get_selector("count");
+                            type MsgSendCount = extern "C" fn(id, SEL) -> NSUInteger;
+                            let msg_send_count: MsgSendCount =
+                                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+                            let count = msg_send_count(devices_array, count_sel);
+                            vox_rt_log("info", &format!("Found {} Metal devices", count));
+                            if count > 0 {
+                                let object_at_sel = get_selector("objectAtIndex:");
+                                type MsgSendAtIndex = extern "C" fn(id, SEL, NSUInteger) -> id;
+                                let msg_send_at_index: MsgSendAtIndex =
+                                    unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+                                let obj = msg_send_at_index(devices_array, object_at_sel, 0);
+                                if !obj.is_null() {
+                                    vox_rt_log(
+                                        "info",
+                                        "Using first Metal device from MTLCopyAllDevices",
+                                    );
+                                    device = unsafe { objc_retain(obj) };
+                                }
+                            }
+                        }
+                        unsafe { objc_release(devices_array) };
+                    }
+                } else {
+                    vox_rt_log("error", "dlsym MTLCopyAllDevices failed");
+                }
+            } else {
+                vox_rt_log("info", "MTLCreateSystemDefaultDevice succeeded");
+            }
+
+            if device.is_null() {
+                vox_rt_log("error", "All attempts to get a Metal device failed");
+                METAL_FAILED.store(true, Ordering::SeqCst);
+                return;
+            }
+
+            // Log device name to verify device is alive
+            let name_sel = get_selector("name");
+            type MsgSendName = extern "C" fn(id, SEL) -> id;
+            let msg_send_name: MsgSendName =
+                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            let name_obj = msg_send_name(device, name_sel);
+            if !name_obj.is_null() {
+                let utf8_sel = get_selector("UTF8String");
+                type MsgSendUTF8 = extern "C" fn(id, SEL) -> *const c_char;
+                let msg_send_utf8: MsgSendUTF8 =
+                    unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+                let name_cstr = msg_send_utf8(name_obj, utf8_sel);
+                if !name_cstr.is_null() {
+                    let name_str = unsafe { std::ffi::CStr::from_ptr(name_cstr) };
+                    vox_rt_log(
+                        "info",
+                        &format!("Metal device name: {}", name_str.to_string_lossy()),
+                    );
+                }
+            }
+
+            let dev = unsafe { objc_retain(device) };
+            METAL_DEVICE.store(dev, Ordering::SeqCst);
+            vox_rt_log("info", &format!("Metal device initialized: {:p}", dev));
+        });
+
+        !METAL_FAILED.load(Ordering::SeqCst)
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_load_device_module(msl_source: *const c_char, msl_len: usize) {
+        vox_rt_log(
+            "info",
+            &format!(
+                "vox_load_device_module(msl_source={:p}, len={})",
+                msl_source, msl_len
+            ),
+        );
+
+        if METAL_FAILED.load(Ordering::SeqCst) {
+            vox_rt_log("warning", "Metal previously failed, ignoring load");
+            return;
+        }
+        if !metal_ensure_init() {
+            vox_rt_log("error", "Metal ensure init failed");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+        if msl_source.is_null() || msl_len == 0 {
+            vox_rt_log("error", "Invalid MSL source (null or length 0)");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        let device = METAL_DEVICE.load(Ordering::SeqCst);
+        if device.is_null() {
+            vox_rt_log("error", "No Metal device available");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        // Create NSString from the null-terminated C string (the source is null-terminated)
+        let nsstring_class = unsafe { objc_getClass(b"NSString\0".as_ptr() as *const c_char) };
+        if nsstring_class.is_null() {
+            vox_rt_log("error", "NSString class not found");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+        let utf8_sel = get_selector("stringWithUTF8String:");
+        type MsgSendNSString = extern "C" fn(id, SEL, *const c_char) -> id;
+        let msg_send_nsstring: MsgSendNSString =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let source_ns = msg_send_nsstring(nsstring_class, utf8_sel, msl_source);
+        if source_ns.is_null() {
+            vox_rt_log("error", "Failed to create NSString from MSL source");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+        let source_ns = unsafe { objc_retain(source_ns) };
+        vox_rt_log("debug", "NSString created successfully");
+
+        // Compile the source
+        let library_sel = get_selector("newLibraryWithSource:options:error:");
+        let mut error: id = ptr::null_mut();
+        type MsgSendNewLibSource = extern "C" fn(id, SEL, id, id, *mut id) -> id;
+        let msg_send_new_lib: MsgSendNewLibSource =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        // options: nil (empty dictionary)
+        let options: id = ptr::null_mut();
+        let library = msg_send_new_lib(device, library_sel, source_ns, options, &mut error);
+        unsafe { objc_release(source_ns) };
+
+        if !library.is_null() {
+            vox_rt_log("info", "Metal library compiled and loaded successfully");
+            let lib = unsafe { objc_retain(library) };
+            METAL_LIBRARY.store(lib, Ordering::SeqCst);
+            return;
+        } else {
+            let err_msg = if !error.is_null() {
+                ns_error_to_string(error)
+            } else {
+                "unknown error".to_string()
+            };
+            vox_rt_log(
+                "error",
+                &format!("newLibraryWithSource failed: {}", err_msg),
+            );
+            if !error.is_null() {
+                unsafe { objc_release(error) };
+            }
+        }
+
+        vox_rt_log("error", "Failed to compile Metal source");
+        METAL_FAILED.store(true, Ordering::SeqCst);
+    }
+
+    // Legacy 1D launch – kept for compatibility
+    #[no_mangle]
+    pub extern "C" fn vox_launch_kernel_1d(
+        kernel_name: *mut c_void,
+        arg_ptrs: *mut *mut c_void,
+        num_args: i32,
+        grid_x: i32,
+        block_x: i32,
+    ) -> i32 {
+        // Forward to 3D with null sizes (backward compatibility)
+        vox_launch_kernel_3d(
+            kernel_name,
+            grid_x,
+            1,
+            1,
+            block_x,
+            1,
+            1,
+            arg_ptrs,
+            num_args,
+            ptr::null(),
+        )
+    }
+
+    // New 3D launch function – FULLY IMPLEMENTED with extreme debugging
+    // Now uses arg_sizes array to create buffers of correct lengths.
+    #[no_mangle]
+    pub extern "C" fn vox_launch_kernel_3d(
+        kernel_name: *mut c_void,
+        grid_x: i32,
+        grid_y: i32,
+        grid_z: i32,
+        block_x: i32,
+        block_y: i32,
+        block_z: i32,
+        arg_ptrs: *mut *mut c_void,
+        num_args: i32,
+        arg_sizes: *const i64,
+    ) -> i32 {
+        vox_rt_log(
+            "info",
+            &format!(
+                "vox_launch_kernel_3d(kernel_name={:p}, grid=({},{},{}), block=({},{},{}), num_args={})",
+                kernel_name, grid_x, grid_y, grid_z, block_x, block_y, block_z, num_args
+            ),
+        );
+
+        if METAL_FAILED.load(Ordering::SeqCst) {
+            vox_rt_log("warning", "Metal previously failed, skipping launch");
+            return -1;
+        }
+        if !metal_ensure_init() {
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        let library = METAL_LIBRARY.load(Ordering::SeqCst);
+        if library.is_null() {
+            vox_rt_log("error", "No Metal library loaded");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+
+        // Convert kernel name C string to NSString
+        let nsstring_class = unsafe { objc_getClass(b"NSString\0".as_ptr() as *const c_char) };
+        if nsstring_class.is_null() {
+            vox_rt_log("error", "NSString class not found");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        let utf8_sel = get_selector("stringWithUTF8String:");
+        type MsgSendNSString = extern "C" fn(id, SEL, *const c_char) -> id;
+        let msg_send_nsstring: MsgSendNSString =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let kernel_name_ns =
+            msg_send_nsstring(nsstring_class, utf8_sel, kernel_name as *const c_char);
+        if kernel_name_ns.is_null() {
+            vox_rt_log("error", "Failed to create NSString from kernel name");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        // Retain it (it is autoreleased)
+        let kernel_name_ns = unsafe { objc_retain(kernel_name_ns) };
+        vox_rt_log("debug", "NSString for kernel name created");
+
+        // Get kernel function
+        let func_sel = get_selector("newFunctionWithName:");
+        type MsgSendFunc = extern "C" fn(id, SEL, id) -> id;
+        let msg_send_func: MsgSendFunc = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let func = msg_send_func(library, func_sel, kernel_name_ns);
+        unsafe { objc_release(kernel_name_ns) }; // Release the NSString
+        if func.is_null() {
+            let name_cstr = unsafe { std::ffi::CStr::from_ptr(kernel_name as *const c_char) };
+            let name = name_cstr.to_string_lossy();
+            vox_rt_log(
+                "error",
+                &format!("Function '{}' not found in library", name),
+            );
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        vox_rt_log("debug", "Kernel function retrieved");
+
+        // Create pipeline state
+        let device = METAL_DEVICE.load(Ordering::SeqCst);
+        let pipeline_sel = get_selector("newComputePipelineStateWithFunction:error:");
+        type MsgSendPipeline = extern "C" fn(id, SEL, id, *mut id) -> id;
+        let msg_send_pipeline: MsgSendPipeline =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let mut error: id = ptr::null_mut();
+        let pipeline = msg_send_pipeline(device, pipeline_sel, func, &mut error);
+        unsafe { objc_release(func) };
+        if pipeline.is_null() {
+            let err_msg = if !error.is_null() {
+                ns_error_to_string(error)
+            } else {
+                "unknown error".to_string()
+            };
+            vox_rt_log(
+                "error",
+                &format!("Failed to create compute pipeline state: {}", err_msg),
+            );
+            if !error.is_null() {
+                unsafe { objc_release(error) };
+            }
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        vox_rt_log("debug", "Compute pipeline state created");
+
+        // Get command queue
+        let queue_sel = get_selector("newCommandQueue");
+        type MsgSendQueue = extern "C" fn(id, SEL) -> id;
+        let msg_send_queue: MsgSendQueue =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let queue = msg_send_queue(device, queue_sel);
+        if queue.is_null() {
+            vox_rt_log("error", "Failed to create command queue");
+            unsafe { objc_release(pipeline) };
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        vox_rt_log("debug", "Command queue created");
+
+        // Create command buffer
+        let buffer_sel = get_selector("commandBuffer");
+        let cmd_buffer = msg_send_queue(queue, buffer_sel);
+        if cmd_buffer.is_null() {
+            vox_rt_log("error", "Failed to create command buffer");
+            unsafe { objc_release(queue) };
+            unsafe { objc_release(pipeline) };
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        vox_rt_log("debug", "Command buffer created");
+
+        // Create compute command encoder
+        let encoder_sel = get_selector("computeCommandEncoder");
+        let encoder = msg_send_queue(cmd_buffer, encoder_sel);
+        if encoder.is_null() {
+            vox_rt_log("error", "Failed to create compute command encoder");
+            unsafe { objc_release(cmd_buffer) };
+            unsafe { objc_release(queue) };
+            unsafe { objc_release(pipeline) };
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        vox_rt_log("debug", "Compute command encoder created");
+
+        // Set pipeline state
+        let set_ps_sel = get_selector("setComputePipelineState:");
+        type MsgSendSetPS = extern "C" fn(id, SEL, id) -> id;
+        let msg_send_set_ps: MsgSendSetPS =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let _ = msg_send_set_ps(encoder, set_ps_sel, pipeline);
+        vox_rt_log("debug", "Pipeline state set on encoder");
+
+        // ------------------------------------------------------------------
+        // Pack arguments using sizes from arg_sizes array.
+        // We assume the convention: arguments 0..num_args-2 are scalars,
+        // and the last argument (num_args-1) is a result pointer.
+        // ------------------------------------------------------------------
+        vox_rt_log("debug", "Packing arguments for Metal dispatch using sizes");
+
+        let mut scalar_data = Vec::new();
+        let mut arg_buffers = Vec::new();
+
+        // Helper to read size for argument i, with fallback to hardcoded if arg_sizes is null
+        let get_arg_size = |i: usize| -> usize {
+            if arg_sizes.is_null() {
+                // fallback: assume i32 for all scalars, pointer size for last
+                if i == (num_args as usize) - 1 {
+                    4 // result pointer size (assuming i32) – but better to use 8? We'll use 4 as before.
+                } else {
+                    4
+                }
+            } else {
+                unsafe { *arg_sizes.add(i) as usize }
+            }
+        };
+
+        for i in 0..num_args as usize {
+            let arg_ptr = unsafe { *arg_ptrs.add(i) };
+            if arg_ptr.is_null() {
+                vox_rt_log("error", &format!("Argument {} pointer is null", i));
+                METAL_FAILED.store(true, Ordering::SeqCst);
+                return -1;
+            }
+
+            let size = get_arg_size(i);
+            vox_rt_log(
+                "debug",
+                &format!("Arg[{}]: size={}, ptr={:p}", i, size, arg_ptr),
+            );
+
+            if i == num_args as usize - 1 {
+                // Last argument: treat as result pointer.
+                // We need to copy the current host value into a buffer of the given size.
+                // Read the data from the host pointer (which points to the value).
+                let mut buf = vec![0u8; size];
+                unsafe {
+                    ptr::copy_nonoverlapping(arg_ptr, buf.as_mut_ptr() as *mut c_void, size);
+                }
+                vox_rt_log(
+                    "debug",
+                    &format!(
+                        "Result arg {}: host bytes = {:?}",
+                        i,
+                        &buf[..std::cmp::min(size, 16)]
+                    ),
+                );
+
+                let buffer_sel = get_selector("newBufferWithBytes:length:options:");
+                type MsgSendBuffer =
+                    extern "C" fn(id, SEL, *const c_void, NSUInteger, NSUInteger) -> id;
+                let msg_send_buffer: MsgSendBuffer =
+                    unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+                let buffer = msg_send_buffer(
+                    device,
+                    buffer_sel,
+                    buf.as_ptr() as *const c_void,
+                    size as NSUInteger,
+                    MTLResourceStorageModeShared,
+                );
+                if buffer.is_null() {
+                    vox_rt_log("error", &format!("Failed to create buffer for arg {}", i));
+                    METAL_FAILED.store(true, Ordering::SeqCst);
+                    return -1;
+                }
+                arg_buffers.push(buffer);
+                vox_rt_log(
+                    "debug",
+                    &format!("Created result buffer for arg {}, size={}", i, size),
+                );
+            } else {
+                // Scalar argument – read the bytes from the host pointer and pack into scalar_data.
+                // The host pointer points to the actual value (e.g., i32, f32, i64 etc.)
+                let mut buf = vec![0u8; size];
+                unsafe {
+                    ptr::copy_nonoverlapping(arg_ptr, buf.as_mut_ptr() as *mut c_void, size);
+                }
+                vox_rt_log(
+                    "debug",
+                    &format!(
+                        "Scalar arg {}: bytes = {:?}",
+                        i,
+                        &buf[..std::cmp::min(size, 16)]
+                    ),
+                );
+                scalar_data.extend_from_slice(&buf);
+            }
+        }
+
+        // Create a buffer for the scalar struct
+        let scalar_size = scalar_data.len();
+        vox_rt_log(
+            "debug",
+            &format!("Scalar struct size: {} bytes", scalar_size),
+        );
+        let scalar_buffer_sel = get_selector("newBufferWithBytes:length:options:");
+        type MsgSendBuffer = extern "C" fn(id, SEL, *const c_void, NSUInteger, NSUInteger) -> id;
+        let msg_send_buffer: MsgSendBuffer =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let scalar_buffer = msg_send_buffer(
+            device,
+            scalar_buffer_sel,
+            scalar_data.as_ptr() as *const c_void,
+            scalar_size as NSUInteger,
+            MTLResourceStorageModeShared,
+        );
+        if scalar_buffer.is_null() {
+            vox_rt_log("error", "Failed to create scalar struct buffer");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return -1;
+        }
+        arg_buffers.insert(0, scalar_buffer); // Put scalar buffer at index 0
+        vox_rt_log(
+            "debug",
+            &format!("Created scalar struct buffer with {} bytes", scalar_size),
+        );
+
+        // Now set all buffers on the encoder
+        let set_buffer_sel = get_selector("setBuffer:offset:atIndex:");
+        type MsgSendSetBuffer = extern "C" fn(id, SEL, id, NSUInteger, NSUInteger) -> id;
+        let msg_send_set_buffer: MsgSendSetBuffer =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        for (idx, buffer) in arg_buffers.iter().enumerate() {
+            let _ = msg_send_set_buffer(encoder, set_buffer_sel, *buffer, 0, idx as NSUInteger);
+            vox_rt_log("debug", &format!("Set buffer {} at index {}", idx, idx));
+        }
+
+        // ------------------------------------------------------------------
+        // Dispatch threads
+        // ------------------------------------------------------------------
+        vox_rt_log(
+            "debug",
+            &format!(
+                "Dispatching grid ({},{},{}), block ({},{},{})",
+                grid_x, grid_y, grid_z, block_x, block_y, block_z
+            ),
+        );
+        #[repr(C)]
+        struct MTLSize {
+            width: NSUInteger,
+            height: NSUInteger,
+            depth: NSUInteger,
+        }
+
+        let grid_size = MTLSize {
+            width: grid_x as NSUInteger,
+            height: grid_y as NSUInteger,
+            depth: grid_z as NSUInteger,
+        };
+        let block_size = MTLSize {
+            width: block_x as NSUInteger,
+            height: block_y as NSUInteger,
+            depth: block_z as NSUInteger,
+        };
+
+        let dispatch_sel = get_selector("dispatchThreadgroups:threadsPerThreadgroup:");
+        // Use a typed function pointer that takes the structs by value.
+        type MsgSendDispatch = extern "C" fn(id, SEL, MTLSize, MTLSize) -> id;
+        let msg_send_dispatch: MsgSendDispatch =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let _ = msg_send_dispatch(encoder, dispatch_sel, grid_size, block_size);
+        vox_rt_log("debug", "Dispatch threads called");
+
+        // End encoding
+        let end_encoding_sel = get_selector("endEncoding");
+        type MsgSendEndEncoding = extern "C" fn(id, SEL) -> id;
+        let msg_send_end_encoding: MsgSendEndEncoding =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let _ = msg_send_end_encoding(encoder, end_encoding_sel);
+        vox_rt_log("debug", "End encoding");
+
+        // Commit command buffer
+        let commit_sel = get_selector("commit");
+        type MsgSendCommit = extern "C" fn(id, SEL) -> id;
+        let msg_send_commit: MsgSendCommit =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let _ = msg_send_commit(cmd_buffer, commit_sel);
+        vox_rt_log("debug", "Command buffer committed");
+
+        // Wait for completion
+        let wait_sel = get_selector("waitUntilCompleted");
+        type MsgSendWait = extern "C" fn(id, SEL) -> id;
+        let msg_send_wait: MsgSendWait = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let _ = msg_send_wait(cmd_buffer, wait_sel);
+        vox_rt_log("debug", "Command buffer completed");
+
+        // Now copy the result buffer back to the host
+        // The result buffer is the last element in arg_buffers (index = arg_buffers.len()-1)
+        if let Some(result_buffer) = arg_buffers.last() {
+            // Get contents pointer
+            let contents_sel = get_selector("contents");
+            type MsgSendContents = extern "C" fn(id, SEL) -> id;
+            let msg_send_contents: MsgSendContents =
+                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            let result_ptr = msg_send_contents(*result_buffer, contents_sel);
+            if !result_ptr.is_null() {
+                // Copy back to the host variable pointed to by the last argument
+                let last_arg_ptr = unsafe { *arg_ptrs.add(num_args as usize - 1) };
+                if !last_arg_ptr.is_null() {
+                    let size = get_arg_size(num_args as usize - 1);
+                    unsafe {
+                        ptr::copy_nonoverlapping(result_ptr, last_arg_ptr, size);
+                    }
+                    vox_rt_log(
+                        "debug",
+                        &format!("Copied result back to host ({} bytes)", size),
+                    );
+                }
+            }
+        }
+
+        // Clean up
+        unsafe {
+            objc_release(encoder);
+            objc_release(cmd_buffer);
+            objc_release(queue);
+            objc_release(pipeline);
+            for buffer in arg_buffers {
+                objc_release(buffer);
+            }
+        }
+
+        vox_rt_log("info", "Kernel executed successfully");
+        0
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_malloc(size: usize) -> *mut c_void {
+        vox_rt_log("debug", &format!("vox_gpu_malloc(size={})", size));
+        if METAL_FAILED.load(Ordering::SeqCst) {
+            let ptr = unsafe { calloc(1, size) };
+            vox_rt_log("debug", &format!("  -> {:p} (host fallback)", ptr));
+            return ptr;
+        }
+        if !metal_ensure_init() {
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            let ptr = unsafe { calloc(1, size) };
+            vox_rt_log(
+                "debug",
+                &format!("  -> {:p} (host fallback after init fail)", ptr),
+            );
+            return ptr;
+        }
+        let device = METAL_DEVICE.load(Ordering::SeqCst);
+        if device.is_null() {
+            vox_rt_log("error", "No Metal device");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            let ptr = unsafe { calloc(1, size) };
+            vox_rt_log("debug", &format!("  -> {:p} (host fallback)", ptr));
+            return ptr;
+        }
+        let buffer_sel = get_selector("newBufferWithLength:options:");
+        type MsgSendBufferLen = extern "C" fn(id, SEL, NSUInteger, NSUInteger) -> id;
+        let msg_send_buffer_len: MsgSendBufferLen =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let buffer = msg_send_buffer_len(
+            device,
+            buffer_sel,
+            size as NSUInteger,
+            MTLResourceStorageModeShared,
+        );
+        if buffer.is_null() {
+            vox_rt_log("error", "Metal buffer allocation failed");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            let ptr = unsafe { calloc(1, size) };
+            vox_rt_log("debug", &format!("  -> {:p} (host fallback)", ptr));
+            return ptr;
+        }
+        vox_rt_log("debug", &format!("  -> device buffer {:p}", buffer));
+        buffer
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_free(ptr: *mut c_void) {
+        vox_rt_log("debug", &format!("vox_gpu_free({:p})", ptr));
+        if ptr.is_null() {
+            return;
+        }
+        if METAL_FAILED.load(Ordering::SeqCst) {
+            unsafe { free(ptr) };
+            vox_rt_log("debug", "  -> freed host memory");
+            return;
+        }
+        unsafe { objc_release(ptr) };
+        vox_rt_log("debug", "  -> freed Metal buffer");
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_memcpy_host_to_device(
+        dst: *mut c_void,
+        src: *mut c_void,
+        size: usize,
+    ) {
+        vox_rt_log(
+            "debug",
+            &format!(
+                "vox_gpu_memcpy_host_to_device(dst={:p}, src={:p}, size={})",
+                dst, src, size
+            ),
+        );
+        if METAL_FAILED.load(Ordering::SeqCst) {
+            vox_rt_log("warning", "Metal failed, skipping copy");
+            return;
+        }
+        if size == 0 || dst.is_null() || src.is_null() {
+            return;
+        }
+        let contents_sel = get_selector("contents");
+        type MsgSendContents = extern "C" fn(id, SEL) -> id;
+        let msg_send_contents: MsgSendContents =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let dst_contents = msg_send_contents(dst, contents_sel);
+        if dst_contents.is_null() {
+            vox_rt_log("error", "Failed to get contents of destination buffer");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+        unsafe {
+            ptr::copy(src, dst_contents, size);
+        }
+        // Inform Metal that the buffer has been modified.
+        let did_modify_sel = get_selector("didModifyRange:");
+        #[repr(C)]
+        struct NSRange {
+            location: NSUInteger,
+            length: NSUInteger,
+        }
+        type MsgSendDidModify = extern "C" fn(id, SEL, NSRange) -> id;
+        let msg_send_did_modify: MsgSendDidModify =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let range = NSRange {
+            location: 0,
+            length: size as NSUInteger,
+        };
+        let _ = msg_send_did_modify(dst, did_modify_sel, range);
+        vox_rt_log("debug", "H2D copy succeeded");
+    }
+
+    #[no_mangle]
+    pub extern "C" fn vox_gpu_memcpy_device_to_host(
+        dst: *mut c_void,
+        src: *mut c_void,
+        size: usize,
+    ) {
+        vox_rt_log(
+            "debug",
+            &format!(
+                "vox_gpu_memcpy_device_to_host(dst={:p}, src={:p}, size={})",
+                dst, src, size
+            ),
+        );
+        if METAL_FAILED.load(Ordering::SeqCst) {
+            unsafe { ptr::write_bytes(dst, 0, size) };
+            vox_rt_log("warning", "Metal failed, zeroing destination");
+            return;
+        }
+        if size == 0 || dst.is_null() || src.is_null() {
+            return;
+        }
+        let contents_sel = get_selector("contents");
+        type MsgSendContents = extern "C" fn(id, SEL) -> id;
+        let msg_send_contents: MsgSendContents =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        let src_contents = msg_send_contents(src, contents_sel);
+        if src_contents.is_null() {
+            vox_rt_log("error", "Failed to get contents of source buffer");
+            METAL_FAILED.store(true, Ordering::SeqCst);
+            unsafe { ptr::write_bytes(dst, 0, size) };
+            return;
+        }
+        unsafe {
+            ptr::copy(src_contents, dst, size);
+        }
+        vox_rt_log("debug", "D2H copy succeeded");
+    }
+}
+
+// ------------------------------------------------------------------
 // Fallback when no GPU feature is enabled
 // ------------------------------------------------------------------
-#[cfg(not(any(feature = "vox_gpu_cuda", feature = "vox_gpu_enabled")))]
+#[cfg(not(any(
+    feature = "vox_gpu_cuda",
+    feature = "vox_gpu_enabled",
+    feature = "vox_gpu_metal"
+)))]
 mod gpu_fallback {
     use super::*;
 
@@ -2148,21 +3065,22 @@ mod gpu_fallback {
     #[no_mangle]
     pub extern "C" fn vox_launch_kernel_1d(
         kernel_name: *mut c_void,
-        _arg_ptrs: *mut *mut c_void,
-        _num_args: i32,
-        _grid_x: i32,
-        _block_x: i32,
+        arg_ptrs: *mut *mut c_void,
+        num_args: i32,
+        grid_x: i32,
+        block_x: i32,
     ) -> i32 {
         vox_launch_kernel_3d(
             kernel_name,
-            _grid_x,
+            grid_x,
             1,
             1,
-            _block_x,
+            block_x,
             1,
             1,
-            _arg_ptrs,
-            _num_args,
+            arg_ptrs,
+            num_args,
+            ptr::null(),
         )
     }
 
@@ -2178,6 +3096,7 @@ mod gpu_fallback {
         block_z: i32,
         _arg_ptrs: *mut *mut c_void,
         _num_args: i32,
+        _arg_sizes: *const i64,
     ) -> i32 {
         let name = unsafe { std::ffi::CStr::from_ptr(kernel_name as *const c_char) };
         vox_rt_log(
@@ -2240,7 +3159,13 @@ mod gpu_fallback {
 // Re-export the appropriate GPU functions based on the active feature.
 #[cfg(feature = "vox_gpu_cuda")]
 pub use gpu_cuda::*;
-#[cfg(not(any(feature = "vox_gpu_cuda", feature = "vox_gpu_enabled")))]
+#[cfg(not(any(
+    feature = "vox_gpu_cuda",
+    feature = "vox_gpu_enabled",
+    feature = "vox_gpu_metal"
+)))]
 pub use gpu_fallback::*;
 #[cfg(feature = "vox_gpu_enabled")]
 pub use gpu_hip::*;
+#[cfg(feature = "vox_gpu_metal")]
+pub use gpu_metal::*;

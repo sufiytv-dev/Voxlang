@@ -11,7 +11,6 @@ use crate::refinement;
 use crate::semantics::SemanticAnalyzer;
 use crate::semantics::symbol::SymbolTable;
 use crate::semantics::types::{Type, parse_generic_type};
-use std::collections::HashMap;
 use std::collections::HashSet;
 
 // -----------------------------------------------------------------------------
@@ -82,16 +81,9 @@ impl MatchPattern {
 // =============================================================================
 #[derive(Debug, Clone)]
 pub(crate) enum ResolvedSymbol {
-    Function {
-        param_types: Vec<Type>,
-        return_type: Type,
-    },
-    Struct {
-        fields: Vec<StructField>,
-    },
-    Enum {
-        variants: Vec<crate::parser::EnumVariant>,
-    },
+    Function {},
+    Struct { fields: Vec<StructField> },
+    Enum {},
 }
 
 // -----------------------------------------------------------------------------
@@ -3979,23 +3971,13 @@ impl SemanticAnalyzer<'_> {
         }
 
         // Check for enum
-        if let Some(variants) = module_symbols.enums.get(item_name) {
-            return Ok(ResolvedSymbol::Enum {
-                variants: variants.clone(),
-            });
+        if let Some(_variants) = module_symbols.enums.get(item_name) {
+            return Ok(ResolvedSymbol::Enum {});
         }
 
         // Check for function
-        if let Some((param_types, _, return_type, ..)) = module_symbols.functions.get(item_name) {
-            let param_ty: Vec<Type> = param_types
-                .iter()
-                .map(|s| Type::Concrete(s.clone()))
-                .collect();
-            let ret_ty = Type::Concrete(return_type.clone());
-            return Ok(ResolvedSymbol::Function {
-                param_types: param_ty,
-                return_type: ret_ty,
-            });
+        if module_symbols.functions.contains_key(item_name) {
+            return Ok(ResolvedSymbol::Function {});
         }
 
         emit_diagnostic(
@@ -4060,17 +4042,6 @@ impl SemanticAnalyzer<'_> {
             }
         }
         None
-    }
-
-    // -------------------------------------------------------------------------
-    // Helper to strip module prefix from a name (e.g., "math::Point" -> "Point")
-    // -------------------------------------------------------------------------
-    fn strip_module_prefix(name: &str) -> String {
-        if let Some(last) = name.rsplit("::").next() {
-            last.to_string()
-        } else {
-            name.to_string()
-        }
     }
 
     // -------------------------------------------------------------------------

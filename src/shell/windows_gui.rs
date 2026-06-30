@@ -3,12 +3,12 @@
 // drag‑and‑drop, file I/O, dark theme, menu bar, output batching, LSP integration,
 // diagnostics, Run button, accelerator table (F5 works; Ctrl+O/S/Q now handled
 // via subclass), DWM theming, full debug logging, and a status bar that shows
-// a text‑based progress bar.
+// a native progress bar and a separate status label.
 //
 // Status bar behaviour:
-//   - Start: "[░░░░░░░░░░░░░░░░░░░░] 0% – Ready"
+//   - Start: "0% - Ready" (label) + empty progress bar
 //   - During compilation: phase name and increasing percentage
-//   - End: "[████████████████████] 100% – Compilation complete"
+//   - End: "100% - Compilation complete" + full progress bar
 //
 // Auto‑scroll: terminal stays at the bottom unless the user scrolls up.
 // Uses append‑only text insertion with EM_REPLACESEL and pending‑refresh coalescing.
@@ -20,11 +20,17 @@
 // Build actions: Build Debug, Build Release, Check, Test, Clean – implemented via
 // threaded calls to runner.rs functions.
 //
-// Performance: Refresh rate limited to 500ms; terminal truncates to 5000 lines
+// Performance: Refresh rate limited to 200ms; terminal truncates to 5000 lines
 // using in‑place deletion. Buffer stealing ensures compiler never blocks.
 // Full logs can be saved to disk; the GUI shows only the tail.
 
-#![allow(non_snake_case, non_upper_case_globals, dead_code)]
+#![allow(
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code,
+    unsafe_op_in_unsafe_fn,
+    unreachable_patterns
+)]
 
 use std::ffi::{OsStr, c_void};
 use std::fs;
@@ -32,7 +38,7 @@ use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,8 +46,8 @@ use super::lsp::{LspClient, WM_USER_DIAGNOSTICS, path_to_uri};
 use super::runner::{build_file, check_file, clean_project, compile_and_run_file, run_tests};
 use super::terminal::TerminalBuffer;
 use crate::diagnostic::{
-    Diagnostic, Level, WM_USER_PHASE_UPDATE, WM_USER_REFRESH, debug_log, emit_diagnostic,
-    emit_phase_update, set_gui_hwnd, set_gui_terminal,
+    Diagnostic, Level, WM_USER_PHASE_UPDATE, WM_USER_REFRESH, emit_phase_update, get_gui_hwnd,
+    set_gui_hwnd, set_gui_phase_callback, set_gui_terminal,
 };
 use crate::find_vox_root;
 use crate::{CacheConfig, host_triple};
@@ -50,8 +56,8 @@ use crate::{CacheConfig, host_triple};
 // Performance tuning constants – scaled for large projects
 // ============================================================================
 
-/// Minimum time between terminal refreshes (500ms = 2 Hz)
-const REFRESH_INTERVAL_MS: u64 = 500;
+/// Minimum time between terminal refreshes (200ms = 5 Hz)
+const REFRESH_INTERVAL_MS: u64 = 200;
 
 /// Maximum lines kept in the Rich Edit control (scrollback limit)
 const UI_MAX_LINES: isize = 5000;
@@ -61,7 +67,7 @@ const UI_MAX_LINES: isize = 5000;
 // ============================================================================
 
 const AUTO_SCROLL_TRACE: bool = false; // Enable to see scroll logs
-const GUI_TRACE: bool = false; // Disable GUI trace logs
+const GUI_TRACE: bool = true; // Enable GUI trace logs (set to true for debugging)
 const DRAG_DROP_TRACE: bool = false; // Enable detailed drag‑and‑drop tracing
 
 // ============================================================================
@@ -111,6 +117,7 @@ type ATOM = u16;
 type WNDPROC = Option<unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT>;
 type HRESULT = i32;
 type HACCEL = *mut c_void;
+type LPCSTR = *const i8;
 
 // MessageBox constants
 const MB_YESNOCANCEL: UINT = 0x00000003;
@@ -120,10 +127,6 @@ const IDYES: i32 = 6;
 const IDNO: i32 = 7;
 const IDCANCEL: i32 = 2;
 
-// Status bar styles
-const SBARS_SIZEGRIP: DWORD = 0x0100;
-const SB_SIMPLE: UINT = 0x0200;
-
 // Window styles
 const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
 const WS_CLIPCHILDREN: DWORD = 0x02000000;
@@ -131,7 +134,7 @@ const WS_CHILD: DWORD = 0x40000000;
 const WS_VISIBLE: DWORD = 0x10000000;
 const WS_VSCROLL: DWORD = 0x00200000;
 const WS_HSCROLL: DWORD = 0x00100000;
-const WS_BORDER: DWORD = 0x00800000;
+// WS_BORDER removed – we use a flat, borderless look
 const WS_CAPTION: DWORD = 0x00C00000;
 const WS_SYSMENU: DWORD = 0x00080000;
 const WS_THICKFRAME: DWORD = 0x00040000;
@@ -140,8 +143,23 @@ const WS_MAXIMIZEBOX: DWORD = 0x00010000;
 const WS_POPUP: DWORD = 0x80000000;
 
 const WS_EX_ACCEPTFILES: DWORD = 0x00000010;
-const WS_EX_CLIENTEDGE: DWORD = 0x00000200;
 
+// Static control styles
+const SS_LEFT: DWORD = 0x00000000;
+
+// Progress bar styles
+const PBS_SMOOTH: DWORD = 0x00000001;
+
+// Common control classes
+const PROGRESS_CLASS: &str = "msctls_progress32\0";
+
+// Progress bar messages
+const PBM_SETPOS: UINT = WM_USER + 2;
+
+// Common control initialisation flags
+const ICC_PROGRESS_CLASS: DWORD = 0x00000020;
+
+// Edit control styles
 const ES_MULTILINE: DWORD = 0x0004;
 const ES_AUTOVSCROLL: DWORD = 0x0040;
 const ES_AUTOHSCROLL: DWORD = 0x0080;
@@ -166,7 +184,10 @@ const WM_DESTROY: UINT = 0x0002;
 const WM_SIZE: UINT = 0x0005;
 const WM_COMMAND: UINT = 0x0111;
 const WM_DROPFILES: UINT = 0x0233;
-const WM_CTLCOLORLISTBOX: UINT = 0x0133; // no longer needed
+const WM_CTLCOLORSTATIC: UINT = 0x0138;
+const WM_CTLCOLOREDIT: UINT = 0x0133;
+const WM_CTLCOLORBTN: UINT = 0x0135;
+const WM_ERASEBKGND: UINT = 0x0014;
 const WM_USER: UINT = 0x0400;
 const WM_SETTEXT: UINT = 0x000C;
 const WM_GETTEXTLENGTH: UINT = 0x000E;
@@ -184,8 +205,15 @@ const WM_CONTEXTMENU: UINT = 0x007B;
 // WM_USER_DIAGNOSTICS is defined in lsp.rs as WM_USER + 2
 // WM_USER_PHASE_UPDATE is defined in diagnostic.rs as WM_USER + 3
 
+// Undocumented UAH messages for dark menu bar painting
+const WM_UAHDRAWMENU: UINT = 0x0091;
+const WM_UAHDRAWMENUITEM: UINT = 0x0092;
+
+// OBJID_MENU = -3
+const OBJID_MENU: i32 = -3;
+
 const EM_LIMITTEXT: UINT = 0x00C5;
-const EM_SETBKGNDCOL: UINT = WM_USER + 67;
+const EM_SETBKGNDCOL: UINT = WM_USER + 67; // EM_SETBKGNDCOLOR
 const EM_SETCHARFORMAT: UINT = WM_USER + 68;
 const EM_GETCHARFORMAT: UINT = WM_USER + 69;
 const EM_CHARFROMPOS: UINT = 0x00D7;
@@ -277,6 +305,9 @@ const VK_X: u16 = 0x58;
 const VK_A: u16 = 0x41;
 const VK_Z: u16 = 0x5A;
 const VK_Y: u16 = 0x59;
+const VK_B: u16 = 0x42;
+const VK_T: u16 = 0x54;
+const VK_L: u16 = 0x4C;
 const VK_CONTROL: i32 = 0x11;
 const VK_SHIFT: i32 = 0x10;
 
@@ -286,6 +317,10 @@ const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
 const DWMWCP_ROUND: u32 = 2;
 const DWMSBT_MAINWINDOW: u32 = 1;
+
+// Older dark mode attribute (some builds need both)
+const DWMWA_USE_IMMERSIVE_DARK_MODE_OLD: u32 = 19;
+const DWMWA_CAPTION_COLOR: u32 = 35;
 
 // CHARFORMAT2W masks and effects
 const CFM_COLOR: u32 = 0x40000000;
@@ -327,6 +362,24 @@ const MSGFLT_ALLOW: DWORD = 1;
 const WM_COPYGLOBALDATA: UINT = 0x0049;
 const WM_COPYDATA: UINT = 0x004A;
 
+// Font and margin constants
+const FW_NORMAL: i32 = 400;
+const DEFAULT_CHARSET: DWORD = 1;
+const OUT_DEFAULT_PRECIS: DWORD = 0;
+const CLIP_DEFAULT_PRECIS: DWORD = 0;
+const CLEARTYPE_QUALITY: DWORD = 5;
+const FIXED_PITCH: DWORD = 1;
+const FF_MODERN: DWORD = 48;
+const EM_SETMARGINS: UINT = 0x00D3;
+const EC_LEFTMARGIN: usize = 0x0001;
+const EC_RIGHTMARGIN: usize = 0x0002;
+
+// Drawing flags for DrawText
+const DT_SINGLELINE: UINT = 0x0020;
+const DT_CENTER: UINT = 0x0001;
+const DT_VCENTER: UINT = 0x0004;
+const DT_LEFT: UINT = 0x0000;
+
 // ============================================================================
 // FFI Declarations
 // ============================================================================
@@ -334,6 +387,8 @@ const WM_COPYDATA: UINT = 0x004A;
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(lpModuleName: LPCWSTR) -> HINSTANCE;
+    fn LoadLibraryA(lpLibFileName: LPCSTR) -> HMODULE;
+    fn GetProcAddress(hModule: HMODULE, lpProcName: LPCSTR) -> *const c_void;
     fn LoadLibraryW(lpLibFileName: LPCWSTR) -> HMODULE;
     fn MultiByteToWideChar(
         CodePage: UINT,
@@ -413,8 +468,15 @@ unsafe extern "system" {
     fn CreatePopupMenu() -> HMENU;
     fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: LPCWSTR) -> BOOL;
     fn DestroyMenu(hMenu: HMENU) -> BOOL;
+    fn GetMenu(hWnd: HWND) -> HMENU;
     fn SetMenu(hWnd: HWND, hMenu: HMENU) -> BOOL;
     fn DrawMenuBar(hWnd: HWND) -> BOOL;
+    fn FindWindowExW(
+        hWndParent: HWND,
+        hWndChildAfter: HWND,
+        lpszClass: LPCWSTR,
+        lpszWindow: LPCWSTR,
+    ) -> HWND;
     fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> BOOL;
     fn SetWindowSubclass(
         hWnd: HWND,
@@ -475,6 +537,17 @@ unsafe extern "system" {
     ) -> BOOL;
     // GetCursorPos
     fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+    // Menu bar drawing helpers (UAH)
+    fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;
+    fn GetMenuBarInfo(hWnd: HWND, idObject: i32, idItem: i32, pmbi: *mut MENUBARINFO) -> BOOL;
+    fn GetMenuStringW(
+        hMenu: HMENU,
+        uIDItem: u32,
+        lpString: LPWSTR,
+        nMaxCount: i32,
+        uFlags: UINT,
+    ) -> i32;
+    fn DrawTextW(hdc: HDC, lpchText: LPCWSTR, cchText: i32, lprc: *mut RECT, format: UINT) -> i32;
 }
 
 // Additional GDI types
@@ -485,6 +558,7 @@ const RDW_INVALIDATE: UINT = 0x0001;
 const RDW_ERASE: UINT = 0x0004;
 const RDW_UPDATENOW: UINT = 0x0100;
 const RDW_ALLCHILDREN: UINT = 0x0080;
+const RDW_FRAME: UINT = 0x0400; // redraw non-client area
 
 #[link(name = "shell32")]
 unsafe extern "system" {
@@ -522,6 +596,7 @@ unsafe extern "system" {
     fn SetBkColor(hdc: HDC, color: u32) -> u32;
     fn SelectObject(hdc: HDC, hObject: *mut c_void) -> *mut c_void;
     fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
+    fn SetBkMode(hdc: HDC, mode: i32) -> i32;
 }
 
 #[link(name = "ole32")]
@@ -549,6 +624,97 @@ unsafe extern "system" {
         pvAttribute: *const c_void,
         cbAttribute: u32,
     ) -> HRESULT;
+}
+
+// ============================================================================
+// Dark mode menu helper (undocumented API)
+// ============================================================================
+
+type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+
+/// Enables dark mode for native Win32 menus by calling the undocumented
+/// `SetPreferredAppMode` (ordinal 135) from uxtheme.dll.
+/// This only affects dropdown menus, not the horizontal menu bar.
+unsafe fn enable_dark_mode_menus() {
+    let uxtheme = LoadLibraryA(b"uxtheme.dll\0".as_ptr() as *const i8);
+    if uxtheme.is_null() {
+        return;
+    }
+
+    // Ordinal 135: SetPreferredAppMode
+    let proc_135 = GetProcAddress(uxtheme, 135 as *const i8);
+    if !proc_135.is_null() {
+        let set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32 =
+            mem::transmute(proc_135);
+        set_preferred_app_mode(2); // 2 = Force Dark
+    }
+
+    // Ordinal 136: FlushMenuThemes (makes dropdowns update)
+    let proc_136 = GetProcAddress(uxtheme, 136 as *const i8);
+    if !proc_136.is_null() {
+        let flush_menu_themes: unsafe extern "system" fn() = mem::transmute(proc_136);
+        flush_menu_themes();
+    }
+}
+
+// ============================================================================
+// Undocumented UAH structures for dark menu bar painting
+// ============================================================================
+
+#[repr(C)]
+struct DRAWITEMSTRUCT {
+    pub CtlType: u32,
+    pub CtlID: u32,
+    pub itemID: u32,
+    pub itemAction: u32,
+    pub itemState: u32,
+    pub hwndItem: HWND,
+    pub hDC: HDC,
+    pub rcItem: RECT,
+    pub itemData: usize,
+}
+
+#[repr(C)]
+struct UAHMENU {
+    pub hmenu: isize, // HMENU
+    pub hdc: isize,   // HDC
+    pub dwFlags: u32,
+}
+
+#[repr(C)]
+struct UAHMENUITEMMETRICS {
+    pub cx: u32,
+    pub cy: u32,
+}
+
+#[repr(C)]
+struct UAHMENUPOPUPMETRICS {
+    pub rgcx: [u32; 4],
+    pub fUpdateMaxWidths: u32,
+}
+
+#[repr(C)]
+struct UAHMENUITEM {
+    pub iPosition: i32,
+    pub umim: UAHMENUITEMMETRICS,
+    pub umpm: UAHMENUPOPUPMETRICS,
+}
+
+#[repr(C)]
+struct UAHDRAWMENUITEM {
+    pub dis: DRAWITEMSTRUCT,
+    pub um: UAHMENU,
+    pub umi: UAHMENUITEM,
+}
+
+#[repr(C)]
+struct MENUBARINFO {
+    pub cbSize: u32,
+    pub rcBar: RECT,
+    pub hMenu: HMENU,
+    pub hwndMenu: HWND,
+    pub fBarFocused: BOOL,
+    pub fFocused: BOOL,
 }
 
 // ============================================================================
@@ -582,12 +748,14 @@ struct MSG {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct POINT {
     x: LONG,
     y: LONG,
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct RECT {
     left: LONG,
     top: LONG,
@@ -709,9 +877,13 @@ struct AppState {
     hwnd_editor: HWND,
     hwnd_terminal: HWND,
     hwnd_button: HWND,
-    hwnd_status: HWND,
+    hwnd_status_text: HWND, // Static text for phase/percent
+    hwnd_progress: HWND,    // Progress bar
     hFont: HFONT,
     hBrush: HBRUSH,
+    hbrStatusBk: HBRUSH, // Background brush for status label
+    hbrEditBk: HBRUSH,   // Background brush for edit controls
+    hbrButtonBk: HBRUSH, // Background brush for button (if needed)
     file_path: Option<String>,
     is_modified: bool,
     terminal: Arc<Mutex<TerminalBuffer>>,
@@ -727,6 +899,7 @@ struct AppState {
     old_terminal_proc: Option<WNDPROC>,
     compilation_in_progress: bool, // track if a build is running
     was_at_bottom: bool,           // saved scroll state before text replacement
+    is_test_run: bool,             // <-- NEW: true while a test run is active
 }
 
 impl Default for AppState {
@@ -736,9 +909,13 @@ impl Default for AppState {
             hwnd_editor: ptr::null_mut(),
             hwnd_terminal: ptr::null_mut(),
             hwnd_button: ptr::null_mut(),
-            hwnd_status: ptr::null_mut(),
+            hwnd_status_text: ptr::null_mut(),
+            hwnd_progress: ptr::null_mut(),
             hFont: ptr::null_mut(),
             hBrush: ptr::null_mut(),
+            hbrStatusBk: ptr::null_mut(),
+            hbrEditBk: ptr::null_mut(),
+            hbrButtonBk: ptr::null_mut(),
             file_path: None,
             is_modified: false,
             terminal: Arc::new(Mutex::new(TerminalBuffer::new())),
@@ -754,6 +931,7 @@ impl Default for AppState {
             old_terminal_proc: None,
             compilation_in_progress: false,
             was_at_bottom: false,
+            is_test_run: false, // <-- NEW
         }
     }
 }
@@ -798,13 +976,6 @@ fn parse_phase_percent(msg: &str) -> (&str, usize) {
     }
     // Fallback: treat whole as phase, percent 0
     (msg.trim(), 0)
-}
-
-/// Build a text‑based progress bar: 20 blocks, e.g. "[████████░░░░]".
-fn build_progress_bar(percent: usize) -> String {
-    let filled = (percent as usize) / 5; // 20 blocks max
-    let empty = 20 - filled;
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
 // ============================================================================
@@ -1158,7 +1329,7 @@ unsafe fn push_output_line(terminal: &Arc<Mutex<TerminalBuffer>>, hwnd: HWND, li
 }
 
 /// Clear the terminal content.
-unsafe fn clear_output(hwnd: HWND, terminal: &Arc<Mutex<TerminalBuffer>>, terminal_hwnd: HWND) {
+unsafe fn clear_output(_hwnd: HWND, terminal: &Arc<Mutex<TerminalBuffer>>, terminal_hwnd: HWND) {
     {
         let mut term = terminal.lock().unwrap();
         term.clear();
@@ -1186,12 +1357,21 @@ unsafe fn clear_output(hwnd: HWND, terminal: &Arc<Mutex<TerminalBuffer>>, termin
 }
 
 /// Request a terminal refresh. Only posts a message if one isn't already pending.
+/// During a test run, we force immediate refresh using SendMessage.
 unsafe fn request_refresh(hwnd: HWND) {
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if state_ptr == 0 {
         return;
     }
     let state = &mut *(state_ptr as *mut AppState);
+
+    // ---- TEST STREAMING FIX: if test run active, force immediate refresh via SendMessage ----
+    if state.is_test_run {
+        // SendMessage will process WM_USER_REFRESH synchronously on the main thread.
+        SendMessageW(hwnd, WM_USER_REFRESH, 0, 0);
+        return;
+    }
+
     if state.pending_refresh {
         if AUTO_SCROLL_TRACE {
             println!("[AUTO-SCROLL] request_refresh: refresh already pending, skipping");
@@ -1221,20 +1401,28 @@ unsafe fn process_output_refresh(hwnd: HWND) {
         return;
     }
 
-    let now = Instant::now();
-    if now.duration_since(state.last_refresh_time) < Duration::from_millis(REFRESH_INTERVAL_MS) {
-        // We are on cooldown! Don't drop the update.
-        // Keep pending_refresh = true and set an alarm to flush the rest later.
-        state.pending_refresh = true;
-        SetTimer(hwnd, 1001, REFRESH_INTERVAL_MS as u32, ptr::null());
-        return;
+    // ---- TEST STREAMING FIX: bypass cooldown if test run is active ----
+    if !state.is_test_run {
+        let now = Instant::now();
+        if now.duration_since(state.last_refresh_time) < Duration::from_millis(REFRESH_INTERVAL_MS)
+        {
+            // We are on cooldown! Don't drop the update.
+            // Keep pending_refresh = true and set an alarm to flush the rest later.
+            state.pending_refresh = true;
+            SetTimer(hwnd, 1001, REFRESH_INTERVAL_MS as u32, ptr::null());
+            return;
+        }
+        // Cooldown passed – proceed
+        state.pending_refresh = false;
+        state.last_refresh_time = now;
+        KillTimer(hwnd, 1001);
+    } else {
+        // For test runs, we don't throttle – just proceed immediately.
+        state.pending_refresh = false;
+        // Update last_refresh_time to avoid a sudden burst after the test, but we don't enforce cooldown.
+        state.last_refresh_time = Instant::now();
+        KillTimer(hwnd, 1001);
     }
-
-    // Cooldown passed. Proceed with the flush!
-    state.pending_refresh = false;
-    state.processing_refresh = true;
-    state.last_refresh_time = now;
-    KillTimer(hwnd, 1001); // Cancel any alarms, we are flushing right now
 
     // 1. STEAL the buffer
     let new_lines = {
@@ -1274,9 +1462,7 @@ unsafe fn process_output_refresh(hwnd: HWND) {
             );
         }
 
-        // Stop redrawing to avoid flicker
         SendMessageW(state.hwnd_terminal, 0x000B /* WM_SETREDRAW */, 0, 0);
-        // Select from start to the cutoff index and delete
         SendMessageW(
             state.hwnd_terminal,
             EM_SETSEL,
@@ -1284,7 +1470,6 @@ unsafe fn process_output_refresh(hwnd: HWND) {
             cutoff_char_index as LPARAM,
         );
         SendMessageW(state.hwnd_terminal, EM_REPLACESEL, 0, w!("") as LPARAM);
-        // Resume redrawing
         SendMessageW(state.hwnd_terminal, 0x000B /* WM_SETREDRAW */, 1, 0);
     }
 
@@ -1295,7 +1480,6 @@ unsafe fn process_output_refresh(hwnd: HWND) {
         combined.push_str("\r\n");
     }
 
-    // Append the text
     apply_terminal_colored_text_append(state.hwnd_terminal, &combined);
 
     // 5. Restore caret and snap to bottom if needed
@@ -1303,13 +1487,10 @@ unsafe fn process_output_refresh(hwnd: HWND) {
         if AUTO_SCROLL_TRACE {
             println!("[AUTO-SCROLL] Scrolling to bottom");
         }
-        // Move caret to the absolute end of the newly appended text
         let ndx = SendMessageW(state.hwnd_terminal, WM_GETTEXTLENGTH, 0, 0);
         SendMessageW(state.hwnd_terminal, EM_SETSEL, ndx as WPARAM, ndx as LPARAM);
-        // Force the window to scroll to the caret
         SendMessageW(state.hwnd_terminal, EM_SCROLLCARET, 0, 0);
 
-        // Also scroll the viewport using EM_LINESCROLL for reliability
         let total_lines = SendMessageW(state.hwnd_terminal, EM_GETLINECOUNT, 0, 0);
         if total_lines > 0 {
             let mut rect = RECT {
@@ -1359,6 +1540,10 @@ unsafe extern "system" fn editor_subclass_proc(
     _dwRefData: usize,
 ) -> LRESULT {
     let main_hwnd = GetParent(hwnd);
+    // Safety: if the parent window is invalid, fall back to default processing.
+    if main_hwnd.is_null() {
+        return DefSubclassProc(hwnd, msg, wparam, lparam);
+    }
 
     match msg {
         WM_DROPFILES => {
@@ -1390,8 +1575,13 @@ unsafe extern "system" fn editor_subclass_proc(
             );
             let has_selection = start != end;
 
+            // Helper to produce wide string pointer (must live long enough)
+            let wstr = |s: &str| {
+                let wide = to_wide(s);
+                wide.as_ptr()
+            };
+
             // Append menu items
-            let wstr = |s| to_wide(s).as_ptr();
             AppendMenuW(
                 hMenu,
                 if can_undo { MF_ENABLED } else { MF_GRAYED },
@@ -1519,6 +1709,42 @@ unsafe extern "system" fn editor_subclass_proc(
                     VK_Y => {
                         // Ctrl+Y = Redo (handled natively by Rich Edit)
                     }
+                    VK_B => {
+                        // Ctrl+B = Build Debug, Ctrl+Shift+B = Build Release
+                        let cmd = if shift {
+                            ID_BUILD_RELEASE
+                        } else {
+                            ID_BUILD_DEBUG
+                        };
+                        debug_log!(
+                            "[GUI] Subclass: Ctrl+{}B detected -> posting {:?}",
+                            if shift { "Shift+" } else { "" },
+                            cmd
+                        );
+                        PostMessageW(main_hwnd, WM_COMMAND, cmd as WPARAM, 0);
+                        return 0;
+                    }
+                    VK_C => {
+                        if shift {
+                            // Ctrl+Shift+C = Check
+                            debug_log!("[GUI] Subclass: Ctrl+Shift+C detected -> posting ID_CHECK");
+                            PostMessageW(main_hwnd, WM_COMMAND, ID_CHECK as WPARAM, 0);
+                            return 0;
+                        }
+                        // Ctrl+C = Copy (handled natively by Rich Edit)
+                    }
+                    VK_T => {
+                        // Ctrl+T = Test
+                        debug_log!("[GUI] Subclass: Ctrl+T detected -> posting ID_TEST");
+                        PostMessageW(main_hwnd, WM_COMMAND, ID_TEST as WPARAM, 0);
+                        return 0;
+                    }
+                    VK_L => {
+                        // Ctrl+L = Clean
+                        debug_log!("[GUI] Subclass: Ctrl+L detected -> posting ID_CLEAN");
+                        PostMessageW(main_hwnd, WM_COMMAND, ID_CLEAN as WPARAM, 0);
+                        return 0;
+                    }
                     // Let Rich Edit handle Ctrl+C, Ctrl+V, Ctrl+X, Ctrl+A natively
                     _ => {}
                 }
@@ -1532,7 +1758,7 @@ unsafe extern "system" fn editor_subclass_proc(
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
 
-        WM_MOUSEMOVE => {
+        _WM_MOUSEMOVE => {
             // Tooltip implementation will be added later.
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
@@ -1556,7 +1782,9 @@ unsafe extern "system" fn terminal_subclass_proc(
                 println!("[DRAG_DROP] terminal_subclass_proc: forwarding WM_DROPFILES to main");
             }
             let parent = GetParent(hwnd);
-            SendMessageW(parent, msg, wparam, lparam);
+            if !parent.is_null() {
+                SendMessageW(parent, msg, wparam, lparam);
+            }
             return 0;
         }
         _ => DefSubclassProc(hwnd, msg, wparam, lparam),
@@ -1665,6 +1893,41 @@ unsafe fn apply_diagnostics(state: &mut AppState, diags: Vec<Diagnostic>) {
 }
 
 // ============================================================================
+// Phase callback (called from diagnostic.rs on compiler threads)
+// ============================================================================
+
+fn phase_callback(phase: &'static str, percent: usize) {
+    // Called from diagnostic.rs – this is on a compiler thread, not the main GUI thread.
+    // We use PostMessageW to send the update to the main window.
+    let hwnd = get_gui_hwnd();
+    debug_log!(
+        "[GUI] phase_callback: phase='{}', percent={}, hwnd={:?}",
+        phase,
+        percent,
+        hwnd
+    );
+    if hwnd.is_null() {
+        debug_log!("[GUI] phase_callback: HWND is NULL! Cannot post phase update.");
+        return;
+    }
+    let msg = format!("{} ({}%)", phase, percent);
+    let boxed = Box::new(msg);
+    unsafe {
+        let result = PostMessageW(
+            hwnd as HWND,
+            WM_USER_PHASE_UPDATE,
+            0,
+            Box::into_raw(boxed) as isize,
+        );
+        if result == 0 {
+            debug_log!("[GUI] phase_callback: PostMessageW failed!");
+        } else {
+            debug_log!("[GUI] phase_callback: PostMessageW succeeded");
+        }
+    }
+}
+
+// ============================================================================
 // Window Procedure
 // ============================================================================
 
@@ -1680,12 +1943,19 @@ unsafe extern "system" fn wnd_proc(
             let dll_name = to_wide(RICHEDIT_DLL);
             LoadLibraryW(dll_name.as_ptr());
 
+            // Initialize common controls for progress bar
+            let mut icc = INITCOMMONCONTROLSEX {
+                dwSize: mem::size_of::<INITCOMMONCONTROLSEX>() as DWORD,
+                dwICC: ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS,
+            };
+            InitCommonControlsEx(&mut icc);
+
             let hinst = GetModuleHandleW(ptr::null());
 
-            // Editor Rich Edit
+            // Editor Rich Edit – flat, borderless (no WS_BORDER, no WS_EX_CLIENTEDGE)
             let class_wide = to_wide(MSFTEDIT_CLASS);
             let hwnd_editor = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                0, // No extended border styles
                 class_wide.as_ptr(),
                 ptr::null(),
                 WS_CHILD
@@ -1708,15 +1978,19 @@ unsafe extern "system" fn wnd_proc(
             );
             debug_log!("[GUI] Editor HWND: {:?}", hwnd_editor);
 
+            // Force dark scrollbars and overall dark theme on the editor
+            let dark_theme = w!("DarkMode_Explorer");
+            SetWindowTheme(hwnd_editor, dark_theme, ptr::null());
+
             RevokeDragDrop(hwnd_editor);
 
             // Set a large text limit for the editor (2GB characters)
             SendMessageW(hwnd_editor, EM_LIMITTEXT, 0x7FFFFFFF, 0);
 
-            // ---- Terminal Rich Edit (replaces ListBox) ----
+            // ---- Terminal Rich Edit – flat, borderless ----
             // Set ES_READONLY to prevent user input, but allow selection and copy.
             let hwnd_terminal = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                0, // No extended border styles
                 class_wide.as_ptr(),
                 ptr::null(),
                 WS_CHILD
@@ -1747,16 +2021,14 @@ unsafe extern "system" fn wnd_proc(
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
 
+            // Force dark scrollbars and overall dark theme on the terminal
+            SetWindowTheme(hwnd_terminal, dark_theme, ptr::null());
+
             // Revoke OLE drag‑drop on the terminal too
             RevokeDragDrop(hwnd_terminal);
 
             // Set effectively infinite text limit for terminal (2GB characters)
             SendMessageW(hwnd_terminal, EM_LIMITTEXT, 0x7FFFFFFF, 0);
-
-            // Set dark background and white text for terminal
-            SendMessageW(hwnd_terminal, EM_SETBKGNDCOL, 0, 0x1E1E1E);
-            let hFontTerm = CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, w!("Consolas"));
-            SendMessageW(hwnd_terminal, 0x0030, hFontTerm as WPARAM, 1);
 
             // ---- Button ----
             let hwnd_button = CreateWindowExW(
@@ -1775,29 +2047,172 @@ unsafe extern "system" fn wnd_proc(
             );
             debug_log!("[GUI] Button HWND: {:?}", hwnd_button);
 
-            // ---- Status bar ----
-            let hwnd_status = CreateWindowExW(
+            // ---- Status bar grip is removed ----
+
+            // ---- Status text label ----
+            let hwnd_status_text = CreateWindowExW(
                 0,
-                w!("msctls_statusbar32"),
-                ptr::null(),
-                WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                w!("STATIC"),
+                w!("0% - Ready"), // hyphen, not en-dash
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
                 0,
                 0,
-                0,
-                0,
+                200,
+                22,
                 hwnd,
                 ptr::null_mut(),
                 hinst,
                 ptr::null_mut(),
             );
-            debug_log!("[GUI] Status bar HWND: {:?}", hwnd_status);
+            debug_log!("[GUI] Status text HWND: {:?}", hwnd_status_text);
 
-            // ---- Fonts ----
-            let hFont = CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, w!("Consolas"));
-            SendMessageW(hwnd_editor, 0x0030, hFont as WPARAM, 1);
-            SendMessageW(hwnd_editor, EM_SETBKGNDCOL, 0, 0x1E1E1E);
+            // ---- Progress bar ----
+            let hwnd_progress = CreateWindowExW(
+                0,
+                w!(PROGRESS_CLASS),
+                ptr::null(),
+                WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+                0,
+                0,
+                100,
+                22,
+                hwnd,
+                ptr::null_mut(),
+                hinst,
+                ptr::null_mut(),
+            );
+            debug_log!("[GUI] Progress bar HWND: {:?}", hwnd_progress);
+
+            // ---- Create dark brushes for controls ----
+            let hbrEditBk = CreateSolidBrush(0x001E1E1E);
+            let hbrButtonBk = CreateSolidBrush(0x001E1E1E);
+            let hbrStatusBk = CreateSolidBrush(0x001E1E1E);
+
+            // ---- FORCE DARK THEME ON ALL CONTROLS (already done for editor/terminal) ----
+            SetWindowTheme(hwnd_button, dark_theme, ptr::null());
+            SetWindowTheme(hwnd_status_text, dark_theme, ptr::null());
+            SetWindowTheme(hwnd_progress, dark_theme, ptr::null());
+
+            let hr_progress = SetWindowTheme(hwnd_progress, dark_theme, ptr::null());
+            debug_log!(
+                "[GUI] SetWindowTheme(progress) HRESULT = 0x{:08X}",
+                hr_progress
+            );
+
+            // ---- Create a modern, ClearType‑hinted monospace font ----
+            debug_log!("[GUI] Creating font with Consolas, -15pt, ClearType");
+            let hFont = CreateFontW(
+                -15,                     // height (negative = point size)
+                0,                       // width (0 = automatic)
+                0,                       // escapement
+                0,                       // orientation
+                FW_NORMAL,               // weight
+                0,                       // italic
+                0,                       // underline
+                0,                       // strikeout
+                DEFAULT_CHARSET,         // character set
+                OUT_DEFAULT_PRECIS,      // output precision
+                CLIP_DEFAULT_PRECIS,     // clipping precision
+                CLEARTYPE_QUALITY,       // quality (ClearType)
+                FIXED_PITCH | FF_MODERN, // pitch and family
+                w!("Consolas"),          // face name
+            );
+            debug_log!("[GUI] Font handle: {:?}", hFont);
+
+            // ---- Apply font and background to editor ----
+            if !hFont.is_null() {
+                let res = SendMessageW(hwnd_editor, 0x0030, hFont as WPARAM, 1);
+                debug_log!("[GUI] WM_SETFONT(editor) returned {}", res);
+            } else {
+                debug_log!("[GUI] ERROR: hFont is NULL!");
+            }
+
+            // Set dark background for editor via EM_SETBKGNDCOL
+            let dark_bg: isize = 0x001E1E1E;
+            let prev_bg = SendMessageW(hwnd_editor, EM_SETBKGNDCOL, 0, dark_bg);
+            debug_log!(
+                "[GUI] EM_SETBKGNDCOL(editor) returned {} (previous)",
+                prev_bg
+            );
+            // Force redraw to apply new background
+            RedrawWindow(
+                hwnd_editor,
+                ptr::null(),
+                ptr::null_mut(),
+                RDW_INVALIDATE | RDW_UPDATENOW,
+            );
+
+            // Set default text color to white for editor
             set_editor_white_color(hwnd_editor);
-            SendMessageW(hwnd_terminal, 0x0030, hFont as WPARAM, 1);
+
+            // Apply font to terminal
+            if !hFont.is_null() {
+                let res = SendMessageW(hwnd_terminal, 0x0030, hFont as WPARAM, 1);
+                debug_log!("[GUI] WM_SETFONT(terminal) returned {}", res);
+            }
+
+            // Set dark background for terminal via EM_SETBKGNDCOL
+            let prev_bg = SendMessageW(hwnd_terminal, EM_SETBKGNDCOL, 0, dark_bg);
+            debug_log!(
+                "[GUI] EM_SETBKGNDCOL(terminal) returned {} (previous)",
+                prev_bg
+            );
+            RedrawWindow(
+                hwnd_terminal,
+                ptr::null(),
+                ptr::null_mut(),
+                RDW_INVALIDATE | RDW_UPDATENOW,
+            );
+
+            // Also set default text color for terminal to white
+            let mut cf = CHARFORMAT2W {
+                cbSize: mem::size_of::<CHARFORMAT2W>() as u32,
+                dwMask: CFM_COLOR,
+                dwEffects: 0,
+                crTextColor: 0x00FFFFFF,
+                ..mem::zeroed()
+            };
+            SendMessageW(
+                hwnd_terminal,
+                EM_SETCHARFORMAT,
+                SCF_ALL,
+                &mut cf as *mut _ as isize,
+            );
+            SendMessageW(
+                hwnd_terminal,
+                EM_SETCHARFORMAT,
+                SCF_DEFAULT,
+                &mut cf as *mut _ as isize,
+            );
+
+            // ---- Apply font to status text and button ----
+            if !hFont.is_null() {
+                let res = SendMessageW(hwnd_status_text, 0x0030, hFont as WPARAM, 1);
+                debug_log!("[GUI] WM_SETFONT(status_text) returned {}", res);
+                let res = SendMessageW(hwnd_button, 0x0030, hFont as WPARAM, 1);
+                debug_log!("[GUI] WM_SETFONT(button) returned {}", res);
+            }
+
+            // ---- Add margins to editor and terminal ----
+            let margins = (12 << 16) | 12; // right and left = 12 pixels
+            let margin_res = SendMessageW(
+                hwnd_editor,
+                EM_SETMARGINS,
+                (EC_LEFTMARGIN | EC_RIGHTMARGIN) as WPARAM,
+                margins as LPARAM,
+            );
+            debug_log!("[GUI] EM_SETMARGINS(editor) returned {}", margin_res);
+            let margin_res = SendMessageW(
+                hwnd_terminal,
+                EM_SETMARGINS,
+                (EC_LEFTMARGIN | EC_RIGHTMARGIN) as WPARAM,
+                margins as LPARAM,
+            );
+            debug_log!("[GUI] EM_SETMARGINS(terminal) returned {}", margin_res);
+
+            // ---- Theme the button (already done) ----
+            let hr_button = SetWindowTheme(hwnd_button, dark_theme, ptr::null());
+            debug_log!("[GUI] SetWindowTheme(button) HRESULT = 0x{:08X}", hr_button);
 
             let hBrush = CreateSolidBrush(0x1E1E1E);
 
@@ -1862,19 +2277,29 @@ unsafe extern "system" fn wnd_proc(
                 hBuildMenu,
                 MF_STRING,
                 ID_BUILD_DEBUG as usize,
-                w!("&Build (Debug)"),
+                w!("&Build (Debug)\tCtrl+B"),
             );
             AppendMenuW(
                 hBuildMenu,
                 MF_STRING,
                 ID_BUILD_RELEASE as usize,
-                w!("Build &Release"),
+                w!("Build &Release\tCtrl+Shift+B"),
             );
             AppendMenuW(hBuildMenu, MF_SEPARATOR, 0, ptr::null());
-            AppendMenuW(hBuildMenu, MF_STRING, ID_CHECK as usize, w!("&Check"));
+            AppendMenuW(
+                hBuildMenu,
+                MF_STRING,
+                ID_CHECK as usize,
+                w!("&Check\tCtrl+Shift+C"),
+            );
             AppendMenuW(hBuildMenu, MF_SEPARATOR, 0, ptr::null());
-            AppendMenuW(hBuildMenu, MF_STRING, ID_TEST as usize, w!("&Test"));
-            AppendMenuW(hBuildMenu, MF_STRING, ID_CLEAN as usize, w!("&Clean"));
+            AppendMenuW(hBuildMenu, MF_STRING, ID_TEST as usize, w!("&Test\tCtrl+T"));
+            AppendMenuW(
+                hBuildMenu,
+                MF_STRING,
+                ID_CLEAN as usize,
+                w!("&Clean\tCtrl+L"),
+            );
             AppendMenuW(hMenu, MF_POPUP, hBuildMenu as usize, w!("&Build"));
 
             SetMenu(hwnd, hMenu);
@@ -1898,18 +2323,23 @@ unsafe extern "system" fn wnd_proc(
             debug_log!("[GUI] Tooltip HWND: {:?}", tooltip_hwnd);
 
             // ---- AppState ----
-            let mut state = AppState {
+            let state = AppState {
                 hwnd_main: hwnd,
                 hwnd_editor,
                 hwnd_terminal,
                 hwnd_button,
-                hwnd_status,
+                hwnd_status_text,
+                hwnd_progress,
                 hFont,
                 hBrush,
+                hbrStatusBk,
+                hbrEditBk,
+                hbrButtonBk,
                 tooltip_hwnd,
                 compilation_in_progress: false,
                 was_at_bottom: false,
                 pending_refresh: false,
+                is_test_run: false, // <-- NEW
                 ..Default::default()
             };
 
@@ -1917,14 +2347,29 @@ unsafe extern "system" fn wnd_proc(
             let boxed = Box::new(state);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(boxed) as isize);
 
+            // Set the terminal buffer and GUI HWND for the diagnostic module
             set_gui_terminal(terminal);
+            debug_log!("[GUI] Setting GUI HWND to {:?}", hwnd);
             set_gui_hwnd(hwnd);
 
+            // Set the phase callback (this is the function that will be called from diagnostic.rs)
+            set_gui_phase_callback(phase_callback);
+
             // Subclass the editor
-            let _ = SetWindowSubclass(hwnd_editor, editor_subclass_proc as usize, 1, 0);
+            let _ = SetWindowSubclass(
+                hwnd_editor,
+                editor_subclass_proc as *const () as usize,
+                1,
+                0,
+            );
 
             // Subclass the terminal
-            let _ = SetWindowSubclass(hwnd_terminal, terminal_subclass_proc as usize, 2, 0);
+            let _ = SetWindowSubclass(
+                hwnd_terminal,
+                terminal_subclass_proc as *const () as usize,
+                2,
+                0,
+            );
 
             // Revoke OLE drag‑drop on the main window as well to be safe
             RevokeDragDrop(hwnd);
@@ -1947,21 +2392,176 @@ unsafe extern "system" fn wnd_proc(
 
             SetFocus(hwnd_editor);
 
-            let mut icc = INITCOMMONCONTROLSEX {
-                dwSize: mem::size_of::<INITCOMMONCONTROLSEX>() as DWORD,
-                dwICC: ICC_STANDARD_CLASSES,
-            };
-            InitCommonControlsEx(&mut icc);
+            // Set initial progress bar value (0)
+            SendMessageW(hwnd_progress, PBM_SETPOS, 0, 0);
 
-            // Set initial status bar text: empty bar with "Ready"
-            let empty_bar = build_progress_bar(0);
-            let initial_status = format!("[{}] {}% – Ready", empty_bar, 0);
-            let wide_initial = to_wide(&initial_status);
-            SetWindowTextW(hwnd_status, wide_initial.as_ptr());
+            // ---- Force an initial WM_SIZE to set layout ----
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetClientRect(hwnd, &mut rect);
+            SendMessageW(
+                hwnd,
+                WM_SIZE,
+                0,
+                ((rect.bottom as isize) << 16) | (rect.right as isize),
+            );
 
             return 0;
         }
 
+        // ---- Undocumented UAH messages for dark menu bar ----
+        // WM_UAHDRAWMENU: paints the background of the menu bar
+        WM_UAHDRAWMENU => {
+            let p_uahmenu = lparam as *const UAHMENU;
+            if !p_uahmenu.is_null() {
+                let hdc = (*p_uahmenu).hdc as HDC;
+
+                let mut rc_window = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                GetWindowRect(hwnd, &mut rc_window);
+
+                let mut mbi: MENUBARINFO = mem::zeroed();
+                mbi.cbSize = mem::size_of::<MENUBARINFO>() as u32;
+
+                // OBJID_MENU = -3
+                if GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mut mbi) != 0 {
+                    let mut rc_bar = mbi.rcBar;
+
+                    // Map from screen coordinates to non-client window coordinates
+                    rc_bar.left -= rc_window.left;
+                    rc_bar.top -= rc_window.top;
+                    rc_bar.right -= rc_window.left;
+                    rc_bar.bottom -= rc_window.top;
+
+                    // #1E1E1E is standard VS Code dark gray
+                    let brush = CreateSolidBrush(0x001E1E1E);
+                    FillRect(hdc, &rc_bar, brush);
+                    DeleteObject(brush as *mut c_void);
+                }
+            }
+            return 0;
+        }
+
+        // WM_UAHDRAWMENUITEM: paints individual menu items (File, Edit, etc.)
+        WM_UAHDRAWMENUITEM => {
+            let p_draw = lparam as *const UAHDRAWMENUITEM;
+            if !p_draw.is_null() {
+                let dis = &(*p_draw).dis;
+                let hdc = dis.hDC;
+                let mut rc = dis.rcItem;
+
+                // Check if user is hovering (ODS_HOTLIGHT = 0x0040) or clicking (ODS_SELECTED = 0x0001)
+                let is_active = (dis.itemState & 0x0041) != 0;
+
+                // Use lighter gray for hover/selection, dark gray for idle
+                let bg_color = if is_active { 0x00333333 } else { 0x001E1E1E };
+
+                let brush = CreateSolidBrush(bg_color);
+                FillRect(hdc, &rc, brush);
+                DeleteObject(brush as *mut c_void);
+
+                // Set text color and background mode
+                SetBkMode(hdc, 1); // TRANSPARENT
+                SetTextColor(hdc, 0x00FFFFFF); // White text
+
+                // Get menu text
+                let mut text = [0u16; 256];
+                let hmenu = (*p_draw).um.hmenu as HMENU;
+
+                let len = GetMenuStringW(
+                    hmenu,
+                    (*p_draw).umi.iPosition as u32,
+                    text.as_mut_ptr(),
+                    text.len() as i32,
+                    0x0400, // MF_BYPOSITION
+                );
+
+                if len > 0 {
+                    // DT_SINGLELINE | DT_CENTER | DT_VCENTER = 0x0025
+                    let format = DT_SINGLELINE | DT_CENTER | DT_VCENTER;
+                    DrawTextW(hdc, text.as_ptr(), len, &mut rc, format);
+                }
+            }
+            return 0;
+        }
+
+        // --------------------------------------------------------------
+        // WM_ERASEBKGND – fill with border color so the 1‑px gap becomes visible
+        // --------------------------------------------------------------
+        WM_ERASEBKGND => {
+            let hdc = wparam as HDC;
+            let border_brush = CreateSolidBrush(0x00333333);
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            GetClientRect(hwnd, &mut rect);
+            FillRect(hdc, &rect, border_brush);
+            DeleteObject(border_brush);
+            return 1; // we handled it
+        }
+
+        WM_CTLCOLOREDIT => {
+            // For editor and terminal, return dark background brush and set white text
+            let hdc = wparam as HDC;
+            let hwndCtl = lparam as HWND;
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if state_ptr != 0 {
+                let state = &*(state_ptr as *const AppState);
+                if hwndCtl == state.hwnd_editor || hwndCtl == state.hwnd_terminal {
+                    SetTextColor(hdc, 0x00FFFFFF); // white text
+                    SetBkColor(hdc, 0x001E1E1E); // dark background
+                    return state.hbrEditBk as LRESULT;
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        WM_CTLCOLORBTN => {
+            // For button, return dark background brush if needed
+            let hdc = wparam as HDC;
+            let hwndCtl = lparam as HWND;
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if state_ptr != 0 {
+                let state = &*(state_ptr as *const AppState);
+                if hwndCtl == state.hwnd_button {
+                    SetTextColor(hdc, 0x00FFFFFF);
+                    SetBkColor(hdc, 0x001E1E1E);
+                    return state.hbrButtonBk as LRESULT;
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        WM_CTLCOLORSTATIC => {
+            // Handle dark background for status text
+            let hdc = wparam as HDC;
+            let hwndCtl = lparam as HWND;
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if state_ptr != 0 {
+                let state = &*(state_ptr as *const AppState);
+                if hwndCtl == state.hwnd_status_text {
+                    SetTextColor(hdc, 0x00DCDCDC);
+                    SetBkColor(hdc, 0x001E1E1E);
+                    return state.hbrStatusBk as LRESULT;
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+
+        // ============================================================
+        // WM_SIZE – layout with 2‑px inset (Gap Trick) for custom border
+        // ============================================================
         WM_SIZE => {
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if state_ptr == 0 {
@@ -1972,57 +2572,100 @@ unsafe extern "system" fn wnd_proc(
             let client_width = (lparam & 0xFFFF) as i32;
             let client_height = ((lparam >> 16) & 0xFFFF) as i32;
 
-            let button_width = 80;
-            let button_height = 24;
-            let gap = 4;
-            let status_height = 22;
+            // Inset for the custom border (2px on all sides for visibility)
+            const BORDER_INSET: i32 = 2;
 
-            let editor_height = (client_height - status_height) * 60 / 100;
-            let terminal_height =
-                client_height - status_height - editor_height - button_height - gap * 2;
+            // Increased bottom bar height to 64 pixels
+            let bottom_bar_height = 64;
+            let gap = 8; // gap between editor and terminal
 
-            let hdwp = BeginDeferWindowPos(4);
-            let hdwp = DeferWindowPos(
+            // Compute heights without insets
+            let editor_height = ((client_height - bottom_bar_height) * 6) / 10;
+            let terminal_height = client_height - bottom_bar_height - editor_height - gap;
+
+            let hdwp = BeginDeferWindowPos(5); // 5 controls: editor, terminal, status_text, progress, button
+
+            // Editor – inset by BORDER_INSET from left, top, right, bottom
+            let _ = DeferWindowPos(
                 hdwp,
                 state.hwnd_editor,
                 ptr::null_mut(),
-                0,
-                0,
-                client_width,
-                editor_height,
+                BORDER_INSET,
+                BORDER_INSET,
+                client_width - 2 * BORDER_INSET,
+                editor_height - 2 * BORDER_INSET,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            let hdwp = DeferWindowPos(
+
+            // Terminal – inset from left, right, and bottom, and from top with gap
+            let _ = DeferWindowPos(
                 hdwp,
                 state.hwnd_terminal,
                 ptr::null_mut(),
-                0,
-                editor_height + gap,
-                client_width,
-                terminal_height,
+                BORDER_INSET,
+                editor_height + gap + BORDER_INSET, // start after gap and inset
+                client_width - 2 * BORDER_INSET,
+                terminal_height - 2 * BORDER_INSET,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            let hdwp = DeferWindowPos(
+
+            // Status text – we leave it as before (no inset needed, but we keep it aligned)
+            let status_text_width = 280;
+            let button_width = 100;
+            let button_height = 34;
+
+            // Status text – vertically centered in the taller bar
+            let status_y = client_height - bottom_bar_height + (bottom_bar_height - 22) / 2;
+            let _ = DeferWindowPos(
+                hdwp,
+                state.hwnd_status_text,
+                ptr::null_mut(),
+                gap,
+                status_y,
+                status_text_width,
+                22,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+
+            // Progress bar – vertically centered
+            let progress_x = gap + status_text_width + gap;
+            let progress_width =
+                (client_width - status_text_width - button_width - gap * 6).max(120);
+            let progress_y = client_height - bottom_bar_height + (bottom_bar_height - 18) / 2;
+            let _ = DeferWindowPos(
+                hdwp,
+                state.hwnd_progress,
+                ptr::null_mut(),
+                progress_x,
+                progress_y,
+                progress_width,
+                18,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+
+            // Run Button – vertically centered
+            let button_y =
+                client_height - bottom_bar_height + (bottom_bar_height - button_height) / 2;
+            let _ = DeferWindowPos(
                 hdwp,
                 state.hwnd_button,
                 ptr::null_mut(),
-                client_width - button_width - gap,
-                editor_height + gap + terminal_height + gap,
+                client_width - button_width - 12,
+                button_y,
                 button_width,
                 button_height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            let hdwp = DeferWindowPos(
-                hdwp,
-                state.hwnd_status,
-                ptr::null_mut(),
-                0,
-                client_height - status_height,
-                client_width,
-                status_height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+
             EndDeferWindowPos(hdwp);
+
+            // Force redraw of button to ensure it appears correctly
+            RedrawWindow(
+                state.hwnd_button,
+                ptr::null(),
+                ptr::null_mut(),
+                RDW_INVALIDATE | RDW_UPDATENOW,
+            );
 
             return 0;
         }
@@ -2165,7 +2808,7 @@ unsafe extern "system" fn wnd_proc(
                         return 0;
                     }
 
-                    if let Some(path) = &state.file_path {
+                    if let Some(_path) = &state.file_path {
                         if let Err(e) = save_file(state) {
                             debug_log!("[GUI] save_file before run failed: {}", e);
                             push_output_line(&state.terminal, hwnd, format!("Save failed: {}", e));
@@ -2265,13 +2908,13 @@ unsafe extern "system" fn wnd_proc(
                         return 0;
                     }
 
-                    if let Some(path) = &state.file_path {
+                    if let Some(_path) = &state.file_path {
                         if let Err(e) = save_file(state) {
                             debug_log!("[GUI] save_file before build failed: {}", e);
                             push_output_line(&state.terminal, hwnd, format!("Save failed: {}", e));
                             return 0;
                         }
-                        let path = Path::new(path).to_path_buf();
+                        let path = Path::new(&_path).to_path_buf();
                         clear_output(hwnd, &state.terminal, state.hwnd_terminal);
                         state.compilation_in_progress = true;
                         emit_phase_update("Building (debug)", 0);
@@ -2338,13 +2981,13 @@ unsafe extern "system" fn wnd_proc(
                         return 0;
                     }
 
-                    if let Some(path) = &state.file_path {
+                    if let Some(_path) = &state.file_path {
                         if let Err(e) = save_file(state) {
                             debug_log!("[GUI] save_file before build failed: {}", e);
                             push_output_line(&state.terminal, hwnd, format!("Save failed: {}", e));
                             return 0;
                         }
-                        let path = Path::new(path).to_path_buf();
+                        let path = Path::new(&_path).to_path_buf();
                         clear_output(hwnd, &state.terminal, state.hwnd_terminal);
                         state.compilation_in_progress = true;
                         emit_phase_update("Building (release)", 0);
@@ -2410,13 +3053,13 @@ unsafe extern "system" fn wnd_proc(
                         return 0;
                     }
 
-                    if let Some(path) = &state.file_path {
+                    if let Some(_path) = &state.file_path {
                         if let Err(e) = save_file(state) {
                             debug_log!("[GUI] save_file before check failed: {}", e);
                             push_output_line(&state.terminal, hwnd, format!("Save failed: {}", e));
                             return 0;
                         }
-                        let path = Path::new(path).to_path_buf();
+                        let path = Path::new(&_path).to_path_buf();
                         clear_output(hwnd, &state.terminal, state.hwnd_terminal);
                         state.compilation_in_progress = true;
                         emit_phase_update("Checking", 0);
@@ -2513,6 +3156,9 @@ unsafe extern "system" fn wnd_proc(
                         return 0;
                     }
 
+                    // ---- Set test run flag so refresh bypasses throttle ----
+                    state.is_test_run = true;
+
                     thread::spawn(move || {
                         let hwnd = hwnd_main as HWND;
                         unsafe {
@@ -2533,6 +3179,12 @@ unsafe extern "system" fn wnd_proc(
                                     debug_log!("[GUI] run_tests error: {}", e);
                                     push_output_line(&terminal, hwnd, format!("Test error: {}", e));
                                 }
+                            }
+                            // ---- Test run finished: clear flag ----
+                            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                            if state_ptr != 0 {
+                                let state = &mut *(state_ptr as *mut AppState);
+                                state.is_test_run = false;
                             }
                             PostMessageW(hwnd, WM_USER_REFRESH, 0, 0);
                             thread::sleep(Duration::from_millis(20));
@@ -2766,6 +3418,7 @@ unsafe extern "system" fn wnd_proc(
         WM_USER_PHASE_UPDATE => {
             if lparam != 0 {
                 let msg = Box::from_raw(lparam as *mut String);
+                debug_log!("[GUI] WM_USER_PHASE_UPDATE: received message: '{}'", msg);
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
                 if state_ptr != 0 {
                     let state = &mut *(state_ptr as *mut AppState);
@@ -2776,6 +3429,14 @@ unsafe extern "system" fn wnd_proc(
                         percent,
                         msg
                     );
+
+                    // ---- TEST STREAMING FIX: set flag based on phase ----
+                    if phase == "Testing" {
+                        state.is_test_run = true;
+                    } else if phase == "Test complete" {
+                        state.is_test_run = false;
+                    }
+
                     if phase == "Compilation complete"
                         || phase == "Build complete"
                         || phase == "Check complete"
@@ -2783,16 +3444,33 @@ unsafe extern "system" fn wnd_proc(
                         || phase == "Clean complete"
                     {
                         state.compilation_in_progress = false;
+                        debug_log!("[GUI] compilation_in_progress set to false");
                     } else {
                         state.compilation_in_progress = true;
                     }
-                    let bar = build_progress_bar(percent);
-                    let status_text = format!("[{}] {}% – {}", bar, percent, phase);
-                    let wide = to_wide(&status_text);
-                    SetWindowTextW(state.hwnd_status, wide.as_ptr());
-                    // Force immediate redraw of the status bar
-                    UpdateWindow(state.hwnd_status);
+                    // Update status text with hyphen, not en-dash
+                    let status_text = format!("{}% - {}", percent, phase);
+                    SetWindowTextW(state.hwnd_status_text, to_wide(&status_text).as_ptr());
+                    // Update progress bar
+                    SendMessageW(state.hwnd_progress, PBM_SETPOS, percent as WPARAM, 0);
+                    // Force immediate redraw of the status bar area
+                    RedrawWindow(
+                        state.hwnd_status_text,
+                        ptr::null(),
+                        ptr::null_mut(),
+                        RDW_INVALIDATE,
+                    );
+                    RedrawWindow(
+                        state.hwnd_progress,
+                        ptr::null(),
+                        ptr::null_mut(),
+                        RDW_INVALIDATE,
+                    );
+                } else {
+                    debug_log!("[GUI] WM_USER_PHASE_UPDATE: state_ptr is null!");
                 }
+            } else {
+                debug_log!("[GUI] WM_USER_PHASE_UPDATE: lparam is 0, ignoring.");
             }
             return 0;
         }
@@ -2823,8 +3501,12 @@ unsafe extern "system" fn wnd_proc(
                 }
                 DeleteObject(state.hFont as *mut c_void);
                 DeleteObject(state.hBrush as *mut c_void);
+                DeleteObject(state.hbrStatusBk as *mut c_void);
+                DeleteObject(state.hbrEditBk as *mut c_void);
+                DeleteObject(state.hbrButtonBk as *mut c_void);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
+
             PostQuitMessage(0);
             return 0;
         }
@@ -2847,6 +3529,9 @@ pub fn run(hide_console: bool) -> Result<(), String> {
         // Initialize OLE so that RevokeDragDrop actually works
         OleInitialize(ptr::null_mut());
 
+        // Enable dark mode for native menus (dropdowns) – does not affect horizontal bar
+        enable_dark_mode_menus();
+
         debug_log!("[GUI] run() started");
         let hinst = GetModuleHandleW(ptr::null());
         if hinst.is_null() {
@@ -2867,7 +3552,8 @@ pub fn run(hide_console: bool) -> Result<(), String> {
             hInstance: hinst,
             hIcon: icon,
             hCursor: cursor,
-            hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+            // Use subtle dark gray for the border (Gap Trick)
+            hbrBackground: CreateSolidBrush(0x00333333),
             lpszMenuName: ptr::null(),
             lpszClassName: class_name,
             hIconSm: ptr::null_mut(),
@@ -2903,29 +3589,47 @@ pub fn run(hide_console: bool) -> Result<(), String> {
         }
         debug_log!("[GUI] Main window HWND: {:?}", hwnd);
 
-        // DWM theming
-        let dark_mode = 1i32;
+        // ---- Stronger dark mode enforcement ----
+        let dark = 1i32;
+
+        // Primary dark mode attribute (Windows 11)
         let hr = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark_mode as *const _ as *const c_void,
+            &dark as *const _ as *const c_void,
             4,
         );
         debug_log!(
-            "[GUI] DwmSetWindowAttribute dark mode: HRESULT = 0x{:08X}",
+            "[GUI] DwmSetWindowAttribute dark mode (20): HRESULT = 0x{:08X}",
             hr
         );
-        let corner_preference = DWMWCP_ROUND;
+
+        // Older attribute (for Windows 10 builds that need it)
+        let hr = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE_OLD,
+            &dark as *const _ as *const c_void,
+            4,
+        );
+        debug_log!(
+            "[GUI] DwmSetWindowAttribute dark mode (19): HRESULT = 0x{:08X}",
+            hr
+        );
+
+        // Rounded corners
+        let corner = DWMWCP_ROUND;
         let hr = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corner_preference as *const _ as *const c_void,
+            &corner as *const _ as *const c_void,
             4,
         );
         debug_log!(
             "[GUI] DwmSetWindowAttribute rounded corners: HRESULT = 0x{:08X}",
             hr
         );
+
+        // Mica backdrop
         let backdrop = DWMSBT_MAINWINDOW;
         let hr = DwmSetWindowAttribute(
             hwnd,
@@ -2935,8 +3639,42 @@ pub fn run(hide_console: bool) -> Result<(), String> {
         );
         debug_log!("[GUI] DwmSetWindowAttribute Mica: HRESULT = 0x{:08X}", hr);
 
+        // ---- NEW: Custom title bar color (slightly lighter) ----
+        const DWMWA_CAPTION_COLOR: u32 = 35;
+        let caption_color = 0x00333333u32; // <-- tweak this hex value
+        let hr_caption = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &caption_color as *const _ as *const c_void,
+            4,
+        );
+        debug_log!(
+            "[GUI] DwmSetWindowAttribute caption color (35): HRESULT = 0x{:08X}",
+            hr_caption
+        );
+
+        // ---- Force dark menu bar theme ----
+        let hr_theme = SetWindowTheme(hwnd, w!("DarkMode_Explorer"), ptr::null());
+        debug_log!("[GUI] SetWindowTheme(main) HRESULT = 0x{:08X}", hr_theme);
+
+        // Re-apply immersive dark mode (sometimes it needs a second push)
+        let hr = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const c_void,
+            4,
+        );
+        debug_log!(
+            "[GUI] DwmSetWindowAttribute dark mode (20) re-apply: HRESULT = 0x{:08X}",
+            hr
+        );
+
+        // Show the window
         ShowWindow(hwnd, 1);
         debug_log!("[GUI] ShowWindow called");
+
+        // Redraw the menu bar (will be painted via UAH messages)
+        DrawMenuBar(hwnd);
 
         // ---- Message pump: no accelerator table, no TranslateAccelerator ----
         let mut msg = MSG {

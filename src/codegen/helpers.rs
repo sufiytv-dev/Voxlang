@@ -8,7 +8,6 @@
 // for recursively expanding type aliases before LLVM mapping.
 
 use crate::codegen::CodegenEngine;
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;

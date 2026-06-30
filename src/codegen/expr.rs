@@ -14,6 +14,14 @@
 // - Stores the device pointer value in a temporary on the stack, then passes
 //   the address of that temporary to the kernel launch API.
 // - Uses the correct size for the pointee type
+//
+// FIXED (2026-06-29): For Metal backend, skip device memory allocation and
+// host-to-device copy. The runtime manages all device memory. Pass the host
+// address directly in the argument array.
+//
+// PHASE 3 (2026-06-29): Emit an array of argument sizes (in bytes) and pass
+// it to vox_launch_kernel_3d as an extra parameter. This removes hardcoded
+// sizes in the runtime and enables support for f32, i64, etc.
 
 use crate::codegen::CodegenEngine;
 use crate::codegen::type_map::parse_generic_type;
@@ -48,15 +56,6 @@ impl<'a> ExprEmitter<'a> {
         match self.target {
             CodegenTarget::Host => self.engine.debug_emit(line),
             CodegenTarget::Device => self.engine.debug_emit_device(line),
-        }
-    }
-
-    /// Helper: return the pointer type to use for a load/store of an alloca on the device.
-    fn device_ptr_type(&self, elem_ty: &str) -> String {
-        if self.target == CodegenTarget::Device {
-            self.engine.device_ptr_type(elem_ty)
-        } else {
-            format!("{}*", elem_ty)
         }
     }
 
@@ -252,7 +251,6 @@ impl<'a> ExprEmitter<'a> {
 
                 let mut ty = base_vox_ty.as_str();
                 let mut ptr_reg = base_ptr;
-                let mut loaded_count = 0;
 
                 while ty.starts_with('&') {
                     self.engine.debug_log(&format!(
@@ -263,9 +261,11 @@ impl<'a> ExprEmitter<'a> {
                     let ptr_ty = self
                         .engine
                         .map_type(ty, self.target == CodegenTarget::Device);
+                    // The pointer operand is a pointer to the value type, i.e., ptr_ty*
+                    let ptr_operand_ty = format!("{}*", ptr_ty);
                     self.emit(&format!(
                         "    {} = load {}, {} {}",
-                        loaded, ptr_ty, ptr_ty, ptr_reg
+                        loaded, ptr_ty, ptr_operand_ty, ptr_reg
                     ));
                     ptr_reg = loaded;
                     if let Some(s) = ty.strip_prefix("&mut ") {
@@ -276,7 +276,6 @@ impl<'a> ExprEmitter<'a> {
                         break;
                     }
                     ty = ty.trim();
-                    loaded_count += 1;
                 }
 
                 let stripped_ty = ty;
@@ -923,8 +922,8 @@ impl<'a> ExprEmitter<'a> {
                         variant,
                         bindings,
                         by_ref: _,
-                        enum_name,
-                        span,
+                        enum_name: _,
+                        span: _,
                     } = &arm.pattern
                     {
                         let enum_base = CodegenEngine::strip_generic_args(&scr_vox_ty);
@@ -1072,7 +1071,7 @@ impl<'a> ExprEmitter<'a> {
                 let target_llvm = self
                     .engine
                     .map_type(target_type, self.target == CodegenTarget::Device);
-                let source_is_string = matches!(**expr, ASTNode::StringLiteral(..));
+                let _source_is_string = matches!(**expr, ASTNode::StringLiteral(..));
 
                 let mut source_ty = self.expr_type(expr).unwrap_or_default();
                 if let ASTNode::Identifier(name, _) = &**expr {
@@ -1363,7 +1362,7 @@ impl<'a> ExprEmitter<'a> {
                                     ));
                                     return result_reg;
                                 } else {
-                                    if let Some(concrete_ty) = concrete_ty {
+                                    if let Some(_concrete_ty) = concrete_ty {
                                         return "zeroinitializer".to_string();
                                     } else {
                                         if discriminant == 0 {
@@ -3093,7 +3092,7 @@ impl<'a> ExprEmitter<'a> {
                 let left_ty = self.expr_type(left).unwrap_or_else(|| "i32".to_string());
                 let right_ty = self.expr_type(right).unwrap_or_else(|| "i32".to_string());
                 let is_float = left_ty == "f64" || right_ty == "f64";
-                let is_integer = !is_float;
+                let _is_integer = !is_float;
 
                 match op {
                     TokenKind::Equal
@@ -3585,64 +3584,85 @@ impl<'a> ExprEmitter<'a> {
                 let grid_z = self.compile(gz_expr);
 
                 // -------------------------------------------------------------
-                // 1. Allocate device memory for mutable reference (&mut) arguments
+                // 1. Determine which arguments are mutable references.
+                //    For Metal, we will NOT allocate device memory or copy;
+                //    we pass host addresses directly. The runtime will manage
+                //    everything on the device side.
                 // -------------------------------------------------------------
-                let mut mutable_indices = Vec::new();
-                for (i, vt) in param_vox_types.iter().enumerate() {
-                    if vt.starts_with("&mut ") {
-                        mutable_indices.push(i);
+                let is_metal = self.engine.gpu_mode.as_deref() == Some("metal");
+                let mutable_indices: Vec<usize> = param_vox_types
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, vt)| {
+                        if vt.starts_with("&mut ") {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // For non-Metal, we need device pointers for mutable args.
+                // For Metal, we don't allocate anything here – just pass the host address.
+                let mut device_ptrs = Vec::new(); // (arg_index, device_ptr_reg, size, pointee_vox)
+                if !is_metal {
+                    for &idx in &mutable_indices {
+                        let pointee_vox = &param_vox_types[idx][5..]; // after "&mut "
+                        let size = self.engine.size_of_type(pointee_vox);
+                        if size == 0 {
+                            emit_diagnostic(
+                                &Diagnostic::error(&format!(
+                                    "Cannot determine size of pointee type '{}' for mutable parameter",
+                                    pointee_vox
+                                ))
+                                .with_code("VX0313")
+                                .with_span(*span),
+                            );
+                            self.engine.has_error = true;
+                            return "0".to_string();
+                        }
+                        let dev_ptr = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = call i8* @vox_gpu_malloc(i64 {})",
+                            dev_ptr, size
+                        ));
+                        let pointee_llvm = self
+                            .engine
+                            .map_type(pointee_vox, self.target == CodegenTarget::Device);
+                        let cast_ptr = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = bitcast i8* {} to {}*",
+                            cast_ptr, dev_ptr, pointee_llvm
+                        ));
+                        device_ptrs.push((idx, cast_ptr, size, pointee_vox.to_string()));
                     }
-                }
-                let mut device_ptrs = Vec::new(); // (arg_index, device_ptr_reg, size_in_bytes, pointee_vox)
-                for &idx in &mutable_indices {
-                    let pointee_vox = &param_vox_types[idx][5..]; // after "&mut "
-                    let size = self.engine.size_of_type(pointee_vox);
-                    if size == 0 {
-                        emit_diagnostic(
-                            &Diagnostic::error(&format!(
-                                "Cannot determine size of pointee type '{}' for mutable parameter",
-                                pointee_vox
-                            ))
-                            .with_code("VX0313")
-                            .with_span(*span),
-                        );
-                        self.engine.has_error = true;
-                        return "0".to_string();
-                    }
-                    let dev_ptr = self.engine.next_register();
-                    self.emit(&format!(
-                        "    {} = call i8* @vox_gpu_malloc(i64 {})",
-                        dev_ptr, size
-                    ));
-                    let pointee_llvm = self
-                        .engine
-                        .map_type(pointee_vox, self.target == CodegenTarget::Device);
-                    let cast_ptr = self.engine.next_register();
-                    self.emit(&format!(
-                        "    {} = bitcast i8* {} to {}*",
-                        cast_ptr, dev_ptr, pointee_llvm
-                    ));
-                    device_ptrs.push((idx, cast_ptr, size, pointee_vox.to_string()));
                 }
 
                 // -------------------------------------------------------------
                 // 2. Build argument pointer array (void**)
                 // -------------------------------------------------------------
                 let arg_array = self.engine.next_register();
+                let arg_count = args.len();
+                self.emit(&format!("    {} = alloca [{} x i8*]", arg_array, arg_count));
+                let arg_ptr = self.engine.next_register();
                 self.emit(&format!(
-                    "    {} = alloca i8*, i32 {}, align 8",
-                    arg_array,
-                    args.len()
+                    "    {} = getelementptr inbounds [{} x i8*], [{} x i8*]* {}, i64 0, i64 0",
+                    arg_ptr, arg_count, arg_count, arg_array
                 ));
 
+                // -------------------------------------------------------------
+                // 2a. Store arguments into the argument array.
+                //     This uses arg_ptr (register %1) early, making register
+                //     numbering sequential.
+                // -------------------------------------------------------------
                 for (i, arg) in args.iter().enumerate() {
-                    let arg_val = self.compile(arg); // SSA value
+                    let arg_val = self.compile(arg); // SSA value (may be a host pointer)
                     let arg_vox = self.expr_type(arg).unwrap_or_else(|| "i32".to_string());
 
                     if mutable_indices.contains(&i) {
-                        // Mutable reference argument: &mut T
-                        // The argument expression must be a BorrowExpr of a variable.
-                        // Retrieve the host variable's alloca pointer.
+                        // Mutable reference argument
+                        // For Metal: just pass the host pointer directly.
+                        // For non-Metal: we allocate device buffer and copy.
                         let host_ptr = match arg {
                             ASTNode::BorrowExpr { expr, .. } => match &**expr {
                                 ASTNode::Identifier(name, _) => {
@@ -3682,59 +3702,78 @@ impl<'a> ExprEmitter<'a> {
                                 return "0".to_string();
                             }
                         };
-                        // Strip "&mut " from arg_vox to get the pointee Vox type
-                        let pointee_vox = arg_vox
-                            .strip_prefix("&mut ")
-                            .unwrap_or(&arg_vox)
-                            .to_string();
-                        let pointee_llvm = self.engine.map_type(&pointee_vox, false); // host LLVM type of pointee
-                        // Cast host pointer to i8*
-                        let host_i8 = self.engine.next_register();
-                        self.emit(&format!(
-                            "    {} = bitcast {}* {} to i8*",
-                            host_i8, pointee_llvm, host_ptr
-                        ));
-                        // Get device pointer and cast to i8*
-                        let dev_ptr_reg = device_ptrs
-                            .iter()
-                            .find(|(idx, _, _, _)| *idx == i)
-                            .unwrap()
-                            .1
-                            .clone();
-                        let dev_i8 = self.engine.next_register();
-                        self.emit(&format!(
-                            "    {} = bitcast {}* {} to i8*",
-                            dev_i8, pointee_llvm, dev_ptr_reg
-                        ));
-                        // Copy host value to device
-                        let size = self.engine.size_of_type(&pointee_vox);
-                        self.emit(&format!(
-                            "    call void @vox_gpu_memcpy_host_to_device(i8* {}, i8* {}, i64 {})",
-                            dev_i8, host_i8, size
-                        ));
 
-                        // *** FIX: create a temporary stack variable to hold the device pointer value ***
-                        // The argument array must contain a pointer to the argument value.
-                        // For a pointer argument (the device pointer itself), the "value" is the pointer.
-                        // We create a temporary i8*, store the device pointer in it, then pass the address of that temporary.
-                        let temp_ptr = self.engine.next_register();
-                        self.emit(&format!("    {} = alloca i8*", temp_ptr));
-                        self.emit(&format!("    store i8* {}, i8** {}", dev_i8, temp_ptr));
-                        let ptr_to_temp = self.engine.next_register();
-                        self.emit(&format!(
-                            "    {} = bitcast i8** {} to i8*",
-                            ptr_to_temp, temp_ptr
-                        ));
+                        if is_metal {
+                            // Metal: just store the host pointer (as i8*) in the argument array.
+                            let pointee_vox = arg_vox
+                                .strip_prefix("&mut ")
+                                .unwrap_or(&arg_vox)
+                                .to_string();
+                            let pointee_llvm = self.engine.map_type(&pointee_vox, false);
+                            let host_i8 = self.engine.next_register();
+                            self.emit(&format!(
+                                "    {} = bitcast {}* {} to i8*",
+                                host_i8, pointee_llvm, host_ptr
+                            ));
+                            let gep = self.engine.next_register();
+                            self.emit(&format!(
+                                "    {} = getelementptr i8*, i8** {}, i32 {}",
+                                gep, arg_ptr, i
+                            ));
+                            self.emit(&format!("    store i8* {}, i8** {}", host_i8, gep));
+                        } else {
+                            // Non-Metal: copy host→device, then store device pointer in temp.
+                            let pointee_vox = arg_vox
+                                .strip_prefix("&mut ")
+                                .unwrap_or(&arg_vox)
+                                .to_string();
+                            let pointee_llvm = self
+                                .engine
+                                .map_type(&pointee_vox, self.target == CodegenTarget::Device);
+                            let host_i8 = self.engine.next_register();
+                            self.emit(&format!(
+                                "    {} = bitcast {}* {} to i8*",
+                                host_i8, pointee_llvm, host_ptr
+                            ));
 
-                        let gep = self.engine.next_register();
-                        self.emit(&format!(
-                            "    {} = getelementptr i8*, i8** {}, i32 {}",
-                            gep, arg_array, i
-                        ));
-                        self.emit(&format!("    store i8* {}, i8** {}", ptr_to_temp, gep));
+                            // Get the device pointer from device_ptrs
+                            let dev_ptr_reg = device_ptrs
+                                .iter()
+                                .find(|(idx, _, _, _)| *idx == i)
+                                .unwrap()
+                                .1
+                                .clone();
+                            let dev_i8 = self.engine.next_register();
+                            self.emit(&format!(
+                                "    {} = bitcast {}* {} to i8*",
+                                dev_i8, pointee_llvm, dev_ptr_reg
+                            ));
+                            // Copy host→device
+                            let size = self.engine.size_of_type(&pointee_vox);
+                            self.emit(&format!(
+                                "    call void @vox_gpu_memcpy_host_to_device(i8* {}, i8* {}, i64 {})",
+                                dev_i8, host_i8, size
+                            ));
+
+                            // Create temporary to hold device pointer, store its address in arg array.
+                            let temp_ptr = self.engine.next_register();
+                            self.emit(&format!("    {} = alloca i8*", temp_ptr));
+                            self.emit(&format!("    store i8* {}, i8** {}", dev_i8, temp_ptr));
+                            let ptr_to_temp = self.engine.next_register();
+                            self.emit(&format!(
+                                "    {} = bitcast i8** {} to i8*",
+                                ptr_to_temp, temp_ptr
+                            ));
+                            let gep = self.engine.next_register();
+                            self.emit(&format!(
+                                "    {} = getelementptr i8*, i8** {}, i32 {}",
+                                gep, arg_ptr, i
+                            ));
+                            self.emit(&format!("    store i8* {}, i8** {}", ptr_to_temp, gep));
+                        }
                     } else {
                         // Non-mutable argument: normal value (i32, float, struct, etc.)
-                        // Create a temporary alloca to hold the value and store its address.
+                        // For both Metal and non-Metal, we pass a pointer to a temporary holding the value.
                         let arg_llvm = self
                             .engine
                             .map_type(&arg_vox, self.target == CodegenTarget::Device);
@@ -3752,10 +3791,63 @@ impl<'a> ExprEmitter<'a> {
                         let gep = self.engine.next_register();
                         self.emit(&format!(
                             "    {} = getelementptr i8*, i8** {}, i32 {}",
-                            gep, arg_array, i
+                            gep, arg_ptr, i
                         ));
                         self.emit(&format!("    store i8* {}, i8** {}", ptr_to_tmp, gep));
                     }
+                }
+
+                // -------------------------------------------------------------
+                // 2b. Build argument size array (i64*) and fill it.
+                //     This happens after all argument stores, so registers are
+                //     already used for all stores, and size array registers will
+                //     be consecutive.
+                // -------------------------------------------------------------
+                let size_array = self.engine.next_register();
+                self.emit(&format!(
+                    "    {} = alloca [{} x i64]",
+                    size_array, arg_count
+                ));
+                let size_ptr = self.engine.next_register();
+                self.emit(&format!(
+                    "    {} = getelementptr inbounds [{} x i64], [{} x i64]* {}, i64 0, i64 0",
+                    size_ptr, arg_count, arg_count, size_array
+                ));
+
+                // Helper to get size of a Vox type (in bytes)
+                fn get_arg_size(engine: &mut CodegenEngine, vox_ty: &str) -> usize {
+                    // Strip references for pointer arguments
+                    let ty = if vox_ty.starts_with("&mut ") || vox_ty.starts_with("& ") {
+                        &vox_ty[vox_ty.find(' ').unwrap_or(0) + 1..]
+                    } else {
+                        vox_ty
+                    };
+                    // Convert u64 to usize. The size will never exceed usize on the target.
+                    engine.size_of_type(ty) as usize
+                }
+
+                for i in 0..arg_count {
+                    let arg = &args[i];
+                    let arg_vox = self.expr_type(arg).unwrap_or_else(|| "i32".to_string());
+                    let size_val = get_arg_size(self.engine, &arg_vox);
+                    if size_val == 0 {
+                        emit_diagnostic(
+                            &Diagnostic::error(&format!(
+                                "Cannot determine size of argument type '{}'",
+                                arg_vox
+                            ))
+                            .with_code("VX0317")
+                            .with_span(*span),
+                        );
+                        self.engine.has_error = true;
+                        return "0".to_string();
+                    }
+                    let gep = self.engine.next_register();
+                    self.emit(&format!(
+                        "    {} = getelementptr i64, i64* {}, i32 {}",
+                        gep, size_ptr, i
+                    ));
+                    self.emit(&format!("    store i64 {}, i64* {}", size_val, gep));
                 }
 
                 // -----------------------------------------------------------------
@@ -3765,13 +3857,14 @@ impl<'a> ExprEmitter<'a> {
                 self.emit(&ptr_inst);
                 let launch_ret = self.engine.next_register();
                 self.emit(&format!(
-                    "    {} = call i32 @vox_launch_kernel_3d(i8* {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i8** {}, i32 {})",
+                    "    {} = call i32 @vox_launch_kernel_3d(i8* {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i8** {}, i32 {}, i64* {})",
                     launch_ret,
                     kernel_name_ptr,
                     grid_x, grid_y, grid_z,
                     block_x, block_y, block_z,
-                    arg_array,
-                    args.len()
+                    arg_ptr,
+                    args.len(),
+                    size_ptr
                 ));
 
                 let success_i1 = self.engine.next_register();
@@ -3792,77 +3885,90 @@ impl<'a> ExprEmitter<'a> {
 
                 // -------------------------------------------------------------
                 // 4. Copy back results for &mut parameters (device → host)
+                //    Only for non-Metal; Metal does its own copy in the runtime.
                 // -------------------------------------------------------------
-                for (idx, dev_ptr, size, pointee_vox) in &device_ptrs {
-                    let host_ptr = match &args[*idx] {
-                        ASTNode::BorrowExpr { expr, .. } => match &**expr {
-                            ASTNode::Identifier(name, _) => {
-                                if let Some((_, alloc_reg, _, _)) =
-                                    self.engine.variable_symbols.get(name)
-                                {
-                                    alloc_reg.clone()
-                                } else {
+                if !is_metal {
+                    for (idx, dev_ptr, size, pointee_vox) in &device_ptrs {
+                        let host_ptr = match &args[*idx] {
+                            ASTNode::BorrowExpr { expr, .. } => match &**expr {
+                                ASTNode::Identifier(name, _) => {
+                                    if let Some((_, alloc_reg, _, _)) =
+                                        self.engine.variable_symbols.get(name)
+                                    {
+                                        alloc_reg.clone()
+                                    } else {
+                                        emit_diagnostic(
+                                            &Diagnostic::error(&format!(
+                                                "Cannot find host variable '{}' for mutable kernel argument",
+                                                name
+                                            ))
+                                            .with_code("VX0314")
+                                            .with_span(*span),
+                                        );
+                                        self.engine.has_error = true;
+                                        return "0".to_string();
+                                    }
+                                }
+                                _ => {
                                     emit_diagnostic(
-                                        &Diagnostic::error(&format!(
-                                            "Cannot find host variable '{}' for mutable kernel argument",
-                                            name
-                                        ))
-                                        .with_code("VX0314")
-                                        .with_span(*span),
+                                        &Diagnostic::error("Mutable kernel argument must be a simple borrow of a variable")
+                                            .with_code("VX0315")
+                                            .with_span(*span),
                                     );
                                     self.engine.has_error = true;
                                     return "0".to_string();
                                 }
-                            }
+                            },
                             _ => {
                                 emit_diagnostic(
-                                    &Diagnostic::error("Mutable kernel argument must be a simple borrow of a variable")
-                                        .with_code("VX0315")
-                                        .with_span(*span),
+                                    &Diagnostic::error(
+                                        "Mutable kernel argument must be a borrow expression",
+                                    )
+                                    .with_code("VX0316")
+                                    .with_span(*span),
                                 );
                                 self.engine.has_error = true;
                                 return "0".to_string();
                             }
-                        },
-                        _ => {
-                            emit_diagnostic(
-                                &Diagnostic::error(
-                                    "Mutable kernel argument must be a borrow expression",
-                                )
-                                .with_code("VX0316")
-                                .with_span(*span),
-                            );
-                            self.engine.has_error = true;
-                            return "0".to_string();
-                        }
-                    };
-                    let pointee_llvm = self
-                        .engine
-                        .map_type(pointee_vox, self.target == CodegenTarget::Device);
-                    let dev_i8 = self.engine.next_register();
-                    self.emit(&format!(
-                        "    {} = bitcast {}* {} to i8*",
-                        dev_i8, pointee_llvm, dev_ptr
-                    ));
-                    self.emit(&format!(
-                        "    call void @vox_gpu_memcpy_device_to_host(i8* {}, i8* {}, i64 {})",
-                        host_ptr, dev_i8, size
-                    ));
+                        };
+                        let pointee_llvm = self
+                            .engine
+                            .map_type(pointee_vox, self.target == CodegenTarget::Device);
+
+                        let host_i8 = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = bitcast {}* {} to i8*",
+                            host_i8, pointee_llvm, host_ptr
+                        ));
+
+                        let dev_i8 = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = bitcast {}* {} to i8*",
+                            dev_i8, pointee_llvm, dev_ptr
+                        ));
+
+                        self.emit(&format!(
+                            "    call void @vox_gpu_memcpy_device_to_host(i8* {}, i8* {}, i64 {})",
+                            host_i8, dev_i8, size
+                        ));
+                    }
                 }
 
                 // -------------------------------------------------------------
-                // 5. Free device memory
+                // 5. Free device memory (only for non-Metal)
                 // -------------------------------------------------------------
-                for (_, dev_ptr, _, pointee_vox) in &device_ptrs {
-                    let pointee_llvm = self
-                        .engine
-                        .map_type(pointee_vox, self.target == CodegenTarget::Device);
-                    let dev_i8 = self.engine.next_register();
-                    self.emit(&format!(
-                        "    {} = bitcast {}* {} to i8*",
-                        dev_i8, pointee_llvm, dev_ptr
-                    ));
-                    self.emit(&format!("    call void @vox_gpu_free(i8* {})", dev_i8));
+                if !is_metal {
+                    for (_, dev_ptr, _, pointee_vox) in &device_ptrs {
+                        let pointee_llvm = self
+                            .engine
+                            .map_type(pointee_vox, self.target == CodegenTarget::Device);
+                        let dev_i8 = self.engine.next_register();
+                        self.emit(&format!(
+                            "    {} = bitcast {}* {} to i8*",
+                            dev_i8, pointee_llvm, dev_ptr
+                        ));
+                        self.emit(&format!("    call void @vox_gpu_free(i8* {})", dev_i8));
+                    }
                 }
 
                 "0".to_string()

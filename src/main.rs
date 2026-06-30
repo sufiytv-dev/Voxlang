@@ -139,8 +139,8 @@ Options (may appear before or after the command):
   --debug                 Enable debug output (lexer, parser, codegen)
   --target <TRIPLE>       Target triple (default: host triple)
   --output-format <FORMAT> Specify terminal formatting ("pretty", "json", "auto")
-  --gpu <BACKEND>         GPU backend: "cuda" or "hip" (auto-detected if omitted)
-  --gpu-arch <ARCH>       GPU architecture (e.g., sm_70, sm_75, gfx1200) (auto-detected if omitted)
+  --gpu <BACKEND>         GPU backend: "cuda", "hip", or "metal" (auto-detected if omitted)
+  --gpu-arch <ARCH>       GPU architecture (e.g., sm_70, sm_75, gfx1200, apple2) (auto-detected if omitted)
   --no-cache              Ignore all caches
   --reuse-proofs [true|false] Reuse cached Z3 proofs (default: true)
   --reuse-bitcode [true|false] Reuse cached LLVM bitcode (default: true)
@@ -209,13 +209,16 @@ fn parse_args() -> Cli {
                 }
                 "--gpu" => {
                     if i + 1 >= args.len() {
-                        eprintln!("Error: --gpu requires a backend (cuda or hip)");
+                        eprintln!("Error: --gpu requires a backend (cuda, hip, or metal)");
                         print_usage();
                         std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
                     }
                     let backend = args[i + 1].clone();
-                    if backend != "cuda" && backend != "hip" {
-                        eprintln!("Error: --gpu must be 'cuda' or 'hip', got '{}'", backend);
+                    if backend != "cuda" && backend != "hip" && backend != "metal" {
+                        eprintln!(
+                            "Error: --gpu must be 'cuda', 'hip', or 'metal', got '{}'",
+                            backend
+                        );
                         print_usage();
                         std::process::exit(diagnostic::exit_code::GENERIC_ERROR);
                     }
@@ -423,7 +426,7 @@ pub fn compile_source(
     gpu_backend: Option<&str>,
     gpu_arch: Option<&str>,
     config: &CacheConfig,
-    profile: &str,    // "debug" or "release"
+    _profile: &str,   // "debug" or "release"
     check_only: bool, // if true, stop after semantic analysis (no IR generation)
 ) -> Result<CompilationResult, String> {
     let path = Path::new(file_path);
@@ -562,18 +565,32 @@ pub fn compile_source(
     // -------------------------------------------------------------------------
     // Auto-detect GPU backend and architecture (prioritise installed SDK)
     // -------------------------------------------------------------------------
-    let (final_backend, final_arch): (Option<String>, Option<String>);
+    let (final_backend, mut final_arch): (Option<String>, Option<String>);
+
+    // Helper to get default arch for Metal based on target triple
+    let default_metal_arch = |target_triple: &str| -> &str {
+        if target_triple.contains("x86_64") {
+            "mac2" // Intel Macs
+        } else {
+            "apple2" // Apple Silicon (also works for Apple GPUs on macOS)
+        }
+    };
 
     // 1. User override via --gpu / --gpu-arch
     if let Some(backend) = gpu_backend {
         final_backend = Some(backend.to_string());
         final_arch = gpu_arch.map(|s| s.to_string());
+        if final_arch.is_none() && backend == "metal" {
+            // Use default based on target if not overridden
+            final_arch = Some(default_metal_arch(target).to_string());
+        }
     } else if let Some(sdk) = discovery::find_gpu_sdk() {
         // 2. If a GPU SDK is installed, use that
         final_backend = Some(sdk.backend.clone());
         let default_arch = match sdk.backend.as_str() {
             "cuda" => "sm_75",
             "hip" => "gfx1200",
+            "metal" => default_metal_arch(target),
             _ => "sm_75",
         };
         final_arch = gpu_arch
@@ -606,18 +623,24 @@ pub fn compile_source(
 
     emit_phase_update("IR generation", 70);
 
-    // Determine GPU architecture default (sm_75 for RTX 2070 Super)
+    // Determine GPU architecture default
     let default_gpu_arch = match final_backend.as_deref() {
         Some("cuda") => "sm_75",
         Some("hip") => "gfx1200",
+        Some("metal") => default_metal_arch(target),
         _ => "sm_75",
     };
     let effective_gpu_arch = final_arch.as_deref().unwrap_or(default_gpu_arch);
 
-    // Standard device triples WITHOUT architecture suffix (architecture passed via -mcpu to llc)
+    if final_backend.as_deref() == Some("metal") {
+        eprintln!("[DEBUG] Metal architecture: {}", effective_gpu_arch);
+    }
+
+    // Device triple override: for Metal we use a dummy triple that signals the Metal backend.
     let forced_device_triple = final_backend.as_deref().map(|backend| match backend {
         "cuda" => "nvptx64-nvidia-cuda".to_string(),
         "hip" => "amdgcn-amd-amdhsa".to_string(),
+        "metal" => "metal-apple-macos".to_string(), // used as a marker in codegen
         _ => unreachable!(),
     });
 
@@ -631,7 +654,7 @@ pub fn compile_source(
     for (alias, module_ast) in imported_modules {
         codegen.add_imported_module_ast(alias, module_ast);
     }
-    // Pass the GPU architecture (e.g., "sm_75") to the code generator
+    // Pass the GPU architecture (e.g., "sm_75", "apple2") to the code generator
     codegen.set_gpu_arch(Some(effective_gpu_arch.to_string()));
 
     // LLVM tool discovery with fallback
@@ -660,7 +683,7 @@ pub fn compile_source(
         has_gpu,
         _device_triple: device_triple,
         gpu_backend: final_backend,
-        gpu_arch: final_arch,
+        gpu_arch: Some(effective_gpu_arch.to_string()),
     })
 }
 
@@ -935,6 +958,7 @@ fn cmd_build(
     let sdk_available = match detected_backend {
         Some("cuda") => discovery::find_cuda_sdk().is_some(),
         Some("hip") => discovery::find_hip_sdk().is_some(),
+        Some("metal") => discovery::find_metal_sdk().is_some(),
         _ => true,
     };
     if !sdk_available {
@@ -973,6 +997,7 @@ fn cmd_build(
             (hipcc, true)
         }
         Some("cuda") => (llvm_tools.clang, false),
+        Some("metal") => (llvm_tools.clang, false), // Metal uses clang as linker with -framework Metal
         _ => (llvm_tools.clang, false),
     };
 
@@ -992,7 +1017,7 @@ fn cmd_build(
     let static_lib = cache_dir.join(&lib_name);
 
     // -------------------------------------------------------------------------
-    // Rebuild vox_rt with the appropriate feature flags (or none if CPU fallback)
+    // Rebuild vox_rt with the appropriate feature flags
     // -------------------------------------------------------------------------
     let need_rebuild = !static_lib.exists()
         || fs::metadata("src/vox_rt.rs")
@@ -1008,7 +1033,6 @@ fn cmd_build(
 
     if need_rebuild {
         let mut rustc_cmd = Command::new("rustc");
-        // Use -o to specify the exact output path
         rustc_cmd
             .arg("--crate-type=staticlib")
             .arg("--target")
@@ -1020,22 +1044,28 @@ fn cmd_build(
             .arg("-C")
             .arg("overflow-checks=off")
             .arg("-o")
-            .arg(&static_lib) // output directly to the desired name
+            .arg(&static_lib)
             .arg("src/vox_rt.rs");
 
         if target_triple.contains("msvc") {
             rustc_cmd.arg("-C").arg("target-feature=+crt-static");
         }
-        // Only add feature flag if SDK is available and we have a valid backend
+        // Add feature flags based on the detected backend
         if let Some(backend) = detected_backend {
-            if backend == "cuda" {
-                rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_cuda\"");
-            } else if backend == "hip" {
-                rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_enabled\"");
+            match backend {
+                "cuda" => {
+                    rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_cuda\"");
+                }
+                "hip" => {
+                    rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_enabled\"");
+                }
+                "metal" => {
+                    rustc_cmd.arg("--cfg").arg("feature=\"vox_gpu_metal\"");
+                }
+                _ => {}
             }
         }
 
-        // Capture output to show errors
         let output = rustc_cmd.output().expect("failed to run rustc");
         if !output.status.success() {
             eprintln!("rustc stderr:\n{}", String::from_utf8_lossy(&output.stderr));
@@ -1045,9 +1075,7 @@ fn cmd_build(
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Verify that the library exists; if not, abort with clear error.
-    // -------------------------------------------------------------------------
+    // Verify that the library exists
     if !static_lib.exists() {
         eprintln!(
             "Error: Static library '{}' was not generated.",
@@ -1067,11 +1095,11 @@ fn cmd_build(
     // Set the target triple explicitly (important for Windows)
     link_cmd.arg("-target").arg(target);
 
-    // Use absolute paths for -L to avoid path resolution issues
+    // Use absolute paths for -L
     let cache_dir_abs = cache_dir.canonicalize().unwrap_or(cache_dir);
     link_cmd.arg(&format!("-L{}", cache_dir_abs.display()));
 
-    // Add system library paths to LIB environment variable instead of -L (to avoid quoting issues)
+    // Add system library paths to LIB environment variable
     let mut lib_paths = Vec::new();
     if let Ok(current_lib) = env::var("LIB") {
         if !current_lib.is_empty() {
@@ -1079,14 +1107,12 @@ fn cmd_build(
         }
     }
 
-    // Add discovered system library paths
     for p in &llvm_tools.system_libs {
         if let Some(s) = p.to_str() {
             lib_paths.push(s.to_string());
         }
     }
 
-    // Add cache dir absolute path to LIB
     if let Some(s) = cache_dir_abs.to_str() {
         lib_paths.push(s.to_string());
     }
@@ -1116,10 +1142,10 @@ fn cmd_build(
     }
     debug_log("[DISCOVERY] Set LIB environment variable for linking.");
 
-    // Link against vox_rt (the name is already correct)
-    link_cmd.arg("-lvox_rt"); // For Unix, linker looks for libvox_rt.a; for Windows, vox_rt.lib
+    // Link against vox_rt
+    link_cmd.arg("-lvox_rt");
 
-    // Standard system libraries – exactly as in 0.4
+    // Standard system libraries
     if target_triple.contains("msvc") {
         link_cmd.arg("-Wl,/NODEFAULTLIB:libcmt");
         link_cmd.arg("-lmsvcrt");
@@ -1145,13 +1171,12 @@ fn cmd_build(
     }
 
     // -------------------------------------------------------------------------
-    // Add GPU SDK library paths and libraries only if SDK is available
+    // Add GPU SDK library paths and frameworks only if SDK is available
     // -------------------------------------------------------------------------
     if let Some(backend) = detected_backend {
         match backend {
             "cuda" => {
                 if let Some(sdk) = discovery::find_cuda_sdk() {
-                    // Add CUDA lib to LIB and -L
                     if let Some(s) = sdk.lib_path.to_str() {
                         unsafe {
                             let current = env::var("LIB").unwrap_or_default();
@@ -1166,6 +1191,13 @@ fn cmd_build(
             "hip" => {
                 // hipcc adds its own flags; we just need to link the HIP runtime
                 link_cmd.arg("-lamdhip64");
+            }
+            "metal" => {
+                // Metal requires linking against Metal and Foundation frameworks
+                // Also need -lobjc for Objective-C runtime
+                link_cmd.arg("-lobjc");
+                link_cmd.arg("-framework").arg("Metal");
+                link_cmd.arg("-framework").arg("Foundation");
             }
             _ => {}
         }

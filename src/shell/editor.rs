@@ -1,5 +1,7 @@
 // src/shell/editor.rs – Notepad component (lines, cursor, file I/O)
 
+#![allow(dead_code)]
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

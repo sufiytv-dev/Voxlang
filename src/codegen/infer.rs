@@ -5,8 +5,6 @@
 // and constant folding for compile‑time evaluation.
 
 use crate::codegen::CodegenEngine;
-use crate::codegen::type_map::parse_generic_type;
-use crate::diagnostic::emit_diagnostic;
 use crate::frontend::token::TokenKind;
 use crate::parser::ASTNode;
 use std::collections::HashMap;

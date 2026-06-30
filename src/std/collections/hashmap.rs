@@ -10,7 +10,7 @@ use core::mem;
 
 /// The FNV‑1a hash implementation.
 #[derive(Default)]
-struct FNVHasher(u64);
+pub(crate) struct FNVHasher(u64);
 
 impl Hasher for FNVHasher {
     #[inline]

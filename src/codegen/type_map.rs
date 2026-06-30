@@ -3,12 +3,10 @@
 // Contains methods for mapping Vox types to LLVM types, computing sizes,
 // stripping generic arguments/references, and resolving concrete field types.
 //
-// UPDATED (2026-06-14):
-// - For NVPTX, uses opaque pointers (`ptr`) with address spaces.
-// - `device_ptr_type` returns `"ptr addrspace(5)"` for local memory.
-// - Reference parameters become `ptr addrspace(1)` for global memory.
-// - Allocas get `addrspace(5)` via `alloca_addrspace_suffix`.
-// - Added support for qualified struct names (e.g., `math::Point`).
+// UPDATED (2026-06-28):
+// - Added `is_metal()` helper to detect Metal backend.
+// - Updated address space helpers to handle Metal gracefully (no-op).
+// - Comments clarify that Metal-specific type mapping is handled in `msl.rs`.
 
 use crate::codegen::CodegenEngine;
 use crate::codegen::helpers::sanitize_type_name;
@@ -46,7 +44,7 @@ impl CodegenEngine {
     }
 
     // ------------------------------------------------------------------------
-    // Target detection helpers (NVPTX / AMD)
+    // Target detection helpers (NVPTX / AMD / Metal)
     // ------------------------------------------------------------------------
     /// Detect if target is NVPTX (NVIDIA GPU)
     pub fn is_nvptx(&self) -> bool {
@@ -61,6 +59,20 @@ impl CodegenEngine {
         self.device_triple
             .as_ref()
             .map(|t| t.contains("amdgcn"))
+            .unwrap_or(false)
+    }
+
+    /// Detect if target is Metal (Apple GPU)
+    pub fn is_metal(&self) -> bool {
+        // Check both device triple override and gpu_mode
+        if let Some(ref mode) = self.gpu_mode {
+            if mode == "metal" {
+                return true;
+            }
+        }
+        self.device_triple
+            .as_ref()
+            .map(|t| t.contains("metal") || t.contains("air64"))
             .unwrap_or(false)
     }
 
@@ -113,10 +125,14 @@ impl CodegenEngine {
 
     // ------------------------------------------------------------------------
     // Address space and pointer type helpers (for device IR)
+    // For Metal these are no‑ops because we generate MSL directly.
     // ------------------------------------------------------------------------
     /// Return an address space suffix for `alloca` (e.g., `, addrspace(5)` for GPU).
     pub fn alloca_addrspace_suffix(&self) -> String {
-        if self.is_nvptx() || self.is_amdgcn() {
+        if self.is_metal() {
+            // Metal doesn't use LLVM IR; return empty to avoid incorrect syntax.
+            String::new()
+        } else if self.is_nvptx() || self.is_amdgcn() {
             ", addrspace(5)".to_string()
         } else {
             String::new()
@@ -126,17 +142,22 @@ impl CodegenEngine {
     /// For device IR, return the pointer type string for local memory (allocas).
     /// For NVPTX/AMD, this is `ptr addrspace(5)`. For host, explicit element pointer.
     pub fn device_ptr_type(&self, _elem_ty: &str) -> String {
-        if self.is_nvptx() || self.is_amdgcn() {
+        if self.is_metal() {
+            // Metal path uses MSL; this method should not be called.
+            // Return a dummy to avoid crashes.
+            "ptr".to_string()
+        } else if self.is_nvptx() || self.is_amdgcn() {
             "ptr addrspace(5)".to_string()
         } else {
-            // Host: keep explicit pointer type
             format!("{}*", _elem_ty)
         }
     }
 
     /// Return the LLVM pointer type to use for host `alloca` (opaque `ptr`).
-    /// Kept for host code only.
     pub fn alloca_pointer_type(&self) -> String {
+        if self.is_metal() {
+            return "ptr".to_string();
+        }
         if let Some(triple) = &self.device_triple {
             if triple.contains("amdgcn") {
                 return "ptr addrspace(5)".to_string();
@@ -182,6 +203,7 @@ impl CodegenEngine {
     }
 
     /// Map a Vox type to its LLVM representation.
+    /// Note: For Metal, this method is not used (MSL generator handles its own mapping).
     pub fn map_type(&self, vox_type: &str, is_device: bool) -> String {
         let trimmed = vox_type.trim();
         self.debug_log_type(&format!(
@@ -431,27 +453,27 @@ impl CodegenEngine {
             "*mut u8" => "i8*",
             "usize" => "i32",
             _ => {
-                if trimmed_str.len() == 1
-                    && trimmed_str.chars().next().unwrap().is_ascii_uppercase()
-                {
-                    "i32"
-                } else {
-                    emit_diagnostic(
-                        &Diagnostic::warning(&format!(
-                            "Unknown type '{}', defaulting to i32",
-                            trimmed_str
-                        ))
-                        .with_code("VX0401"),
-                    );
-                    "i32"
-                }
+                // Unknown type: log a warning and default to i32.
+                // The diagnostic will be emitted once per unknown type.
+                emit_diagnostic(
+                    &Diagnostic::warning(&format!(
+                        "Unknown type '{}', defaulting to i32",
+                        trimmed_str
+                    ))
+                    .with_code("VX0401"),
+                );
+                "i32"
             }
         }
         .to_string();
-        self.debug_log_type(&format!(
-            "  -> primitive or fallback: {} -> {}",
-            trimmed_str, result
-        ));
+
+        // Remove the verbose "primitive or fallback" log line.
+        // Only log the result if it's not a common primitive (to reduce noise).
+        let common_primitives = ["i8", "i16", "i32", "i64", "float", "double", "void", "i1"];
+        if !common_primitives.contains(&result.as_str()) {
+            self.debug_log_type(&format!("  -> {} -> {}", trimmed_str, result));
+        }
+
         result
     }
 
@@ -491,7 +513,7 @@ impl CodegenEngine {
                 if struct_no_module.starts_with("Option_") {
                     if let Some(underscore_pos) = struct_no_module.find('_') {
                         let ty_part = &struct_no_module[underscore_pos + 1..];
-                        let mut payload_size = 4;
+                        let payload_size;
                         if let Some((base, _)) = parse_generic_type(ty_part) {
                             payload_size = self.size_of_type(&base);
                         } else {

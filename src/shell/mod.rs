@@ -11,9 +11,14 @@ mod tty; // only needed for TUI
 #[cfg(target_os = "windows")]
 mod windows_gui;
 #[cfg(target_os = "windows")]
-pub use windows_gui::run; // now has signature: pub fn run(hide_console: bool) -> Result<(), String>
+pub use windows_gui::run; // signature: pub fn run(hide_console: bool) -> Result<(), String>
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod macos_gui;
+#[cfg(target_os = "macos")]
+pub use macos_gui::run; // signature: pub fn run(hide_console: bool) -> Result<(), String>
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod tui;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub use tui::run; // signature: pub fn run(_hide_console: bool) -> Result<(), String>

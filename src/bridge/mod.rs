@@ -54,7 +54,7 @@ pub fn bridge_header(header_path: &Path) -> Result<String, String> {
                 output.push_str(&decl);
                 output.push('\n');
             }
-            Err(diag) => {
+            Err(_diag) => {
                 // Diagnostic already emitted inside generate_vox_decl
                 debug_log(format!(
                     "bridge: skipping function '{}' due to error",

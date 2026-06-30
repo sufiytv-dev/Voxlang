@@ -33,15 +33,38 @@ impl CodegenEngine {
     }
 
     /// Add a binary constant (e.g., GPU binary) to the pending list.
+    /// If the data is printable ASCII (plus common whitespace), a comment with the
+    /// decoded text is emitted for readability. The constant itself is always stored
+    /// as hex escapes to ensure exact byte‑for‑byte embedding without length mismatches.
     pub fn add_binary_constant(&mut self, bytes: &[u8]) -> String {
         let name = format!("@device_binary_{}", self.string_counter);
         self.string_counter += 1;
-        let mut escaped = String::new();
+
+        // Check if the data is safe to display as a comment.
+        let is_text = bytes
+            .iter()
+            .all(|&b| b == 0 || (b >= 0x20 && b < 0x7F) || b == b'\n' || b == b'\t' || b == b'\r');
+
+        if is_text {
+            // Emit a comment with the decoded source.
+            let comment_text = String::from_utf8_lossy(bytes);
+            // Escape backslashes and quotes in the comment to keep IR valid.
+            let escaped_comment = comment_text.replace("\\", "\\\\").replace("\"", "\\\"");
+            self.debug_emit("; ----------------------------------------");
+            self.debug_emit(&format!("; Metal MSL source ({} bytes):", bytes.len()));
+            for line in escaped_comment.lines() {
+                self.debug_emit(&format!("; {}", line));
+            }
+            self.debug_emit("; ----------------------------------------");
+        }
+
+        // Always store the actual bytes as hex escapes.
+        let mut hex = String::with_capacity(bytes.len() * 4);
         for &b in bytes {
-            escaped.push_str(&format!("\\{:02X}", b));
+            hex.push_str(&format!("\\{:02X}", b));
         }
         let len = bytes.len();
-        self.pending_strings.push((name.clone(), escaped, len));
+        self.pending_strings.push((name.clone(), hex, len));
         self.string_len.insert(name.clone(), len);
         name
     }
@@ -72,17 +95,17 @@ impl CodegenEngine {
     /// and return the SSA register holding the {i8*, i64} value.
     pub fn get_string_fat_ptr(&mut self, content: &str) -> String {
         let name = self.add_string_constant(content);
-        let len = *self.string_len.get(&name).unwrap();
+        let len = *self.string_len.get(&name).unwrap(); // includes null terminator
         self.debug_log(&format!(
             "generating fat pointer for string constant {}",
             name
         ));
 
-        // Get i8* pointer to the start of the array using modern opaque pointer syntax
         let array_ptr = self.next_register();
+        let array_type = format!("[{} x i8]", len);
         self.debug_emit(&format!(
-            "    {} = getelementptr i8, ptr {}, i64 0",
-            array_ptr, name
+            "    {} = getelementptr inbounds {}, {}* {}, i64 0, i64 0",
+            array_ptr, array_type, array_type, name
         ));
 
         let fat_ptr_alloca = self.next_register();
@@ -114,16 +137,26 @@ impl CodegenEngine {
     /// Returns `(register_name, instruction_line)` – the caller must emit the instruction line.
     pub fn get_string_ptr(&mut self, content: &str) -> (String, String) {
         let name = self.add_string_constant(content);
+        let len = *self.string_len.get(&name).unwrap();
         let reg = self.next_register();
-        let inst = format!("    {} = getelementptr i8, ptr {}, i64 0", reg, name);
+        let array_type = format!("[{} x i8]", len);
+        let inst = format!(
+            "    {} = getelementptr inbounds {}, {}* {}, i64 0, i64 0",
+            reg, array_type, array_type, name
+        );
         (reg, inst)
     }
 
     /// Generate an i8* pointer to a binary constant given its constant name.
     /// Returns `(register_name, instruction_line)` – the caller must emit the instruction line.
     pub fn get_binary_ptr(&mut self, const_name: &str) -> (String, String) {
+        let len = *self.string_len.get(const_name).unwrap_or(&0);
         let reg = self.next_register();
-        let inst = format!("    {} = getelementptr i8, ptr {}, i64 0", reg, const_name);
+        let array_type = format!("[{} x i8]", len);
+        let inst = format!(
+            "    {} = getelementptr inbounds {}, {}* {}, i64 0, i64 0",
+            reg, array_type, array_type, const_name
+        );
         (reg, inst)
     }
 

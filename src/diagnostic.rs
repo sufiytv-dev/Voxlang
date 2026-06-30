@@ -4,6 +4,7 @@
 // Now includes debugging traces for GUI forwarding and a placeholder for source-context
 // diagnostic formatting.
 // Added test_run_active flag to suppress per-file phase updates during test runs.
+// GUI communication is now callback-based, removing direct PostMessageW usage for cross-platform support.
 
 use crate::frontend::span::Span;
 use crate::shell::terminal::TerminalBuffer;
@@ -11,10 +12,34 @@ use std::fs;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+
+// -----------------------------------------------------------------------------
+// Windows‑specific constants and HWND management
+// -----------------------------------------------------------------------------
+#[cfg(windows)]
+use std::os::raw::c_void;
+
+#[cfg(windows)]
+pub const WM_USER_REFRESH: u32 = 0x0400 + 100;
+#[cfg(windows)]
+pub const WM_USER_PHASE_UPDATE: u32 = 0x0400 + 101;
+
+#[cfg(windows)]
+static GUI_HWND: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(windows)]
+pub fn set_gui_hwnd(hwnd: *mut c_void) {
+    GUI_HWND.store(hwnd, Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+pub fn get_gui_hwnd() -> *mut c_void {
+    GUI_HWND.load(Ordering::Relaxed)
+}
 
 // -----------------------------------------------------------------------------
 // Diagnostic trace flag – set to true to enable internal trace prints (to stdout).
@@ -27,7 +52,6 @@ const DIAG_TRACE: bool = false; // <-- Set to true for debugging, then false whe
 // -----------------------------------------------------------------------------
 #[cfg(windows)]
 mod vt {
-    use std::os::windows::io::AsRawHandle;
 
     type DWORD = u32;
     type HANDLE = *mut std::ffi::c_void;
@@ -67,26 +91,26 @@ mod vt {
 }
 
 // -----------------------------------------------------------------------------
-// Win32 constants and types (minimal for message posting)
+// GUI callbacks (set by the platform‑specific GUI implementation)
 // -----------------------------------------------------------------------------
 
-type HWND = *mut std::ffi::c_void;
-type WPARAM = usize;
-type LPARAM = isize;
-type UINT = u32;
-type BOOL = i32;
+/// Callback type for requesting a refresh of the GUI terminal.
+type RefreshCallback = fn();
 
-const WM_USER: UINT = 0x0400;
+/// Callback type for updating the GUI status bar with a phase and percentage.
+type PhaseCallback = fn(&'static str, usize);
 
-/// Custom message sent to the GUI with a heap‑allocated `Box<String>` as lParam.
-/// Used to update the status bar with the current phase.
-pub const WM_USER_PHASE_UPDATE: UINT = WM_USER + 3;
+static GUI_REFRESH_CALLBACK: OnceLock<RefreshCallback> = OnceLock::new();
+static GUI_PHASE_CALLBACK: OnceLock<PhaseCallback> = OnceLock::new();
 
-/// Custom message used to trigger a refresh of the GUI terminal listbox.
-pub const WM_USER_REFRESH: UINT = WM_USER + 1;
+/// Set the callback to request a GUI refresh.
+pub fn set_gui_refresh_callback(callback: RefreshCallback) {
+    let _ = GUI_REFRESH_CALLBACK.set(callback);
+}
 
-unsafe extern "system" {
-    fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> BOOL;
+/// Set the callback to update the GUI status bar.
+pub fn set_gui_phase_callback(callback: PhaseCallback) {
+    let _ = GUI_PHASE_CALLBACK.set(callback);
 }
 
 // -----------------------------------------------------------------------------
@@ -482,25 +506,16 @@ pub fn test_run_active() -> bool {
 }
 
 // -----------------------------------------------------------------------------
-// GUI terminal and HWND forwarding
+// GUI terminal buffer forwarding
 // -----------------------------------------------------------------------------
 
 /// The GUI's terminal buffer to which all phase updates and logs are forwarded.
 static GUI_TERMINAL: OnceLock<Arc<Mutex<TerminalBuffer>>> = OnceLock::new();
 
-/// The GUI's main window HWND (stored as usize to be Sync) to post status bar updates.
-static GUI_HWND: OnceLock<usize> = OnceLock::new();
-
 /// Set the GUI's terminal buffer to receive all diagnostic output.
 pub fn set_gui_terminal(buffer: Arc<Mutex<TerminalBuffer>>) {
     let _ = GUI_TERMINAL.set(buffer);
     eprintln!("[DIAG] GUI_TERMINAL set");
-}
-
-/// Set the GUI's main window HWND to receive phase update messages.
-pub fn set_gui_hwnd(hwnd: HWND) {
-    let _ = GUI_HWND.set(hwnd as usize);
-    eprintln!("[DIAG] GUI_HWND set: {:?}", hwnd);
 }
 
 // A flag to prevent recursion when debug logging calls emit_log.
@@ -538,17 +553,15 @@ fn push_to_gui_terminal(line: String) {
         }
     }
 
-    // Request a UI refresh so the listbox updates
-    if let Some(hwnd) = GUI_HWND.get() {
-        unsafe {
-            let result = PostMessageW(*hwnd as HWND, WM_USER_REFRESH, 0, 0);
-            if DIAG_TRACE {
-                println!("[TRACE] Posted WM_USER_REFRESH, result: {}", result);
-            }
+    // Request a UI refresh using the callback (set by the GUI)
+    if let Some(callback) = GUI_REFRESH_CALLBACK.get() {
+        callback();
+        if DIAG_TRACE {
+            println!("[TRACE] Called GUI refresh callback");
         }
     } else {
         if DIAG_TRACE {
-            println!("[TRACE] GUI_HWND not set, cannot post refresh");
+            println!("[TRACE] GUI_REFRESH_CALLBACK not set, cannot refresh");
         }
     }
 
@@ -737,21 +750,15 @@ pub fn emit_phase_update(phase: &'static str, percent: usize) {
     if should_update_gui {
         push_to_gui_terminal(log_line);
 
-        // Update status bar via custom message to GUI
-        if let Some(hwnd) = GUI_HWND.get() {
-            let hwnd = *hwnd as HWND;
-            let msg = format!("{}  ({}%)", phase, percent);
-            let boxed = Box::new(msg);
-            let ptr = Box::into_raw(boxed);
-            unsafe {
-                PostMessageW(hwnd, WM_USER_PHASE_UPDATE, 0, ptr as isize);
-                if DIAG_TRACE {
-                    println!("[TRACE] Posted WM_USER_PHASE_UPDATE for phase: {}", phase);
-                }
+        // Update status bar via callback (set by GUI)
+        if let Some(callback) = GUI_PHASE_CALLBACK.get() {
+            callback(phase, percent);
+            if DIAG_TRACE {
+                println!("[TRACE] Called GUI phase callback for phase: {}", phase);
             }
         } else {
             if DIAG_TRACE {
-                println!("[TRACE] GUI_HWND not set, cannot post phase update");
+                println!("[TRACE] GUI_PHASE_CALLBACK not set, cannot update status");
             }
         }
     } else {

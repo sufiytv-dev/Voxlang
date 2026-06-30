@@ -5,7 +5,6 @@ use crate::frontend::lexer::Lexer;
 use crate::frontend::span::Span;
 use crate::module::read_source_file;
 use crate::parser::{ASTNode, ImportSource, Parser};
-use crate::std::fs;
 use crate::std::path::{Path, PathBuf};
 
 // -----------------------------------------------------------------------------

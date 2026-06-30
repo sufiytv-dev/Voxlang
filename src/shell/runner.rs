@@ -13,7 +13,7 @@ use std::process::Command;
 use crate::CacheConfig;
 use crate::WalkDir;
 use crate::diagnostic::{emit_log, emit_phase_update, set_test_run_active};
-use crate::{compile_source, get_output_dir, host_triple};
+use crate::{compile_source, get_output_dir};
 
 /// Output from a successful compile+run.
 pub struct RunOutput {
@@ -161,7 +161,7 @@ fn link_executable(
     // Determine the linker based on the detected backend (after SDK check)
     // -------------------------------------------------------------------------
     let llvm_tools = crate::discovery::find_llvm_tools().map_err(|e| e.to_string())?;
-    let (linker, linker_is_hip) = match detected_backend {
+    let (linker, _linker_is_hip) = match detected_backend {
         Some("hip") => {
             let sdk = crate::discovery::find_hip_sdk().unwrap();
             let hipcc = sdk

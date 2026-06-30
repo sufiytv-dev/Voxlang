@@ -4,7 +4,7 @@
 //! This module contains functions for substituting generic parameters in types
 //! and AST nodes, as well as a helper for unifying generic parameters.
 
-use crate::parser::{ASTNode, KernelAttr, MatchArm, Param};
+use crate::parser::{ASTNode, MatchArm, Param};
 use crate::semantics::SemanticAnalyzer;
 use crate::semantics::types::Type;
 use std::collections::HashMap;
@@ -315,7 +315,12 @@ impl SemanticAnalyzer<'_> {
                     span: *span,
                 }
             }
-            KernelLaunch { kernel, grid, args, span } => {
+            KernelLaunch {
+                kernel,
+                grid,
+                args,
+                span,
+            } => {
                 let new_kernel = Box::new(Self::substitute_types_in_node(kernel, subst));
                 let (gx, gy, gz) = grid;
                 let new_grid = (

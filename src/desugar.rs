@@ -3,7 +3,7 @@
 // Runs immediately after parsing, before semantic analysis.
 
 use crate::diagnostic::debug_log;
-use crate::parser::{ASTNode, KernelAttr, MatchArm, MatchPattern};
+use crate::parser::{ASTNode, MatchArm, MatchPattern};
 use std::cell::Cell;
 
 thread_local! {

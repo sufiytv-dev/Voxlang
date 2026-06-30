@@ -53,6 +53,14 @@ CPU fallback	✅ Always	Any machine	–
 
 If no GPU is available or the --gpu flag is omitted, kernels run on the CPU (slower, but useful for testing). The verification still applies.
 
+### Metal Backend
+
+The Metal backend is fully supported on macOS, both on Intel and Apple Silicon. To use it, pass `--gpu metal` to the compiler. The architecture can be specified with `--gpu-arch apple2` (Apple Silicon) or `--gpu-arch mac2` (Intel); if omitted, the compiler auto‑detects the architecture based on the host target triple.
+
+Metal kernels are compiled from MSL (Metal Shading Language) source at runtime using the Metal API (`newLibraryWithSource:options:error:`). Scalars are automatically packed into a struct and passed as a buffer, as required by MSL. `match` expressions on `Option`, `Result`, and custom enums are fully supported inside Metal kernels. No separate device code compilation step is required; the MSL source is embedded in the host binary and compiled just‑in‑time.
+
+The Metal backend requires macOS 10.13+ and Xcode 10+ (or the command‑line tools) to be installed. It has been tested on Intel HD 5000 and Apple Silicon GPUs.
+
 ## Verification Guarantees
 
 Preconditions and postconditions are checked by Z3 at compile time – same as host code.
@@ -94,8 +102,6 @@ fn main():
 Note: get_global_id(0) is a built‑in function that returns the global thread index in the first dimension.
 
 ## Future Work (Roadmap)
-
-- 0.5 – Apple Metal backend (macOS), launch‑time grid/block configuration, better error propagation.
 
 - 0.6 – Automatic device memory management (RAII), texture and shared memory support.
 

@@ -10,7 +10,6 @@
 use crate::codegen::CodegenEngine;
 use crate::diagnostic::{Diagnostic, emit_diagnostic};
 use crate::parser::{ASTNode, KernelAttr};
-use std::collections::HashMap;
 
 impl CodegenEngine {
     // ------------------------------------------------------------------------

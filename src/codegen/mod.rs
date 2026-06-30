@@ -8,6 +8,7 @@ mod gpu;
 mod helpers;
 mod infer;
 mod ir_builder;
+pub mod msl;
 mod parallel;
 mod runtime;
 mod stmt;
@@ -35,7 +36,7 @@ pub struct CodegenEngine {
     pub generic_function_asts: HashMap<String, ASTNode>,
     pub kernel_binary_const: Option<String>,
     pub register_counter: usize,
-    pub alloca_counter: usize, // separate counter for named allocas
+    pub alloca_counter: usize,
     pub variable_symbols: HashMap<String, (String, String, bool, bool)>,
     pub string_counter: usize,
     pub string_map: HashMap<String, String>,
@@ -69,27 +70,13 @@ pub struct CodegenEngine {
     pub module_prefix: Option<String>,
     pub current_function_name: Option<String>,
     pub block_terminated: bool,
-
-    // Debugging fields to track brace emissions and function nesting
     pub brace_emission_log: Vec<String>,
     pub current_function_stack: Vec<String>,
-
-    // type aliases from semantic analysis
     pub type_aliases: HashMap<String, String>,
-
-    // Register allocation tracking for debugging
     pub register_allocations: Vec<(usize, String, String)>,
-
-    // kernel attributes (block dimensions) for each kernel
     pub kernel_attrs: HashMap<String, KernelAttr>,
-
-    // GPU architecture (e.g., "sm_75", "gfx1200")
     pub gpu_arch: Option<String>,
-
-    // Kernel parameter types (Vox types) for each kernel – used during launch codegen
     pub kernel_param_types: HashMap<String, Vec<String>>,
-
-    // Buffer for forward declarations of monomorphised functions
     pub pending_declarations: Vec<String>,
 }
 
@@ -182,12 +169,10 @@ impl CodegenEngine {
         self.gpu_mode = mode.map(|s| s.to_string());
     }
 
-    /// Set the GPU architecture (e.g., "sm_75", "gfx1200")
     pub fn set_gpu_arch(&mut self, arch: Option<String>) {
         self.gpu_arch = arch;
     }
 
-    /// set the type alias map from the semantic analyser.
     pub fn set_type_aliases(&mut self, aliases: HashMap<String, String>) {
         self.type_aliases = aliases;
     }
@@ -207,7 +192,6 @@ impl CodegenEngine {
         }
     }
 
-    /// Retrieve the stored Vox parameter types for a kernel function.
     pub fn get_kernel_param_types(&self, name: &str) -> Option<&Vec<String>> {
         self.kernel_param_types.get(name)
     }
@@ -250,39 +234,14 @@ impl CodegenEngine {
     }
 
     // -------------------------------------------------------------
-    // generate() with extreme debugging
+    // generate() – cleaned up logging
     // -------------------------------------------------------------
     pub fn generate(&mut self, ast: &ASTNode) -> String {
         self.debug_log("========== [CODEGEN] generate() START ==========");
-        // Helper to print the Program node details
-        fn print_program(engine: &mut CodegenEngine, ast: &ASTNode, label: &str) {
-            if let ASTNode::Program(stmts, _) = ast {
-                engine.debug_log(&format!(
-                    "[CODEGEN][{}] Program has {} statements",
-                    label,
-                    stmts.len()
-                ));
-                for (i, stmt) in stmts.iter().enumerate() {
-                    if let ASTNode::FunctionDef { name, .. } = stmt {
-                        engine.debug_log(&format!("  [{}] FunctionDef: {}", i, name));
-                    } else {
-                        engine.debug_log(&format!("  [{}] {:?}", i, stmt));
-                    }
-                }
-            } else {
-                engine.debug_log(&format!("[CODEGEN][{}] AST is NOT a Program!", label));
-            }
-        }
-
-        print_program(self, ast, "ENTRY");
-
-        // Clear register allocation tracking for this generation pass
-        self.register_allocations.clear();
-
         self.debug_log("starting IR generation");
-        self.collect_strings(ast);
-        print_program(self, ast, "after collect_strings");
 
+        // Collect strings and emit module header
+        self.collect_strings(ast);
         self.ir.clear();
         self.emit_module_header();
         if self.has_error {
@@ -290,7 +249,7 @@ impl CodegenEngine {
             return String::new();
         }
 
-        // Emit all pending forward declarations at module scope
+        // Emit pending forward declarations
         let decls = std::mem::take(&mut self.pending_declarations);
         for decl in decls {
             self.debug_emit(&decl);
@@ -304,10 +263,6 @@ impl CodegenEngine {
         // Phase 0: store generic function ASTs
         self.debug_log("Phase 0: storing generic function ASTs");
         if let ASTNode::Program(statements, _) = ast {
-            self.debug_log(&format!(
-                "[CODEGEN][Phase0] scanning {} statements",
-                statements.len()
-            ));
             for stmt in statements {
                 if let ASTNode::FunctionDef {
                     name,
@@ -322,15 +277,10 @@ impl CodegenEngine {
                 }
             }
         }
-        print_program(self, ast, "after Phase0");
 
         // Phase 1: emit struct/enum definitions
         self.debug_log("Phase 1: emitting struct/enum definitions");
         if let ASTNode::Program(statements, _) = ast {
-            self.debug_log(&format!(
-                "[CODEGEN][Phase1] scanning {} statements",
-                statements.len()
-            ));
             for stmt in statements {
                 match stmt {
                     ASTNode::StructDef { .. } | ASTNode::EnumDef { .. } => {
@@ -343,7 +293,6 @@ impl CodegenEngine {
                 }
             }
         }
-        print_program(self, ast, "after Phase1");
 
         // Phase 1.5: pre‑generate concrete struct definitions
         self.debug_log("Phase 1.5: pre‑generating concrete struct definitions");
@@ -351,25 +300,15 @@ impl CodegenEngine {
             self.map_type(ty, false);
         }
         self.emit_pending_concrete_structs();
-        print_program(self, ast, "after Phase1.5");
 
         // Phase 2: compile imported modules
         self.debug_log("Phase 2: compiling imported modules");
         let saved_prefix = self.module_prefix.take();
         let imported = std::mem::take(&mut self.imported_modules);
-        self.debug_log(&format!(
-            "[CODEGEN][Phase2] processing {} imported modules",
-            imported.len()
-        ));
         for (alias, module_ast) in &imported {
             self.module_prefix = Some(alias.clone());
-            self.debug_log(&format!("[CODEGEN][Phase2] compiling module '{}'", alias));
+            self.debug_log(&format!("compiling module '{}'", alias));
             if let ASTNode::Program(stmts, _) = module_ast {
-                self.debug_log(&format!(
-                    "  module {} has {} statements",
-                    alias,
-                    stmts.len()
-                ));
                 for stmt in stmts {
                     if matches!(stmt, ASTNode::Import { .. }) {
                         continue;
@@ -384,54 +323,34 @@ impl CodegenEngine {
         }
         self.module_prefix = saved_prefix;
         self.imported_modules = imported;
-        print_program(self, ast, "after Phase2");
 
-        // =============================================================
         // Phase 3: compile original program (skip types and main)
-        // =============================================================
         self.debug_log(
             "Phase 3: compiling original program statements (excluding type definitions and main)",
         );
-        let mut main_ast = None; // [FIX] Store main function AST for later compilation
-        match ast {
-            ASTNode::Program(statements, _) => {
-                self.debug_log(&format!(
-                    "[CODEGEN][Phase3] original program has {} statements",
-                    statements.len()
-                ));
-                for (i, stmt) in statements.iter().enumerate() {
-                    self.debug_log(&format!(
-                        "[CODEGEN][Phase3] processing statement {}: {:?}",
-                        i, stmt
-                    ));
-                    if matches!(stmt, ASTNode::StructDef { .. } | ASTNode::EnumDef { .. }) {
+        let mut main_ast = None;
+        if let ASTNode::Program(statements, _) = ast {
+            for stmt in statements {
+                if matches!(stmt, ASTNode::StructDef { .. } | ASTNode::EnumDef { .. }) {
+                    continue;
+                }
+                if let ASTNode::FunctionDef { name, .. } = stmt {
+                    if name == "main" {
+                        self.debug_log("[CODEGEN] Deferring compilation of 'main' until after device binary generation");
+                        main_ast = Some(stmt.clone());
                         continue;
                     }
-                    // [FIX] Skip main function now – we will compile it after device binary is ready
-                    if let ASTNode::FunctionDef { name, .. } = stmt {
-                        if name == "main" {
-                            self.debug_log("[CODEGEN][Phase3] Deferring compilation of 'main' until after device binary generation");
-                            main_ast = Some(stmt.clone());
-                            continue;
-                        }
-                    }
-                    if self.has_error {
-                        break;
-                    }
-                    self.compile_statement(stmt);
+                }
+                self.compile_statement(stmt);
+                if self.has_error {
+                    return String::new();
                 }
             }
-            _ => {}
         }
-        print_program(self, ast, "after Phase3");
 
         // Phase 4: deferred monomorphised functions
         self.debug_log("Phase 4: deferred monomorphised function compilation");
         while !self.pending_monomorphised_functions.is_empty() {
-            self.debug_log(&format!(
-                "[CODEGEN][Phase4] compiling {} monomorphised functions",
-                self.pending_monomorphised_functions.len()
-            ));
             let pending = std::mem::take(&mut self.pending_monomorphised_functions);
             for func_node in &pending {
                 self.compile_statement(func_node);
@@ -440,16 +359,19 @@ impl CodegenEngine {
                 }
             }
         }
-        print_program(self, ast, "after Phase4");
 
         // Phase 5: emit concrete struct definitions
         self.emit_pending_concrete_structs();
 
-        // [FIX] Generate device binary (PTX/HSACO) and set kernel_binary_const
+        // Generate device binary (PTX/HSACO/Metal) and set kernel_binary_const
         if self.gpu_mode.is_some() && self.has_kernel && !self.device_ir.is_empty() {
             let triple = self.device_triple.clone();
             if let Some(triple) = triple {
-                if let Some(binary) = self.finalize_device_code(&triple) {
+                if let Some(mut binary) = self.finalize_device_code(&triple, Some(ast)) {
+                    if self.gpu_mode.as_deref() == Some("metal") {
+                        binary.push(0);
+                        self.debug_log("[CODEGEN] Added null terminator to Metal MSL source");
+                    }
                     let binary_const = self.add_binary_constant(&binary);
                     self.kernel_binary_const = Some(binary_const.clone());
                     self.debug_log(&format!(
@@ -467,26 +389,19 @@ impl CodegenEngine {
             }
         }
 
-        // [FIX] Now compile main (if it exists) – it will see kernel_binary_const and emit the load call
+        // Now compile main (if it exists)
         if let Some(main_node) = main_ast {
             self.debug_log(
                 "[CODEGEN] Compiling deferred 'main' function (after device binary generation)",
             );
-            // Ensure that the main function is emitted after all other declarations (including the device binary constant)
             self.compile_statement(&main_node);
             if self.has_error {
                 return String::new();
             }
         }
 
-        // =================================================================
         // Phase 4.5: compile any monomorphised functions generated during main compilation
-        // =================================================================
         while !self.pending_monomorphised_functions.is_empty() {
-            self.debug_log(&format!(
-                "[CODEGEN][Phase4.5] compiling {} monomorphised functions",
-                self.pending_monomorphised_functions.len()
-            ));
             let pending = std::mem::take(&mut self.pending_monomorphised_functions);
             for func_node in &pending {
                 self.compile_statement(func_node);
@@ -496,9 +411,6 @@ impl CodegenEngine {
             }
         }
 
-        // Launch stubs are no longer emitted – kernel launches are compiled directly
-        // from ASTNode::KernelLaunch in expr.rs. The pending_kernel_stubs field has been removed.
-
         for worker in &self.pending_workers {
             self.ir.push_str(worker);
             self.ir.push('\n');
@@ -506,21 +418,16 @@ impl CodegenEngine {
 
         self.emit_string_constants();
 
-        // =================================================================
         // POST‑PROCESSING: preserve all closing braces, keep IR intact
-        // =================================================================
-
         let lines: Vec<String> = self.ir.lines().map(|s| s.to_string()).collect();
         let mut balanced_lines = Vec::new();
-        let mut brace_stack = Vec::new(); // track line indices where '{' was seen
+        let mut brace_stack = Vec::new();
         let mut i = 0;
 
         while i < lines.len() {
             let line = &lines[i];
             let trimmed = line.trim();
 
-            // If we are about to start a new function but there are still unclosed braces,
-            // close them first (safety net).
             if trimmed.starts_with("define ") && !brace_stack.is_empty() {
                 while let Some(_) = brace_stack.pop() {
                     balanced_lines.push("}".to_string());
@@ -530,7 +437,6 @@ impl CodegenEngine {
                 }
             }
 
-            // Opening brace at the end of a function definition
             if trimmed.starts_with("define ") && trimmed.ends_with('{') {
                 balanced_lines.push(line.clone());
                 brace_stack.push(balanced_lines.len() - 1);
@@ -538,21 +444,17 @@ impl CodegenEngine {
                 continue;
             }
 
-            // Closing brace: keep it if there is a matching open, otherwise skip (stray brace)
             if trimmed == "}" {
                 if let Some(_) = brace_stack.last() {
-                    // Properly nested: keep it
                     balanced_lines.push(line.clone());
                     brace_stack.pop();
                 } else {
-                    // Stray closing brace at top level – discard it
                     self.debug_log("POST‑PROCESSING: removed stray top‑level '}'");
                 }
                 i += 1;
                 continue;
             }
 
-            // Remove top‑level labels that are not inside any function (stray block labels)
             if brace_stack.is_empty() && trimmed.ends_with(':') && !trimmed.starts_with("define") {
                 self.debug_log(&format!(
                     "POST‑PROCESSING: removed top‑level label '{}'",
@@ -562,25 +464,21 @@ impl CodegenEngine {
                 continue;
             }
 
-            // Remove top‑level `unreachable` instructions outside functions
             if brace_stack.is_empty() && trimmed == "unreachable" {
                 self.debug_log("POST‑PROCESSING: removed top‑level unreachable");
                 i += 1;
                 continue;
             }
 
-            // Normal line – keep it
             balanced_lines.push(line.clone());
             i += 1;
         }
 
-        // After processing all lines, add any missing closing braces (safety)
         while let Some(_) = brace_stack.pop() {
             self.debug_log("POST‑PROCESSING: added missing closing brace at end");
             balanced_lines.push("}".to_string());
         }
 
-        // Remove consecutive blank lines and trim trailing empty lines.
         let mut final_lines = Vec::new();
         let mut last_was_empty = false;
         for line in balanced_lines {
@@ -595,7 +493,6 @@ impl CodegenEngine {
             }
         }
 
-        // Trim trailing blank lines
         while let Some(last) = final_lines.last() {
             if last.trim().is_empty() {
                 final_lines.pop();
@@ -609,101 +506,109 @@ impl CodegenEngine {
             self.ir.push('\n');
         }
 
-        // =================================================================
-        // REGISTER NUMBERING VALIDATION - catch gaps before returning
-        // =================================================================
+        // -------------------------------------------------------------
+        // REGISTER NUMBERING VALIDATION (definitions only)
+        // -------------------------------------------------------------
         if crate::diagnostic::global_debug() {
-            self.debug_log("=== REGISTER NUMBERING VALIDATION ===");
+            self.debug_log("=== REGISTER NUMBERING VALIDATION (definitions only) ===");
             let ir_lines: Vec<&str> = self.ir.lines().collect();
-            let mut expected_reg = 0;
-            let mut current_function = String::new();
-            let mut errors = Vec::new();
-            let mut all_regs_seen = HashSet::new();
-            let mut max_reg_seen = 0;
 
-            for (line_num, line) in ir_lines.iter().enumerate() {
+            let mut current_func = String::new();
+            let mut func_defs: Vec<usize> = Vec::new();
+            let mut all_defs: Vec<(String, Vec<usize>)> = Vec::new();
+
+            for line in ir_lines {
                 let trimmed = line.trim();
 
-                // Track which function we're in
                 if trimmed.starts_with("define ") {
+                    if !current_func.is_empty() && !func_defs.is_empty() {
+                        all_defs.push((current_func.clone(), func_defs.clone()));
+                    }
                     if let Some(func_start) = trimmed.find('@') {
                         if let Some(func_end) = trimmed[func_start + 1..].find('(') {
-                            current_function =
+                            current_func =
                                 trimmed[func_start + 1..func_start + 1 + func_end].to_string();
                         }
                     }
-                    expected_reg = 0; // Reset per function
+                    func_defs.clear();
                     continue;
                 }
 
-                // Skip labels, comments, and empty lines
-                if trimmed.ends_with(':') || trimmed.starts_with(';') || trimmed.is_empty() {
+                if trimmed.starts_with("declare ")
+                    || trimmed.ends_with(':')
+                    || trimmed.starts_with(';')
+                    || trimmed.is_empty()
+                {
                     continue;
                 }
 
-                // Find all register uses %N in this line
-                let mut chars = line.chars().enumerate().peekable();
-                while let Some((pos, ch)) = chars.next() {
-                    if ch == '%' {
-                        let mut num_str = String::new();
-                        while let Some(&(_, next_ch)) = chars.peek() {
-                            if next_ch.is_ascii_digit() {
-                                num_str.push(next_ch);
-                                chars.next();
-                            } else {
+                if let Some(eq_pos) = line.find(" = ") {
+                    let before_eq = &line[..eq_pos];
+                    let mut chars = before_eq.chars().enumerate();
+                    while let Some((_pos, ch)) = chars.next() {
+                        if ch == '%' {
+                            let mut num_str = String::new();
+                            while let Some((_, next_ch)) = chars.next() {
+                                if next_ch.is_ascii_digit() {
+                                    num_str.push(next_ch);
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !num_str.is_empty() {
+                                let num: usize = num_str.parse().unwrap();
+                                func_defs.push(num);
                                 break;
                             }
-                        }
-                        if !num_str.is_empty() {
-                            let num: usize = num_str.parse().unwrap();
-                            all_regs_seen.insert(num);
-                            if num > max_reg_seen {
-                                max_reg_seen = num;
-                            }
-                            if num > expected_reg && expected_reg > 0 && expected_reg < num {
-                                let error_msg = format!(
-                                    "Line {} in function '{}': register gap - expected %{}, got %{} at column {}: {}",
-                                    line_num + 1,
-                                    current_function,
-                                    expected_reg,
-                                    num,
-                                    pos,
-                                    line
-                                );
-                                errors.push(error_msg.clone());
-                                self.debug_log(&format!("  ❌ {}", error_msg));
-                            }
-                            expected_reg = num + 1;
                         }
                     }
                 }
             }
 
-            // Check for missing low-numbered registers
-            for reg in 0..=max_reg_seen {
-                if !all_regs_seen.contains(&reg) && reg <= 5 {
-                    self.debug_log(&format!(
-                        "  ⚠️ Register %{} never used (gap at low end)",
-                        reg
-                    ));
-                    errors.push(format!("Missing low register %{}", reg));
+            if !current_func.is_empty() && !func_defs.is_empty() {
+                all_defs.push((current_func.clone(), func_defs.clone()));
+            }
+
+            let mut errors = Vec::new();
+            for (func_name, defs) in &all_defs {
+                if defs.is_empty() {
+                    continue;
+                }
+                let n = defs.len();
+                let mut sorted = defs.clone();
+                sorted.sort();
+                sorted.dedup();
+                let expected: Vec<usize> = (0..n).collect();
+                if sorted != expected {
+                    let msg = format!(
+                        "Function '{}': register definition set mismatch. Expected {:?}, got {:?}",
+                        func_name, expected, sorted
+                    );
+                    errors.push(msg.clone());
+                    self.debug_log(&format!("  ❌ {}", msg));
+                }
+                if let Some(max) = sorted.last() {
+                    if *max >= n {
+                        let missing: Vec<usize> = (0..n).filter(|i| !sorted.contains(i)).collect();
+                        if !missing.is_empty() {
+                            let msg = format!(
+                                "Function '{}': missing register definitions: {:?}",
+                                func_name, missing
+                            );
+                            errors.push(msg.clone());
+                            self.debug_log(&format!("  ❌ {}", msg));
+                        }
+                    }
                 }
             }
 
             if errors.is_empty() {
                 self.debug_log("✓ Register numbering validation passed");
-                self.debug_log(&format!("  Max register seen: %{}", max_reg_seen));
-                self.debug_log(&format!(
-                    "  Total unique registers: {}",
-                    all_regs_seen.len()
-                ));
             } else {
                 self.debug_log(&format!(
                     "❌ Found {} register numbering errors",
                     errors.len()
                 ));
-
-                // Also write to a debug file for analysis
                 if let Ok(debug_path) = std::env::current_dir() {
                     let debug_dir = debug_path.join("target").join("debug");
                     let _ = std::fs::create_dir_all(&debug_dir);
@@ -718,8 +623,14 @@ impl CodegenEngine {
                 }
             }
 
-            // Report unused register allocations if any
+            // Check allocated registers vs used (sanity check)
             if !self.register_allocations.is_empty() {
+                let mut all_defined = HashSet::new();
+                for (_, defs) in &all_defs {
+                    for d in defs {
+                        all_defined.insert(*d);
+                    }
+                }
                 let allocated_regs: HashSet<usize> = self
                     .register_allocations
                     .iter()
@@ -727,7 +638,7 @@ impl CodegenEngine {
                     .collect();
                 let unused: Vec<&usize> = allocated_regs
                     .iter()
-                    .filter(|n| !all_regs_seen.contains(*n))
+                    .filter(|n| !all_defined.contains(*n))
                     .collect();
                 if !unused.is_empty() {
                     self.debug_log(&format!("⚠️ Unused register allocations: {:?}", unused));

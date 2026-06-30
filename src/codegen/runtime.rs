@@ -134,17 +134,23 @@ impl CodegenEngine {
         self.debug_emit("");
     }
 
-    /// Emit GPU runtime declarations (HIP / CUDA) into the host IR.
+    /// Emit GPU runtime declarations (HIP / CUDA / Metal) into the host IR.
     /// This is idempotent; it only emits once.
+    ///
+    /// Updated for Phase 3: `vox_launch_kernel_3d` now takes an additional
+    /// `i64*` argument size array parameter.
     pub(crate) fn emit_gpu_runtime_declarations(&mut self) {
         if self.gpu_decls_emitted {
             return;
         }
-        self.debug_emit("; GPU runtime support (HIP / CUDA)");
+        self.debug_emit("; GPU runtime support (HIP / CUDA / Metal)");
         self.debug_emit("declare void @vox_load_device_module(i8*, i64)");
         self.debug_emit("declare i32 @vox_launch_kernel_1d(i8*, i8**, i32, i32, i32)");
-        // 3D launch function with grid dimensions (3), block dimensions (3), kernel name, args array, and arg count
-        self.debug_emit("declare i32 @vox_launch_kernel_3d(i8*, i32, i32, i32, i32, i32, i32, i8**, i32)");
+        // 3D launch function with grid dimensions (3), block dimensions (3),
+        // kernel name, args array, arg count, and argument sizes array.
+        self.debug_emit(
+            "declare i32 @vox_launch_kernel_3d(i8*, i32, i32, i32, i32, i32, i32, i8**, i32, i64*)",
+        );
         self.debug_emit("declare i8* @vox_gpu_malloc(i64)");
         self.debug_emit("declare void @vox_gpu_free(i8*)");
         self.debug_emit("declare void @vox_gpu_memcpy_host_to_device(i8*, i8*, i64)");

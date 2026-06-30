@@ -1,7 +1,7 @@
 // src/bridge/generator.rs – Generate Vox FFI wrappers from C functions
 
 use super::parser::CFunction;
-use crate::diagnostic::{Diagnostic, Level, debug_log, emit_diagnostic};
+use crate::diagnostic::{Diagnostic, debug_log, emit_diagnostic};
 
 /// Map C types to Vox types.
 /// Returns a Vox type string (e.g., "i32", "*mut i8", "*const i8", "void").

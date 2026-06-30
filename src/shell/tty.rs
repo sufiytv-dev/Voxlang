@@ -1,12 +1,13 @@
 // src/shell/tty.rs – Raw terminal I/O (Unix via direct FFI, Windows no‑op)
 
-use crate::diagnostic::{Diagnostic, emit_diagnostic};
-use std::ffi::c_int;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 
 #[cfg(unix)]
 mod unix {
+    #![allow(dead_code)]
+
     use super::*;
+    use std::ffi::c_int;
     use std::os::unix::io::AsRawFd;
 
     #[repr(C)]
@@ -36,7 +37,7 @@ mod unix {
             if tcgetattr(fd, &mut termios) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            termios.c_lflag &= !(0x0002 | 0x0008);
+            termios.c_lflag &= !(ICANON | ECHO);
             if tcsetattr(fd, TCSANOW, &termios) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -51,7 +52,7 @@ mod unix {
             if tcgetattr(fd, &mut termios) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            termios.c_lflag |= 0x0002 | 0x0008;
+            termios.c_lflag |= ICANON | ECHO;
             if tcsetattr(fd, TCSANOW, &termios) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -80,10 +81,10 @@ mod unix {
 mod windows {
     use super::*;
     pub fn enable_raw_mode() -> io::Result<()> {
-        emit_diagnostic(
-            &Diagnostic::warning("Raw mode not supported on Windows. Using line input.")
-                .with_code("VX9002"),
-        );
+        // emit_diagnostic(
+        //     &Diagnostic::warning("Raw mode not supported on Windows. Using line input.")
+        //         .with_code("VX9002"),
+        // );
         Ok(())
     }
     pub fn disable_raw_mode() -> io::Result<()> {
@@ -100,6 +101,7 @@ mod windows {
 }
 
 #[cfg(unix)]
+#[allow(unused_imports)]
 pub use unix::*;
 #[cfg(not(unix))]
 pub use windows::*;
